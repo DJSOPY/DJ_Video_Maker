@@ -376,11 +376,33 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
     fi
     if ! "$PYTHON_CMD" -c "import numpy, scipy, mutagen, PIL, librosa, fastdtw" &>/dev/null; then
         echo "📦 基本ライブラリをインストール中（初回・数分）..."
-        "$PYTHON_CMD" -m pip install --quiet --no-input --upgrade pip
-        "$PYTHON_CMD" -m pip install --quiet --no-input numpy scipy mutagen Pillow librosa fastdtw \
-          || "$PYTHON_CMD" -m pip install --no-input numpy scipy mutagen Pillow librosa fastdtw
-        if ! "$PYTHON_CMD" -c "import numpy, scipy, mutagen" &>/dev/null; then
-            echo "❌ 基本ライブラリのインストールに失敗しました（ネット接続を確認してください）"
+        # pipを最新化（古いpipは新しい完成品(wheel)を認識できずビルドに落ちるため必須）
+        "$PYTHON_CMD" -m pip install --quiet --no-input --upgrade pip setuptools wheel
+        # まず「完成品(wheel)のみ・ソースビルド禁止」で試す。
+        # これにより llvmlite 等が“延々ビルドして失敗”する事故（3.14で起きたやつ）を防ぐ。
+        # 対応版Python(3.12等)を使っている前提なので、通常はこれで全部そろう。
+        if "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input \
+              numpy scipy mutagen Pillow librosa fastdtw 2>/tmp/djvm_pip.log; then
+            :
+        else
+            # 完成品が一部欠けた場合のみ、通常インストール（ビルド許可）で最後の一押し
+            echo "   （一部を通常方式で追加インストール中...）"
+            "$PYTHON_CMD" -m pip install --no-input numpy scipy mutagen Pillow librosa fastdtw 2>>/tmp/djvm_pip.log
+        fi
+        # --- 本当に使えるか最終確認（必須のものだけ厳しくチェック）---
+        if ! "$PYTHON_CMD" -c "import numpy, scipy, mutagen, librosa" &>/dev/null; then
+            echo ""
+            echo "❌ 音楽解析に必要なライブラリが用意できませんでした。"
+            # 原因を分かりやすく振り分けて案内
+            pyver="$("$PYTHON_CMD" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)"
+            if grep -qi "llvmlite\|numba\|Failed building wheel" /tmp/djvm_pip.log 2>/dev/null; then
+                echo "   原因：このPython($pyver)向けの音声解析部品(llvmlite)がまだ提供されていません。"
+                echo "   対処：修復ツールが対応版Python(3.12)で作り直します。"
+                echo "        『修復_初回からやり直し.command』を実行してください。"
+            else
+                echo "   ネット接続を確認して、もう一度お試しください（VPNオフ／別回線も有効）。"
+                echo "   何度も失敗する場合は『修復_初回からやり直し.command』を実行してください。"
+            fi
             djvm_pause_exit
         fi
     fi
