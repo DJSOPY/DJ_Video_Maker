@@ -313,60 +313,92 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
     VENV="$HOME/.dj_video_maker_env"
     PYTHON_CMD="$VENV/bin/python3"
 
-    # --- 既存のvenvが対応外Python(3.14等)で作られていたら作り直す ---
+    # ============================================================
+    #  対応Python(3.12優先)で必ずvenvを用意する（全パターン自動対応）
+    #  - 3.14等で作られた壊れたvenvは問答無用で削除
+    #  - 3.12/3.13/3.11/3.10 を探す → 無ければ brew で 3.12 を入れる
+    #  - brew自体が無ければ brew を入れてから 3.12 を入れる
+    #  - 3.14系のシステムpythonには絶対フォールバックしない
+    # ============================================================
+    _djvm_is_supported_ver(){   # 引数のpython実行体が 3.10〜3.13 か
+        local pybin="$1" v
+        v="$("$pybin" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)"
+        case "$v" in 3.10|3.11|3.12|3.13) return 0;; *) return 1;; esac
+    }
+
+    # --- 既存venvが対応外(3.14等)なら削除して作り直す ---
     if [ -x "$PYTHON_CMD" ]; then
-        local cur_ver
-        cur_ver="$("$PYTHON_CMD" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)"
-        case "$cur_ver" in
-            3.10|3.11|3.12|3.13) : ;;   # llvmlite/numbaの完成品があるバージョン→OK
-            *)  echo "🔁 現在のPython($cur_ver)は一部ライブラリ非対応のため、対応版で作り直します..."
-                rm -rf "$VENV" ;;
-        esac
+        if ! _djvm_is_supported_ver "$PYTHON_CMD"; then
+            local badver
+            badver="$("$PYTHON_CMD" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)"
+            echo "🔁 現在のPython($badver)は音声解析ライブラリ非対応のため、対応版で作り直します..."
+            rm -rf "$VENV"
+        fi
     fi
 
     if [ ! -x "$PYTHON_CMD" ]; then
-        echo "🐍 Python環境を構築中..."
-        # --- llvmlite/numbaの完成品(wheel)がある安定版を優先的に探す ---
-        # 3.12を最優先（最も枯れて対応が広い）→ 3.13 → 3.11 → 3.10。3.14系は避ける。
-        local BASE_PY=""
-        for cand in python3.12 python3.13 python3.11 python3.10; do
-            for dir in /opt/homebrew/bin /usr/local/bin /usr/bin; do
-                if [ -x "$dir/$cand" ]; then BASE_PY="$dir/$cand"; break 2; fi
-            done
-            # PATH上も一応探す
-            if command -v "$cand" &>/dev/null; then BASE_PY="$(command -v "$cand")"; break; fi
-        done
+        echo "🐍 Python環境を構築中（対応版のPythonを用意します）..."
 
-        # 見つからなければ Homebrew で 3.12 を入れる（対応版を確実に用意）
-        if [ -z "$BASE_PY" ] && command -v brew &>/dev/null; then
-            echo "📦 対応版のPython(3.12)を用意しています..."
-            brew install python@3.12 2>/dev/null
-            for dir in /opt/homebrew/bin /usr/local/bin; do
-                [ -x "$dir/python3.12" ] && { BASE_PY="$dir/python3.12"; break; }
+        # 対応版Pythonを探す（3.12最優先→3.13→3.11→3.10）。3.14系は候補にしない。
+        _djvm_find_py(){
+            local cand dir
+            for cand in python3.12 python3.13 python3.11 python3.10; do
+                for dir in /opt/homebrew/bin /usr/local/bin /usr/bin; do
+                    [ -x "$dir/$cand" ] && { echo "$dir/$cand"; return 0; }
+                done
+                command -v "$cand" &>/dev/null && { command -v "$cand"; return 0; }
             done
-        fi
+            return 1
+        }
 
-        # それでも無ければ、システムのpython3を最後の手段に（対応版であることを祈る）
+        BASE_PY="$(_djvm_find_py)"
+
+        # 見つからなければ brew で 3.12 を入れる（brewが無ければ brew から入れる）
         if [ -z "$BASE_PY" ]; then
-            if command -v python3 &>/dev/null; then
-                local sysver
-                sysver="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)"
-                case "$sysver" in
-                    3.10|3.11|3.12|3.13) BASE_PY="$(command -v python3)" ;;
-                esac
+            if ! command -v brew &>/dev/null; then
+                echo "📦 まず Homebrew を用意します（初回のみ・パスワードを求められます）..."
+                if groups | grep -qw admin; then
+                    # sudo先行認証（見えないが入力できている旨は事前に案内済み）
+                    sudo -v 2>/dev/null
+                    ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+                    local _ka=$!
+                    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+                    kill "$_ka" 2>/dev/null
+                    [ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
+                    [ -x /usr/local/bin/brew ]    && eval "$(/usr/local/bin/brew shellenv)"
+                fi
+            fi
+            if command -v brew &>/dev/null; then
+                echo "📦 対応版の Python(3.12) を用意しています（数分かかります）..."
+                brew install python@3.12 2>/dev/null
+                for dir in /opt/homebrew/bin /usr/local/bin; do
+                    [ -x "$dir/python3.12" ] && { BASE_PY="$dir/python3.12"; break; }
+                done
             fi
         fi
 
+        # まだ無ければ、システムのpython3が“対応版の時だけ”最後の手段に
+        if [ -z "$BASE_PY" ] && command -v python3 &>/dev/null && _djvm_is_supported_ver "$(command -v python3)"; then
+            BASE_PY="$(command -v python3)"
+        fi
+
         if [ -z "$BASE_PY" ]; then
-            echo "❌ 対応するPython(3.10〜3.13)が見つかりませんでした。"
-            echo "   このMacには新しすぎる/古すぎるPythonしかない可能性があります。"
-            echo "   ターミナルで次を実行してから、もう一度お試しください："
+            echo ""
+            echo "❌ 音声解析に使える Python(3.10〜3.13) を用意できませんでした。"
+            echo "   お手数ですが、ターミナルで次を実行してから、もう一度お試しください："
             echo "       brew install python@3.12"
+            echo "   （Homebrew未導入なら、先に『修復_初回からやり直し.command』を実行）"
             djvm_pause_exit
         fi
 
         echo "   使用するPython: $("$BASE_PY" --version 2>&1)"
         "$BASE_PY" -m venv "$VENV"
+
+        # venvが3.14等になっていないか最終ガード（万一の取り違え防止）
+        if [ -x "$PYTHON_CMD" ] && ! _djvm_is_supported_ver "$PYTHON_CMD"; then
+            echo "⚠️ 作成したPython環境が対応版になりませんでした。作り直しの上、中断します。"
+            rm -rf "$VENV"; djvm_pause_exit
+        fi
         if [ ! -x "$PYTHON_CMD" ]; then
             echo "❌ Python環境の作成に失敗しました。"
             echo "   ターミナルで xcode-select --install を実行して開発ツールを入れ、"
