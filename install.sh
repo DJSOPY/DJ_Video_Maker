@@ -44,10 +44,17 @@ echo "📥 ダウンロード中 → $DEST"
 mkdir -p "$DEST"
 FAIL=""
 for f in "${FILES[@]}"; do
-    enc="$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$f" 2>/dev/null)"
-    if ! curl -fsSL --retry 2 -o "$DEST/$f" "${BASE}/${enc}"; then
-        curl -fsSL --retry 2 -o "$DEST/$f" "${BASE}/$f" || FAIL="$FAIL $f"
-    fi
+    ok=""
+    # macOSの日本語ファイル名は濁点の扱い(NFC/NFD)が混在しうるため、両方＋非エンコードを順に試す
+    for variant in \
+        "$(python3 -c "import urllib.parse,unicodedata,sys;print(urllib.parse.quote(unicodedata.normalize('NFD',sys.argv[1])))" "$f" 2>/dev/null)" \
+        "$(python3 -c "import urllib.parse,unicodedata,sys;print(urllib.parse.quote(unicodedata.normalize('NFC',sys.argv[1])))" "$f" 2>/dev/null)" \
+        "$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$f" 2>/dev/null)"
+    do
+        [ -z "$variant" ] && continue
+        if curl -fsSL --retry 2 -o "$DEST/$f" "${BASE}/${variant}"; then ok="1"; break; fi
+    done
+    [ -z "$ok" ] && FAIL="$FAIL $f"
 done
 
 # 実行権限（curl取得なので隔離属性は付かない＝警告が出ない）
