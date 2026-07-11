@@ -301,6 +301,7 @@ djvm_ensure_tools(){
         echo "❌ 次のツールが準備できませんでした：$miss"
         echo "   ・回線を変えて（VPNオフ／テザリング等）もう一度実行"
         echo "   ・それでもダメなら『修復_初回からやり直し.command』を実行"
+        echo "   💬 それでも直らなければ、この画面を写真に撮って @sousouagain へ"
         djvm_pause_exit
     fi
 }
@@ -491,6 +492,9 @@ djvm_verify(){
         echo "   ネット接続（VPNオフ・別回線も試す）を確認して、"
         echo "   もう一度このアイコンをダブルクリックしてください。"
         echo "   何度も失敗する場合は『修復_初回からやり直し.command』を実行してください。"
+        echo ""
+        echo "   💬 それでも直らない時は、この画面を写真に撮って"
+        echo "      配布元（@sousouagain）に送ってください。すぐ直します。"
         djvm_pause_exit
     fi
 }
