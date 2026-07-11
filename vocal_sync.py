@@ -53,6 +53,34 @@ def _load_mono(path, sr=SR, duration=None):
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def _load_stereo_f32(path, sr):
+    """ffmpegで stereo float32 (2, N) [-1,1] にデコード（Demucs API入力用）"""
+    cmd = ["ffmpeg", "-v", "quiet", "-y", "-i", str(path),
+           "-f", "f32le", "-ac", "2", "-ar", str(sr), "-"]
+    raw = subprocess.run(cmd, capture_output=True).stdout
+    a = np.frombuffer(raw, dtype=np.float32)
+    n = (a.size // 2) * 2
+    return a[:n].reshape(-1, 2).T.copy()          # (2, N)
+
+
+def _resample(y, orig_sr, target_sr):
+    """mono配列のサンプリングレート変換（librosa→scipyの順に試す）"""
+    if orig_sr == target_sr or y.size == 0:
+        return y
+    try:
+        import librosa
+        return librosa.resample(y, orig_sr=orig_sr, target_sr=target_sr)
+    except Exception:
+        pass
+    try:
+        from scipy.signal import resample_poly
+        from math import gcd
+        g = gcd(int(orig_sr), int(target_sr))
+        return resample_poly(y, int(target_sr) // g, int(orig_sr) // g).astype(np.float32)
+    except Exception:
+        return y
+
+
 def _get_duration(path):
     r = subprocess.run(
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
@@ -62,6 +90,28 @@ def _get_duration(path):
         return float(r.stdout.strip())
     except (ValueError, AttributeError):
         return 0.0
+
+
+def _has_av_streams(path):
+    """最終出力に映像と音声の両方があるか確認。"""
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "stream=codec_type",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, errors="replace")
+    kinds = set((r.stdout or "").split())
+    return r.returncode == 0 and {"video", "audio"}.issubset(kinds)
+
+
+def _valid_video(path, expected_dur=None, tolerance=1.0):
+    """途中で打ち切られたmp4を成功と誤認しないための検査。"""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    dur = _get_duration(path)
+    if dur <= 0.05:
+        return False
+    return (expected_dur is None
+            or abs(dur - float(expected_dur)) <= float(tolerance))
 
 
 def _tail(text, n=15):
@@ -154,6 +204,90 @@ def have_demucs():
         return False
 
 
+def _separate_vocals_api(src, sr, dev, verbose=True):
+    """
+    Demucsを「ファイル保存を挟まず」Python API(apply_model)で実行し、
+    ボーカルstemを mono np.array (sr) で返す。失敗時は (None, 理由)。
+
+    なぜCLIでなくAPIか:
+      demucs CLI は分離後の stem を torchaudio.save() で書き出す。
+      torchaudio 2.9以降 save() は torchcodec に処理を委譲するため、
+      torchcodec が無い環境では ImportError で必ず失敗する
+      （＝分離自体は成功しているのに保存だけで落ちてHPSSに落ちる）。
+      APIならテンソルを直接受け取れるので、この保存経路を完全に回避できる。
+    """
+    # demucs.api は 4.1 以降にしか無い。4.0系にも必ずある低レベルAPIを直接使う。
+    try:
+        import torch as th
+        from demucs.pretrained import get_model
+        from demucs.apply import apply_model
+    except Exception as e:
+        return None, f"demucsのimportに失敗: {e!r}"
+
+    try:
+        model = get_model("htdemucs")
+        model.eval()
+        model_sr = int(getattr(model, "samplerate", 44100))       # htdemucs は 44100
+        ch = int(getattr(model, "audio_channels", 2))
+
+        wav = _load_stereo_f32(src, model_sr)                     # (2, N)
+        if wav.size == 0:
+            return None, "音声のデコードに失敗（0サンプル）"
+        x = th.from_numpy(np.ascontiguousarray(wav))
+        if ch == 1:
+            x = x.mean(dim=0, keepdim=True)
+
+        # demucsの標準前処理（api/CLIと同じ正規化）
+        ref = x.mean(0)
+        mean, std = ref.mean(), ref.std() + 1e-8
+        with th.no_grad():
+            out = apply_model(model, ((x - mean) / std)[None],
+                              shifts=0, split=True, overlap=0.25,
+                              device=dev, progress=False)
+        out = out * std + mean                                    # (1, stems, ch, N)
+
+        sources = list(getattr(model, "sources", []))
+        if "vocals" not in sources:
+            return None, f"vocals stem がありません（sources={sources}）"
+        voc = out[0, sources.index("vocals")]                     # (ch, N)
+
+        arr = voc.detach().to("cpu").float().mean(dim=0).numpy()  # → mono
+        arr = _resample(arr, model_sr, sr).astype(np.float32)
+        if arr.size == 0 or float(np.max(np.abs(arr))) <= 1e-4:
+            return None, "分離結果が無音でした"
+        return arr, "ok"
+    except Exception as e:
+        return None, repr(e)
+
+
+def _ensure_torchcodec(verbose=True):
+    """
+    torchaudio 2.9+ の save() が要求する torchcodec を導入する。
+    demucs CLI 経路の ImportError 自己修復用。戻り値: True=導入済み/成功
+    """
+    try:
+        importlib.import_module("torchcodec")
+        return True
+    except Exception:
+        pass
+    if verbose:
+        print("     📦 torchaudio が torchcodec を要求しています → 自動導入します")
+    for cmd in ([sys.executable, "-m", "pip", "install", "-q",
+                 "--break-system-packages", "torchcodec"],
+                [sys.executable, "-m", "pip", "install", "-q", "torchcodec"]):
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        if r.returncode == 0:
+            break
+    try:
+        importlib.invalidate_caches()
+        importlib.import_module("torchcodec")
+        return True
+    except Exception:
+        if verbose:
+            print("     ⚠️ torchcodec を導入できませんでした")
+        return False
+
+
 def separate_vocals(audio_path, work_dir, sr=SR, max_sec=None, verbose=True,
                     demucs_ready=None):
     """
@@ -211,32 +345,58 @@ def separate_vocals(audio_path, work_dir, sr=SR, max_sec=None, verbose=True,
         devs = [_demucs_device()]
         if devs[0] != "cpu":
             devs.append("cpu")          # 速いデバイスがダメなら必ずCPUで再試行
+
+        def _cache_and_return(arr, dev, how):
+            # 次回から同じ結果になるよう、解析配列そのものをキャッシュ保存
+            if cache_npy:
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    np.save(cache_npy, arr.astype(np.float32))
+                except Exception:
+                    pass
+            if verbose:
+                tag = f"（{dev.upper()}）" if dev != "cpu" else ""
+                print(f"     🎤 Demucsでボーカル分離 成功{tag}{how}")
+            return arr.astype(np.float32), "demucs"
+
+        # --- 経路1: Python API（推奨）------------------------------------
+        # stemをテンソルで直接受け取るので torchaudio.save / torchcodec に一切依存しない。
+        reasons = []
+        for dev in devs:
+            arr, why = _separate_vocals_api(src, sr, dev, verbose=verbose)
+            if arr is not None:
+                return _cache_and_return(arr, dev, "")
+            reasons.append(f"{dev}: {why}")
+            if verbose and dev != devs[-1]:
+                print(f"     ↪︎ Demucs APIの{dev.upper()}経路が使えず → APIのCPU経路を試行")
+
+        # --- 経路2: CLI（APIが使えない古いdemucs等の保険）-------------------
         # --two-stems=vocals → vocals.wav と no_vocals.wav の2本だけ（高速）/ --shifts 0 → 決定性
         r = None
+        tried_torchcodec = False
         for dev in devs:
-            r = _run([sys.executable, "-m", "demucs", "--two-stems=vocals", "--shifts", "0",
-                      "-d", dev, "-n", "htdemucs", "--out", str(outdir), str(src)])
-            voc = list(outdir.glob("**/vocals.wav"))
-            if voc:
-                arr = _load_mono(voc[0], sr)
-                if arr.size and float(np.max(np.abs(arr))) > 1e-4:
-                    # 次回から同じ結果になるよう、解析配列そのものをキャッシュ保存
-                    if cache_npy:
-                        try:
-                            cache_dir.mkdir(parents=True, exist_ok=True)
-                            np.save(cache_npy, arr.astype(np.float32))
-                        except Exception:
-                            pass
-                    if verbose:
-                        tag = f"（{dev.upper()}）" if dev != "cpu" else ""
-                        print(f"     🎤 Demucsでボーカル分離 成功{tag}")
-                    return arr, "demucs"
-            if verbose and dev != devs[-1]:
-                print(f"     ⚠️ Demucs {dev.upper()} で分離できず → CPUで再試行")
+            for _attempt in (1, 2):
+                r = _run([sys.executable, "-m", "demucs", "--two-stems=vocals", "--shifts", "0",
+                          "-d", dev, "-n", "htdemucs", "--out", str(outdir), str(src)])
+                voc = list(outdir.glob("**/vocals.wav"))
+                if voc:
+                    arr = _load_mono(voc[0], sr)
+                    if arr.size and float(np.max(np.abs(arr))) > 1e-4:
+                        return _cache_and_return(arr, dev, "（CLI）")
+                # 保存段の torchcodec 不足なら一度だけ自己修復して再試行
+                out_all = ((r.stderr or "") + (r.stdout or "")) if r else ""
+                if (not tried_torchcodec) and "torchcodec" in out_all.lower():
+                    tried_torchcodec = True
+                    if _ensure_torchcodec(verbose):
+                        continue
+                break
+
         # 失敗 → 本当のエラーを表示してから HPSS へ
         if verbose:
-            print("     ⚠️ Demucs分離に失敗 → HPSSにフォールバック。Demucs出力(末尾):")
-            for ln in _tail(((r.stderr if r else "") or "") + "\n" + ((r.stdout if r else "") or ""), 12):
+            print("     ⚠️ Demucs分離に失敗 → HPSSにフォールバック。原因:")
+            for ln in reasons:
+                print("        ", ln)
+            for ln in _tail(((r.stderr if r else "") or "") + "\n" + ((r.stdout if r else "") or ""), 8):
                 print("        ", ln)
 
     # フォールバック: HPSS harmonic（=従来の find_vocal_matches と同等の近似）
@@ -489,7 +649,8 @@ def find_vocal_lipsync_segments(remix_voc, orig_voc, sr=SR, ratio=1.0,
         vmean = float(seg.mean()) if seg.size else 0.0
 
         if vmean < voice_th:
-            segs.append({"r_start": rs, "r_end": re_, "o_start": None, "conf": 0.0})
+            segs.append({"r_start": rs, "r_end": re_, "o_start": None, "conf": 0.0,
+                         "voiced_sec": 0.0})
             t = re_; continue
 
         # チャンク中央のクロマ一致度を信頼度に
@@ -499,10 +660,11 @@ def find_vocal_lipsync_segments(remix_voc, orig_voc, sr=SR, ratio=1.0,
 
         if sim >= conf_th:
             segs.append({"r_start": rs, "r_end": re_, "o_start": float(o_start),
-                         "o_end": float(remix_to_orig(re_)), "conf": sim})
+                         "o_end": float(remix_to_orig(re_)), "conf": sim,
+                         "voiced_sec": re_ - rs})
         else:
             segs.append({"r_start": rs, "r_end": re_, "o_start": None,
-                         "o_end": None, "conf": sim})
+                         "o_end": None, "conf": sim, "voiced_sec": re_ - rs})
         t = re_
 
     # --- 連続するリップシンク区間を結合（長回し優先）---
@@ -516,9 +678,13 @@ def find_vocal_lipsync_segments(remix_voc, orig_voc, sr=SR, ratio=1.0,
                 if abs(s["o_start"] - p["o_end"]) < 2.0:
                     p["r_end"] = s["r_end"]
                     p["o_end"] = s["o_end"]
+                    p["voiced_sec"] = p.get("voiced_sec", 0.0) + s.get("voiced_sec", 0.0)
+                    p["conf"] = min(float(p.get("conf", 0.0)), float(s.get("conf", 0.0)))
                     continue
             if p["o_start"] is None and s["o_start"] is None:
                 p["r_end"] = s["r_end"]
+                p["voiced_sec"] = p.get("voiced_sec", 0.0) + s.get("voiced_sec", 0.0)
+                p["conf"] = max(float(p.get("conf", 0.0)), float(s.get("conf", 0.0)))
                 continue
         merged.append(dict(s))
 
@@ -639,6 +805,25 @@ def _build_vj_drop(mv_path, mv_dur, dur, out, tmp_dir, pool, state, cut=1.8):
     return out.exists() and out.stat().st_size > 0
 
 
+def _legacy_alignment_quality(segs, remix_method, orig_method):
+    """旧エンジンの採用品質を「全曲尺」ではなく歌唱区間基準で評価。"""
+    n_lip = sum(1 for s in segs if s.get("o_start") is not None)
+    lip_sec = sum(float(s["r_end"] - s["r_start"])
+                  for s in segs if s.get("o_start") is not None)
+    voiced_sec = sum(float(s.get("voiced_sec", 0.0)) for s in segs)
+    voiced_coverage = lip_sec / max(voiced_sec, 1e-6)
+    matched_conf = [float(s.get("conf", 0.0)) for s in segs if s.get("o_start") is not None]
+    median_conf = float(np.median(matched_conf)) if matched_conf else 0.0
+    clean_stems = (remix_method == "demucs" and orig_method == "demucs")
+    min_coverage = 0.55 if clean_stems else 0.70
+    min_conf = 0.48 if clean_stems else 0.56
+    accepted = bool(voiced_sec > 0.0 and lip_sec >= 4.0
+                    and voiced_coverage >= min_coverage and median_conf >= min_conf)
+    return {"accepted": accepted, "n_lip": n_lip, "lip_sec": lip_sec,
+            "voiced_sec": voiced_sec, "voiced_coverage": voiced_coverage,
+            "median_conf": median_conf, "clean_stems": clean_stems}
+
+
 def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_dur,
                              filler_cb=None, verbose=True):
     """
@@ -685,14 +870,16 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
     if not segs:
         return False
 
-    n_lip = sum(1 for s in segs if s["o_start"] is not None)
-    lip_sec = sum(s["r_end"] - s["r_start"] for s in segs if s["o_start"] is not None)
+    q = _legacy_alignment_quality(segs, m1, m2)
     if verbose:
-        print(f"     リップシンク採用 {n_lip}/{len(segs)} 区間（{lip_sec:.0f}秒 / 全{music_dur:.0f}秒）")
+        print(f"     リップシンク採用 {q['n_lip']}/{len(segs)} 区間（{q['lip_sec']:.0f}秒 / "
+              f"歌唱{q['voiced_sec']:.0f}秒 = {q['voiced_coverage']*100:.0f}% / "
+              f"一致中央{q['median_conf']:.2f}）")
 
-    if lip_sec < music_dur * 0.15:
+    if not q["accepted"]:
         if verbose:
-            print("     ⚠️ ボーカル一致が少なすぎ → 従来法へフォールバック")
+            method_note = "Demucs" if q["clean_stems"] else "HPSS/raw（厳格判定）"
+            print(f"     ⚠️ ボーカル一致品質が不足（{method_note}） → この方式は採用しない")
         return False
 
     # --- 原曲MVの顔アップ時間帯を検出（歌唱シーン優先のため）---
@@ -711,20 +898,21 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
             print("  🎯 DTW対応をそのまま使用（顔優先オフ）")
 
     if verbose:
-        print(f"  🎬 原曲MVを等速で配置（See You Again式・歌詞位置に合わせて細切れ）")
+        print(f"  🎬 原曲MVを歌詞位置に配置（局所テンポ差も追従）")
 
-    # --- セグメント生成（等速・See You Again式 / doc12方式） ---
-    #   各サブカットを「原曲MVの対応位置から SUBSEG 秒、等速で」切り出す（setptsで伸縮しない）。
-    SUBSEG = 4.0   # 細切れの長さ（短いほど局所テンポ変化に強いが、カットが増える）
+    # --- セグメント生成（See You Again式 / doc12改良） ---
+    #   対応位置は維持し、連続区間だけDTWの局所進行量に追従する。
+    SUBSEG = 2.0   # 局所テンポ差の蓄積を最大約2秒窓に抑える
     seg_files = []
     seg_idx = 0
+    seg_fail = 0
     for s in segs:
         total_dur = s["r_end"] - s["r_start"]
         if total_dur < 0.3:
             continue
 
         if s["o_start"] is not None:
-            # 歌区間: SUBSEG秒ごとに原曲MVの対応位置から“等速”で切り出す
+            # 歌区間: SUBSEG秒ごとに原曲MVの対応位置から切り出す
             anchor = s.get("anchor_o")   # 後半の再アンカー区間のみ非None（前半=Noneで素のDTW）
             seg_r0 = s["r_start"]
             done = 0.0
@@ -733,17 +921,38 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                 r0 = seg_r0 + done
                 if anchor is None:
                     o_pos = remix_to_orig(r0)          # DTW対応位置（前半はここ＝doc12と同じ）
+                    o_end = remix_to_orig(r0 + sub_dur)
                 else:
                     o_pos = anchor + (r0 - seg_r0)      # 再アンカー位置から等速で進める（後半）
+                    o_end = o_pos + sub_dur
                 o_pos = max(0.0, o_pos)
-                if o_pos + sub_dur > mv_dur - 0.05:
-                    o_pos = max(0.0, mv_dur - sub_dur - 0.05)
+                local_src = float(o_end - o_pos)
+                ratio_local = local_src / max(0.05, sub_dur)
+                use_rate = 0.8 <= ratio_local <= 1.25
+                src_dur = local_src if use_rate else sub_dur
+                if o_pos + src_dur > mv_dur - 0.05:
+                    o_pos = max(0.0, mv_dur - src_dur - 0.05)
+                src_dur = min(src_dur, max(0.05, mv_dur - o_pos - 0.02))
                 out = tmp_dir / f"vlip_{seg_idx:03d}.mp4"
                 seg_idx += 1
-                _run(["ffmpeg", "-y", "-ss", f"{o_pos:.3f}", "-t", f"{sub_dur:.3f}",
-                      "-i", str(mv_path), "-vf", VF_NORM, *ENC_ARGS, "-an", str(out)])
+                if use_rate:
+                    # DTWが示す局所的なMV進行量をそのままsub_durに収める。
+                    # 従来は常に等速だったため、10%テンポ差なら4秒窓の
+                    # 末尾で400msずれ、次カットで急に戻る鋸歯状の口ずれが出ていた。
+                    factor = sub_dur / max(0.05, src_dur)
+                    vf = f"setpts={factor:.6f}*PTS,{VF_NORM}"
+                else:
+                    vf = VF_NORM
+                rr = _run(["ffmpeg", "-y", "-ss", f"{o_pos:.3f}", "-t", f"{src_dur:.3f}",
+                           "-i", str(mv_path), "-vf", vf, *ENC_ARGS, "-an", str(out)])
                 if out.exists() and out.stat().st_size > 0:
                     seg_files.append(out)
+                else:
+                    seg_fail += 1
+                    if verbose and seg_fail == 1:
+                        print("     ⚠️ 区間の切り出しに失敗（ffmpeg出力・末尾）:")
+                        for ln in _tail(rr.stderr or rr.stdout, 6):
+                            print("        ", ln)
                 done += sub_dur
         else:
             # ドロップ/VJ区間（歌詞なし）→ filler_cb（原曲MVループ等）。doc12はVJカット無し。
@@ -769,7 +978,11 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                 seg_files.append(out)
 
     if not seg_files:
+        if verbose:
+            print(f"  ❌ リップシンク映像を1本も作れませんでした（切り出し失敗{seg_fail}件）")
         return False
+    if verbose and seg_fail:
+        print(f"     ℹ️ 切り出し失敗 {seg_fail}件（残り{len(seg_files)}本で続行）")
 
     # --- 結合（concat demuxerは相対パスをlistの場所基準で解決するので絶対パスで書く） ---
     listf = tmp_dir / "vlip_concat.txt"
@@ -777,9 +990,26 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
         for s in seg_files:
             f.write(f"file '{Path(s).resolve()}'\n")
     combined = tmp_dir / "vlip_combined.mp4"
-    _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listf),
-          "-c", "copy", str(combined)])
-    if not combined.exists() or combined.stat().st_size == 0:
+    expected_video_dur = sum(_get_duration(s) for s in seg_files)
+    concat_tol = max(1.0, min(3.0, expected_video_dur * 0.01))
+    rr = _run(["ffmpeg", "-y", "-fflags", "+genpts",
+               "-f", "concat", "-safe", "0", "-i", str(listf),
+               "-c", "copy", str(combined)])
+    if not _valid_video(combined, expected_video_dur, concat_tol):
+        # ストリーム不一致等でcopy結合が失敗することがある → 再エンコードで結合し直す
+        if verbose:
+            print("     🔧 映像結合を互換モードで再試行します")
+            for ln in _tail(rr.stderr or rr.stdout, 6):
+                print("        ", ln)
+        combined.unlink(missing_ok=True)
+        rr = _run(["ffmpeg", "-y", "-fflags", "+genpts",
+                   "-f", "concat", "-safe", "0", "-i", str(listf),
+                   "-vf", VF_NORM, *ENC_ARGS, "-an", str(combined)])
+    if not _valid_video(combined, expected_video_dur, concat_tol):
+        if verbose:
+            print("  ❌ リップシンク映像の結合に失敗（ffmpeg出力・末尾）:")
+            for ln in _tail(rr.stderr or rr.stdout, 8):
+                print("        ", ln)
         return False
 
     # --- 長さ合わせ（音声より短ければ延長） ---
@@ -804,22 +1034,42 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                 f.write(f"file '{Path(combined).resolve()}'\n"
                         f"file '{Path(padf).resolve()}'\n")
             ext = tmp_dir / "vlip_combined_ext.mp4"
-            _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(l2),
-                  "-c", "copy", str(ext)])
-            if ext.exists() and ext.stat().st_size > 0:
+            ext_expected = _get_duration(combined) + _get_duration(padf)
+            ext_tol = max(1.0, min(3.0, ext_expected * 0.01))
+            er = _run(["ffmpeg", "-y", "-fflags", "+genpts",
+                       "-f", "concat", "-safe", "0", "-i", str(l2),
+                       "-c", "copy", str(ext)])
+            if not _valid_video(ext, ext_expected, ext_tol):
+                ext.unlink(missing_ok=True)
+                er = _run(["ffmpeg", "-y", "-fflags", "+genpts",
+                           "-f", "concat", "-safe", "0", "-i", str(l2),
+                           "-vf", VF_NORM, *ENC_ARGS, "-an", str(ext)])
+            if _valid_video(ext, ext_expected, ext_tol):
                 combined = ext
+            elif verbose:
+                print("     ⚠️ 延長映像の結合に失敗。元の長さで続行します")
+                for ln in _tail(er.stderr or er.stdout, 5):
+                    print("        ", ln)
 
     # --- 音楽と合成 ---
-    _run(["ffmpeg", "-y", "-i", str(combined), "-i", str(music_path),
-          "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-          "-b:a", "320k", "-t", f"{music_dur:.3f}", "-movflags", "+faststart",
-          str(output_path)])
-    if output_path.exists() and output_path.stat().st_size > 0:
+    output_path = Path(output_path)
+    output_path.unlink(missing_ok=True)
+    rr = _run(["ffmpeg", "-y", "-i", str(combined), "-i", str(music_path),
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+               "-b:a", "320k", "-t", f"{music_dur:.3f}", "-movflags", "+faststart",
+               str(output_path)])
+    if (_valid_video(output_path, music_dur, tolerance=1.0)
+            and _has_av_streams(output_path)):
         if verbose:
             mb = output_path.stat().st_size / 1024 / 1024
             tag = "（Demucs）" if m1 == "demucs" else "（HPSS近似）"
             print(f"  ✅ リップシンク完成{tag}: {output_path.name} ({mb:.1f} MB)")
         return True
+    output_path.unlink(missing_ok=True)
+    if verbose:
+        print("  ❌ 音楽との合成に失敗（ffmpeg出力・末尾）:")
+        for ln in _tail(rr.stderr or rr.stdout, 8):
+            print("        ", ln)
     return False
 
 

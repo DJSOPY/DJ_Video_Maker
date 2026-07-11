@@ -43,6 +43,37 @@ def cookie_args_from_config(config):
         return ["--cookies-from-browser", b]
     return []
 
+
+def ytdlp_run(args, **kw):
+    """yt-dlp を実行する唯一の入口。Cookieの取り出しに失敗したら
+    自動で「Cookie無し」に切り替えてやり直す。
+
+    なぜ必要か（配布時の最重要ポイント）:
+      --cookies-from-browser は他人のMacで普通に失敗する。
+        ・Safariを選んだが、ターミナルに「フルディスクアクセス」が無い
+        ・そのブラウザでYouTubeにログインしていない
+        ・ブラウザを消した / プロファイルが別の場所にある
+      以前はここで失敗するとダウンロード自体が落ちてツールが停止していた。
+      Cookieはボット判定回避のための「あれば良い」もので、必須ではないため、
+      失敗したら黙ってCookie無しに落として続行する。
+    """
+    global YTDLP_COOKIE_ARGS, _COOKIE_DISABLED
+    r = subprocess.run(["yt-dlp", *YTDLP_COOKIE_ARGS, *args], **kw)
+    if r.returncode == 0 or not YTDLP_COOKIE_ARGS:
+        return r
+    # Cookie付きで失敗 → Cookie無しで1回だけやり直す
+    r2 = subprocess.run(["yt-dlp", *args], **kw)
+    if r2.returncode == 0 and not _COOKIE_DISABLED:
+        _COOKIE_DISABLED = True
+        YTDLP_COOKIE_ARGS = []      # 以降はCookie無しで通す（毎回2回叩かない）
+        print("  ⚠️ ブラウザのCookieを読めませんでした → Cookie無しで続行します")
+        print("     （YouTubeにボット判定されるようなら、~/.dj_video_maker/config.json を"
+              "消して別のブラウザを選び直してください）")
+    return r2
+
+
+_COOKIE_DISABLED = False
+
 def configure_cookies(config):
     """初回のみ: YouTubeにログイン済みのブラウザを聞いて保存する。"""
     if "cookies_browser" in config:
@@ -231,24 +262,13 @@ def extract_core_title(artist, title, full_name):
     core_artist = artist
     if " - " in s or " – " in s:
         parts = re.split(r'\s[-–]\s', s)
-        raw_parts = re.split(r'\s[-–]\s', strip_filename_noise(raw))
-        # ★後ろ側に“裸の”Remix語がある（括弧の外）なら、それはリミキサー名で前側が曲名。
-        #   例: 「前前前世 - Natino Remix」→ 前=曲名 / 「DNCE - CAKE <JUMP SMOKERS RMX>」→ 括弧内なので従来通り
-        tail_raw = raw_parts[-1].strip() if len(raw_parts) == len(parts) else parts[-1].strip()
-        tail_no_br = re.sub(r'[<\[\(\{][^>\]\)\}]*[>\]\)\}]', ' ', tail_raw)
-        tail_was_remix = bool(re.search(
-            r'\b(remix|rmx|bootleg|boot|edit|rework|refix|flip|vip|mashup)\b', tail_no_br, re.I))
-        if tail_was_remix and len(parts) >= 2:
-            core_song = parts[0].strip()          # 前側＝曲名
-            # 後ろ側はリミキサー名なのでアーティストには使わない
-        else:
-            # 一番最後のパートを曲名候補に（複数アーティスト名の後ろが曲名のことが多い）
-            core_song = parts[-1].strip()
-            # 前半にアーティスト情報があれば、VS等を除いた先頭1組だけ使う
-            head = parts[0].strip()
-            head = re.split(r'\s+(?:vs\.?|x|×|&|feat\.?|ft\.?)\s+', head, flags=re.I)[0].strip()
-            if not core_artist and head and len(head) < 30:
-                core_artist = head
+        # 一番最後のパートを曲名候補に（複数アーティスト名の後ろが曲名のことが多い）
+        core_song = parts[-1].strip()
+        # 前半にアーティスト情報があれば、VS等を除いた先頭1組だけ使う
+        head = parts[0].strip()
+        head = re.split(r'\s+(?:vs\.?|x|×|&|feat\.?|ft\.?)\s+', head, flags=re.I)[0].strip()
+        if not core_artist and head and len(head) < 30:
+            core_artist = head
     # アーティスト名にVS/&/カンマ/feat等が入ってたら先頭1組だけ
     # （例: "Lady Gaga, Ellison Hard" → "Lady Gaga"。リミキサー名を検索から除く）
     if core_artist:
@@ -354,7 +374,7 @@ def smart_search_mv(full_name, n=5, artist="", title=""):
     #   ・ユーザーの“その曲の正確なRemix”MVが見つかればそれを最優先（+1.0）
     #   ・それ以外は「原曲MV（別バージョン語を含まない）」を優先する
     _cs = _compact(core_song) if core_song else ""
-    def cand_score(t, uploader=""):
+    def cand_score(t):
         base = title_match_score(match_ref, t)
         # スペース/桁つき表記の揺れ対策（"UCHIDA 1" ⇔ "UCHIDA1"）
         if _cs and len(_cs) >= 3 and _cs in _compact(t):
@@ -379,15 +399,6 @@ def smart_search_mv(full_name, n=5, artist="", title=""):
         if any(fk in tl for fk in ("가사", "번역", "한국어", "translation", "traducc",
                                    "traduç", "vietsub", "subtitulado", "letra", "แปล")):
             score -= 0.5
-        # 音源のみアップロード（静止画ジャケ）を強く減点:
-        #   ・"◯◯ - Topic" チャンネル＝YouTube自動生成のArt Track（映像なし）
-        #   ・タイトルの (Official Audio) / (Audio) / Art Track 等
-        up = (uploader or "").strip().lower()
-        if up.endswith("- topic") or up.endswith("- topic'"):
-            score -= 0.8
-        if re.search(r"\b(official audio|audio only|art track|full album)\b", tl) \
-           or re.search(r"[\(\[]\s*audio\s*[\)\]]", tl):
-            score -= 0.5
         return score
 
     # --- 候補をクエリ横断でプールし、「タイトル妥当な中で再生数最多」を本物MVとして選ぶ ---
@@ -402,17 +413,17 @@ def smart_search_mv(full_name, n=5, artist="", title=""):
         # 1) ユーザー指定の正確なRemix MVが居れば最優先（再生数より上）
         exact = [r for r in cands if _is_exact_remix(r["title"])]
         if exact:
-            exact.sort(key=lambda r: (cand_score(r["title"], r.get("uploader","")), r.get("views", 0)), reverse=True)
-            return exact, cand_score(exact[0]["title"], exact[0].get("uploader",""))
+            exact.sort(key=lambda r: (cand_score(r["title"]), r.get("views", 0)), reverse=True)
+            return exact, cand_score(exact[0]["title"])
         # 2) タイトルが十分妥当な候補の中で「再生回数が最多」＝本物の公式MV
         #    （詐称タイトルの低再生アップを、ここで再生数によって弾く）
-        plausible = [r for r in cands if cand_score(r["title"], r.get("uploader","")) >= MV_TIER_MIN]
+        plausible = [r for r in cands if cand_score(r["title"]) >= MV_TIER_MIN]
         if plausible:
-            plausible.sort(key=lambda r: (r.get("views", 0), cand_score(r["title"], r.get("uploader",""))), reverse=True)
-            return plausible, cand_score(plausible[0]["title"], plausible[0].get("uploader",""))
+            plausible.sort(key=lambda r: (r.get("views", 0), cand_score(r["title"])), reverse=True)
+            return plausible, cand_score(plausible[0]["title"])
         # 3) 妥当な一致が無い → スコア最良で妥協
-        cands.sort(key=lambda r: (cand_score(r["title"], r.get("uploader","")), r.get("views", 0)), reverse=True)
-        return cands, cand_score(cands[0]["title"], cands[0].get("uploader",""))
+        cands.sort(key=lambda r: (cand_score(r["title"]), r.get("views", 0)), reverse=True)
+        return cands, cand_score(cands[0]["title"])
 
     pool = {}
     best = None; best_query = uniq[0] if uniq else full_name
@@ -435,7 +446,7 @@ def smart_search_mv(full_name, n=5, artist="", title=""):
                 break
 
     # 一致率が低すぎる(誤検索)場合は、核心曲名そのものを最終クエリにして再検索
-    top_now = cand_score(best[0]["title"], best[0].get("uploader","")) if best else -1.0
+    top_now = cand_score(best[0]["title"]) if best else -1.0
     if best is None or top_now < 0.34:
         fallback_q = core_song if core_song else clean_full
         results = search_youtube_mv(fallback_q, n)
@@ -456,10 +467,10 @@ def smart_search_mv(full_name, n=5, artist="", title=""):
 def search_youtube_mv(query, n=3):
     # リリック動画を除外すると件数が減るので、多め(n+3)に取得してから絞る
     fetch_n = n + 3
-    r = subprocess.run([
-        "yt-dlp", *YTDLP_COOKIE_ARGS, f"ytsearch{fetch_n}:{query}",
+    r = ytdlp_run([
+        f"ytsearch{fetch_n}:{query}",
         "--no-playlist",
-        "--print", "%(title)s\t%(id)s\t%(duration)s\t%(view_count)s\t%(uploader)s",
+        "--print", "%(title)s\t%(id)s\t%(duration)s\t%(view_count)s",
         "--no-download"
     ], capture_output=True, text=True, errors="replace")
     results = []
@@ -475,8 +486,7 @@ def search_youtube_mv(query, n=3):
                 vc = 0
             item = {"title": t, "id": parts[1],
                     "duration": parts[2] if len(parts) > 2 else "?",
-                    "views": vc,
-                    "uploader": parts[4] if len(parts) > 4 else ""}
+                    "views": vc}
             # リリック/歌詞付きは原則後回し（口パク不可）。ただし公式アップ
             # （"Official Visualizer 歌詞付き" 等）は本物なので主候補に残す。
             is_off = any(k in tl for k in ("official", "公式"))
@@ -1174,7 +1184,7 @@ def download_festival_filler(tmp_dir, tag):
     url = f"https://www.youtube.com/watch?v={pick['id']}"
     fdir = tmp_dir / f"filler_{tag}"; fdir.mkdir(exist_ok=True)
     out = fdir / "filler.mp4"
-    subprocess.run(["yt-dlp", *YTDLP_COOKIE_ARGS,
+    ytdlp_run([
         "-f","bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
         "--no-playlist","--merge-output-format","mp4","-o",str(out), url], capture_output=True)
     if not out.exists():
@@ -1205,8 +1215,7 @@ def make_vj_mashup(mashup_path, song_names, loop_path, output_path, tmp_dir):
         vdir = tmp_dir / f"song_{i}"
         vdir.mkdir(exist_ok=True)
         out = vdir / "video.mp4"
-        subprocess.run([
-            "yt-dlp", *YTDLP_COOKIE_ARGS,
+        ytdlp_run([
             "-f","bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
             "--no-playlist","--merge-output-format","mp4","-o",str(out), url
         ], capture_output=True)
@@ -1317,57 +1326,23 @@ def _ensure_dtw_libs():
         except Exception:
             return False
 
-def download_video(url, out_dir, fatal=True):
-    """fatal=False のときは失敗しても終了せず None を返す（候補を順に試すループ用）。"""
+def download_video(url, out_dir):
     print(f"\n🎬 映像をダウンロード中...")
     out = out_dir / "video.mp4"
-    # YouTubeの403(Forbidden)対策:
-    #   形式(AV1系)やクライアント経路によって拒否されることがあるため、
-    #   ①通常 → ②H.264強制 → ③別クライアント(ios/android)+H.264 の順で自動リトライする。
-    attempts = [
-        ("標準", True,
-         ["-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]"]),
-        ("H.264形式に変更して再試行", True,
-         ["-f", "bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/18"]),
-        ("別経路(iOSクライアント)で再試行", True,
-         ["--extractor-args", "youtube:player_client=ios",
-          "-f", "bestvideo[height<=720][vcodec^=avc1]+bestaudio/best[height<=720]/18"]),
-        ("別経路(Androidクライアント)で再試行", True,
-         ["--extractor-args", "youtube:player_client=android",
-          "-f", "best[height<=720]/18"]),
-        # ブラウザcookieが未ログイン/不整合だと、cookie有りの方が弾かれることがある。
-        # 最後の砦として cookie無し（匿名アクセス）でも試す。
-        ("Cookie無しで再試行", False,
-         ["-f", "bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/18"]),
-        ("Cookie無し+別経路(Android)で再試行", False,
-         ["--extractor-args", "youtube:player_client=android",
-          "-f", "best[height<=720]/18"]),
-    ]
-    for i, (label, use_cookies, fmt_args) in enumerate(attempts):
-        if i > 0:
-            print(f"  🔁 ダウンロード拒否(403等) → {label}...")
-        cookie_args = YTDLP_COOKIE_ARGS if use_cookies else []
-        r = subprocess.run([
-            "yt-dlp", *cookie_args, *fmt_args,
-            "--no-playlist", "--merge-output-format", "mp4", "-o", str(out), url
-        ], capture_output=(i > 0), text=True, errors="replace")
-        if out.exists() and out.stat().st_size > 0:
-            print(f"  ✅ 完了")
-            return out
+    ytdlp_run([
+        "-f","bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+        "--no-playlist","--merge-output-format","mp4","-o",str(out), url
+    ])
+    if not out.exists():
         candidates = list(out_dir.glob("video.*"))
-        if candidates:
-            print(f"  ✅ 完了")
-            return candidates[0]
-        # 403以外の致命的エラー（動画削除/非公開など）はリトライしても無駄なので打ち切る
-        err = (r.stderr or "") if i > 0 else ""
-        if i > 0 and any(k in err for k in ("Private video", "Video unavailable", "removed")):
-            print("  ❌ この動画は非公開/削除されています")
-            break
-    print("❌ 映像ファイルが見つかりません")
-    print("   （READMEの『403エラー』の章を参照：ChromeでYouTubeにログイン→再実行 が一番効きます）")
-    if fatal:
-        sys.exit(1)
-    return None
+        if not candidates:
+            print("❌ 映像をダウンロードできませんでした。")
+            print("   ・ネット接続を確認してください")
+            print("   ・yt-dlp が古い可能性があります → ターミナルで  brew upgrade yt-dlp")
+            sys.exit(1)
+        out = candidates[0]
+    print(f"  ✅ 完了")
+    return out
 
 
 def is_static_video(video_path, samples=6):
@@ -1422,7 +1397,7 @@ def get_festival_filler_cached(tmp_dir):
         if out.exists() and out.stat().st_size > 0:
             if str(out) not in cached: cached.append(str(out))
             continue
-        subprocess.run(["yt-dlp", *YTDLP_COOKIE_ARGS,
+        ytdlp_run([
             "-f","bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
             "--no-playlist","--merge-output-format","mp4","-o",str(out),
             f"https://www.youtube.com/watch?v={r['id']}"], capture_output=True)
@@ -1901,8 +1876,6 @@ def waveform_track_plan(music_audio, video_audio, sr, music_dur, vid_dur,
     return seg_plan, confs, score
 
 
-PENDING_WARNINGS = []   # 曲ごとの重要警告（静止画MV等）を溜めて最後に必ず見せる
-
 def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # urls は候補URLのリスト（後方互換で単一strも可）。静止画/短すぎ候補は飛ばす。
     if isinstance(urls, str):
@@ -1914,19 +1887,17 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         _music_dur_pre = 0
     video_path = None
     chosen_url = urls[0] if urls else ""
-    _static_last = None            # 全滅時の最後の砦（静止画でも一応使う用）
     for i, u in enumerate(urls):
         cand_dir = tmp_dir / f"cand{i}"
         cand_dir.mkdir(parents=True, exist_ok=True)
-        vp = download_video(u, cand_dir, fatal=False)
+        vp = download_video(u, cand_dir)
         if vp is None or not Path(vp).exists():
             continue
-        # 静止画（ジャケ画像/音声のみのアップロード）は最後の候補でも採用しない
-        if is_static_video(vp):
-            print("  ⚠️ この候補は静止画（ジャケ画像/音声のみのアップロード）でした → 次を試します")
-            _static_last = (vp, u)
-            continue
+        # 最後の候補以外なら、静止画 or 曲より極端に短いMV は飛ばして次へ
         if i < len(urls) - 1:
+            if is_static_video(vp):
+                print("  ⚠️ この候補は静止画（ジャケ画像/音声のみのアップロード）でした → 次の候補を試します")
+                continue
             try:
                 _vd = get_duration(vp)
             except Exception:
@@ -1937,42 +1908,6 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         video_path = vp
         chosen_url = u
         break
-    # 候補が全部 静止画/取得失敗 だった → 「music video」で救済再検索して動く映像を探す
-    if video_path is None and _static_last is not None:
-        try:
-            tags = get_metadata(music_path)
-            _t = tags.get("title", "") or strip_filename_noise(music_path.stem)
-            _a = tags.get("artist", "")
-            rq = clean_song_query(f"{_a} {_t}".strip()) + " music video"
-            print(f"  🔎 静止画しか無かったため再検索: {rq}")
-            tried = set()
-            for u in urls:
-                if "watch?v=" in u:
-                    tried.add(u.split("watch?v=")[-1].split("&")[0])
-            rescue = [r for r in search_youtube_mv(rq, n=5) if r["id"] not in tried]
-            for j, r0 in enumerate(rescue):
-                cand_dir = tmp_dir / f"rescue{j}"
-                cand_dir.mkdir(parents=True, exist_ok=True)
-                vp = download_video(f"https://www.youtube.com/watch?v={r0['id']}", cand_dir, fatal=False)
-                if vp and Path(vp).exists() and not is_static_video(vp):
-                    print(f"  ✅ 動く映像を発見: {r0['title']}")
-                    video_path = vp
-                    chosen_url = f"https://www.youtube.com/watch?v={r0['id']}"
-                    break
-        except Exception as _e:
-            pass
-        if video_path is None:
-            print("")
-            print("  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-            print("  ┃ ⚠️  この曲は【静止画（ジャケ写）の映像】しか見つかりません ┃")
-            print("  ┃     公式MVが存在しない可能性が高いです。                 ┃")
-            print("  ┃     このまま作ると、映像はジャケ写のままのMP4になります。 ┃")
-            print("  ┃     別の映像を使いたい場合は URL版 で好きな動画を指定を。 ┃")
-            print("  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-            print("")
-            PENDING_WARNINGS.append(
-                f"⚠️ {music_path.stem}: 静止画（ジャケ写）ベースで作成（公式MVが見つからない曲）")
-            video_path, chosen_url = _static_last
     if video_path is None:
         print("  ❌ 有効な映像が取得できませんでした")
         return
@@ -2048,6 +1983,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # Remixはテンポが数%違うことがある（例: 75↔70）。BPM検出は当てにならないので、
     # 波形を色々な倍率で試して「一番一直線に揃う倍率」を探し、合えばMVを補正して等速で乗せる。
     remix_aligned = False  # リミックスで拍が一直線に揃った（＝MV全体を当てて流せる）
+    remix_lipsync_attempted = False
     if _is_remix_word and not is_quasi_original:
         best_rate, lock, lock_1p0 = find_best_mv_tempo(video_audio, music_audio)
         print(f"  🎚 テンポ探索: 最良 ×{best_rate:.3f}（一直線度 {lock*100:.0f}% / 等倍は {lock_1p0*100:.0f}%）")
@@ -2066,15 +2002,29 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         # 「MV全体を1オフセットで当てて流せる」のは拍が十分に一直線な時だけ。
         # lock 0.45〜0.80 は揃いが中途半端＝当て込み不可（後段でリップシンクへ回す）。
         remix_aligned = (lock >= 0.80)
-        if abs(best_rate - 1.0) > 0.003 and (lock - lock_1p0) >= 0.10:
+        if (remix_aligned and abs(best_rate - 1.0) > 0.003
+                and (lock - lock_1p0) >= 0.10):
             print(f"  🎚 MVを ×{best_rate:.3f} にテンポ補正して波形を合わせます...")
             adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)
             if adj is not None:
                 video_path = adj
                 vid_dur = get_duration(video_path) or (vid_dur / best_rate)
                 video_audio = wav_to_array_path(video_path, duration=min(vid_dur, 360))
+        elif not remix_aligned and abs(best_rate - 1.0) > 0.003:
+            print(f"  ℹ️ 一致率が中間的なため、推定テンポでMVを先に変形せず原版を保持")
         else:
             print(f"  ℹ️ 等倍と大差なし → テンポ補正せず等倍で配置")
+
+        # lock 0.45〜0.80は「一部は合うが、MV全編を1本の時間軸では
+        # 流せない」remix。従来は remix_aligned=False を記録するだけで
+        # そのまま伴奏波形/クロマ経路へ進み、ボーカル位置が違うのに
+        # 通常同期を採用することがあった。この帯はProを先に試す。
+        if not remix_aligned:
+            print(f"  🎤 部分的なテンポ一致（{lock*100:.0f}%） → ボーカル・リップシンクを優先")
+            remix_lipsync_attempted = True
+            if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
+                return
+            print("  ↪︎ リップシンクの信頼度が足りないため、波形/メロディ同期も試します")
 
     # ── 全編・生波形・等間隔追従（単調制約なし）──
     #   各窓の絶対ベストMV位置を生波形NCCで実測し、波形が指す所へそのまま置く。
@@ -2124,7 +2074,8 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             #   ・原曲/Intro/Extended系 → 無理に口パクせず “原曲MVをそのまま流す”
             if is_rmx:
                 print(f"  ⚠️ クロマでも合わない（{cconf:.2f}）→ リップシンクに切替")
-                if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
+                if (not remix_lipsync_attempted
+                        and _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur)):
                     return
                 print(f"  → リップシンクも弱い → 原曲MVをそのまま流します")
             else:
@@ -2251,13 +2202,11 @@ def download_yt_video(url, out_path):
     if not url or "watch?v=" not in url:
         print(f"        yt-dlp: 無効なURL: {url!r}")
         return None
-    cmd = [
-        "yt-dlp", *YTDLP_COOKIE_ARGS,
+    r = ytdlp_run([
         "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
         "--no-playlist", "--merge-output-format", "mp4",
         "-o", str(out_path), url
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    ], capture_output=True, text=True, errors="replace")
     if out_path.exists() and out_path.stat().st_size > 0:
         return out_path
     cands = list(out_path.parent.glob(out_path.stem + ".*"))
@@ -3981,12 +3930,6 @@ finally:
 
 print(f"\n{'='*54}")
 print(f"🎉 全{len(music_list)}曲 完了！ → {out_dir}")
-if PENDING_WARNINGS:
-    print("")
-    print("──── ⚠️ 確認が必要な曲 ────")
-    for w in PENDING_WARNINGS:
-        print(f"  {w}")
-    print("──────────────────────")
 print(f"{'='*54}")
 if os.environ.get("DJVM_WEB") != "1":
     try:

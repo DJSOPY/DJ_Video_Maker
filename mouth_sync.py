@@ -55,7 +55,7 @@ def _make_extractor():
             static_image_mode=False, max_num_faces=1, refine_landmarks=False,
             min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-        def extract(rgb, w, h):
+        def extract(rgb, w, h, timestamp_ms=None):
             res = fm.process(rgb)
             if not res.multi_face_landmarks:
                 return None
@@ -75,10 +75,15 @@ def _make_extractor():
                                         running_mode=vision.RunningMode.VIDEO)
     lmk = vision.FaceLandmarker.create_from_options(opts)
 
-    def extract(rgb, w, h, _ts=[0]):
+    def extract(rgb, w, h, timestamp_ms=None, _last_ts=[-1]):
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        _ts[0] += 33
-        res = lmk.detect_for_video(mp_img, _ts[0])
+        # VIDEOモードの時刻は、モデルの想定30fpsではなく実際に
+        # サンプリングしたフレームのPTSを渡す。これがずれると顔追跡の
+        # 速度想定が狂い、口の動き量も不安定になる。
+        ts = int(round(float(timestamp_ms or 0)))
+        ts = max(ts, _last_ts[0] + 1)
+        _last_ts[0] = ts
+        res = lmk.detect_for_video(mp_img, ts)
         if not res.face_landmarks:
             return None
         lm = res.face_landmarks[0]
@@ -100,9 +105,10 @@ def analyze_mouth(video_path, fps=10.0, max_seconds=None):
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     dur = (n_frames / src_fps) if (n_frames and src_fps) else None
     step = max(1, int(round(src_fps / float(fps))))
+    actual_fps = src_fps / step
 
     times, mar, face_mask = [], [], []
-    fi = 0
+    fi = 0; last_t = -1.0
     try:
         while True:
             if not cap.grab():
@@ -111,12 +117,29 @@ def analyze_mouth(video_path, fps=10.0, max_seconds=None):
                 ok2, frame = cap.retrieve()
                 if not ok2:
                     break
-                t = fi / src_fps
+                # CFRならframe/fps、VFRならOpenCVが返す実PTSを優先。
+                # 一部backendはPOS_MSECを0のまま返すため、単調増加しない
+                # 場合はframe/fpsへ安全に戻す。
+                t_nominal = fi / src_fps
+                t_pts = None
+                try:
+                    pos_prop = getattr(cv2, "CAP_PROP_POS_MSEC", None)
+                    pos_ms = float(cap.get(pos_prop)) if pos_prop is not None else -1.0
+                    if np.isfinite(pos_ms) and pos_ms >= 0.0:
+                        cand = pos_ms / 1000.0
+                        if last_t < 0.0 or cand > last_t + 1e-6:
+                            t_pts = cand
+                except Exception:
+                    pass
+                t = t_nominal if t_pts is None else t_pts
+                if t <= last_t:
+                    t = t_nominal
+                last_t = t
                 if max_seconds is not None and t > max_seconds:
                     break
                 h, w = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pts = extract(rgb, w, h)
+                pts = extract(rgb, w, h, int(round(t * 1000.0)))
                 if pts and len(pts) > max(UP_INNER, LO_INNER, L_CORNER, R_CORNER):
                     vert = _dist(pts[UP_INNER], pts[LO_INNER])
                     horiz = _dist(pts[L_CORNER], pts[R_CORNER]) + 1e-6
@@ -128,7 +151,12 @@ def analyze_mouth(video_path, fps=10.0, max_seconds=None):
         cap.release()
 
     times = np.array(times); mar = np.array(mar); face_mask = np.array(face_mask)
-    activity = _activity_from_mar(mar, face_mask, fps)
+    if len(times) > 1:
+        diffs = np.diff(times)
+        diffs = diffs[diffs > 1e-6]
+        if len(diffs):
+            actual_fps = 1.0 / float(np.median(diffs))
+    activity = _activity_from_mar(mar, face_mask, actual_fps)
     return times, mar, face_mask, activity, dur, backend
 
 
@@ -139,17 +167,22 @@ def _activity_from_mar(mar, face_mask, fps):
     if len(mar) < 3:
         return activity
     win = max(1, int(round(0.5 * fps)))
-    marf = mar.copy()
-    last = float("nan")
-    for i in range(len(marf)):           # 顔なし(nan)は直前値で補間
-        if math.isnan(marf[i]):
-            marf[i] = last if not math.isnan(last) else 0.0
-        else:
-            last = marf[i]
-    for i in range(len(marf)):
-        lo = max(0, i - win); hi = min(len(marf), i + win + 1)
-        activity[i] = float(np.std(marf[lo:hi]))
-    activity[face_mask == 0] = 0.0
+    valid = (np.asarray(face_mask) > 0) & np.isfinite(mar)
+    p = 0
+    while p < len(mar):
+        if not valid[p]:
+            p += 1; continue
+        run_lo = p
+        while p < len(mar) and valid[p]:
+            p += 1
+        run_hi = p
+        # 顔が消えたカットを跨いで前のMARを引き継がない。
+        # シーン切替の前後の口形差が「歌唱」と誤検出されるのを防ぐ。
+        for i in range(run_lo, run_hi):
+            lo = max(run_lo, i - win); hi = min(run_hi, i + win + 1)
+            vals = np.asarray(mar[lo:hi], dtype=float)
+            if len(vals) >= 2:
+                activity[i] = float(np.std(vals))
     return activity
 
 
@@ -189,23 +222,34 @@ def build_mouth_profile(video_path, fps=10.0, act_thresh=0.012, max_seconds=None
             video_path, fps=fps, max_seconds=max_seconds)
         if len(times) == 0:
             return None
-        return {"times": times, "activity": activity, "face": face_mask,
-                "fps": fps, "thresh": act_thresh,
+        sample_fps = (1.0 / float(np.median(np.diff(times)))) if len(times) > 1 else float(fps)
+        return {"times": times, "mar": mar, "activity": activity, "face": face_mask,
+                "fps": sample_fps, "thresh": act_thresh,
                 "face_rate": float(np.mean(face_mask)), "backend": backend}
     except Exception as e:
         print(f"     ⚠️ 口解析スキップ（mouth_sync）: {str(e)[:80]}")
         return None
 
 
+def _nearest_profile_index(profile, t):
+    """口プロファイルで時刻tに最も近いサンプルindex。"""
+    import numpy as np
+    times = profile.get("times", []) if profile else []
+    if len(times) == 0:
+        return None
+    right = int(np.clip(np.searchsorted(times, t, side="left"), 0, len(times) - 1))
+    left = max(0, right - 1)
+    return left if abs(float(t) - times[left]) <= abs(times[right] - float(t)) else right
+
+
 def is_mv_singing(profile, t):
     """MVの時刻tで口パク中(歌ってる)か。顔が取れてない/不明なら False（＝確証なし）。"""
     if not profile:
         return False
-    import numpy as np
     times = profile["times"]
     if len(times) == 0:
         return False
-    i = int(np.clip(np.searchsorted(times, t), 0, len(times) - 1))
+    i = _nearest_profile_index(profile, t)
     if profile["face"][i] == 0:        # 顔が取れていない点は歌ってると断定しない
         return False
     return bool(profile["activity"][i] >= profile["thresh"])
@@ -216,11 +260,10 @@ def mv_face_but_silent(profile, t):
     これは remixが歌っている時に来ると“ズレ”の確証になる（顔なしは判定不能→False）。"""
     if not profile:
         return False
-    import numpy as np
     times = profile["times"]
     if len(times) == 0:
         return False
-    i = int(np.clip(np.searchsorted(times, t), 0, len(times) - 1))
+    i = _nearest_profile_index(profile, t)
     if profile["face"][i] == 0:        # 顔が取れていない→判断不能（誤爆させない）
         return False
     return bool(profile["activity"][i] < profile["thresh"])
@@ -301,24 +344,49 @@ def measure_segment_mouth_lag(profile, seg_remix_t, seg_mv_t, venv_times, venv,
     if np.std(V) < 1e-6:
         return None, 0.0, 0.0
     V = (V - V.mean()) / (V.std() + 1e-9)
-    fcov = float(np.mean(np.interp(seg_mv_t, times, face.astype(float))))
+    def nearest_values(query, values):
+        """顔マスクは0/1の離散値なので線形補間しない。"""
+        q = np.asarray(query, dtype=float)
+        right = np.searchsorted(times, q, side="left")
+        right = np.clip(right, 0, len(times) - 1)
+        left = np.clip(right - 1, 0, len(times) - 1)
+        use_left = np.abs(q - times[left]) <= np.abs(times[right] - q)
+        idx = np.where(use_left, left, right)
+        return np.asarray(values)[idx]
+
+    # 探索中のラグごとに「その移動先で顔が取れているか」も
+    # 再計算する。従来は移動前の顔率だけを使っていたため、顔の無い
+    # カットへのシフトが偶然高相関に見えることがあった。
     deltas = np.arange(-max_lag, max_lag + 1e-9, step)
-    best_corr = -2.0; best_lag = 0.0
+    best_corr = -2.0; best_lag = 0.0; best_fcov = 0.0; best_score = -2.0
     for d in deltas:
-        A = np.interp(seg_mv_t + d, times, act)
-        if np.std(A) < 1e-6:
+        shifted = seg_mv_t + d
+        in_range = (shifted >= times[0]) & (shifted <= times[-1])
+        valid = in_range & (nearest_values(shifted, face.astype(float)) >= 0.5)
+        fc = float(np.mean(valid))
+        if int(np.sum(valid)) < 4:
+            continue
+        A = np.interp(shifted[valid], times, act)
+        VV = V[valid]
+        if np.std(A) < 1e-6 or np.std(VV) < 1e-6:
             continue
         An = (A - A.mean()) / (A.std() + 1e-9)
-        c = float(np.mean(V * An))
-        if c > best_corr:
-            best_corr = c; best_lag = float(d)
+        Vn = (VV - VV.mean()) / (VV.std() + 1e-9)
+        c = float(np.mean(Vn * An))
+        # 顔カバー率が少ない候補が、数点の偶然一致だけで
+        # 勝たないよう軽い罰則を与える。生の相関値はログ用に保つ。
+        score = c - 0.15 * max(0.0, min_face - fc)
+        if score > best_score:
+            best_score = score; best_corr = c; best_lag = float(d); best_fcov = fc
+    if best_score <= -2.0:
+        return None, 0.0, 0.0
     # ゲート判定
-    passed = (fcov >= min_face) and (best_corr >= min_corr)
+    passed = (best_fcov >= min_face) and (best_corr >= min_corr)
     if not passed and not ret_always:
-        return None, best_corr, fcov
+        return None, best_corr, best_fcov
     if not passed and ret_always:
-        return best_lag, best_corr, fcov   # 実測値は返すが呼び出し側で min_shift 等で弾く
-    return best_lag, best_corr, fcov
+        return best_lag, best_corr, best_fcov   # 実測値は返すが呼び出し側で min_shift 等で弾く
+    return best_lag, best_corr, best_fcov
 
 
 def main():

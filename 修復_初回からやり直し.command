@@ -3,10 +3,7 @@
 #  🛠 DJ Video Maker — 修復（初回からやり直し）
 #  うまく動かない / 途中で落ちる ときに、これをダブルクリック。
 #  壊れた古い残骸を掃除して、必要なものを一から入れ直します。
-#  Homebrewが入れられない環境では、パスワード不要の
-#  直接ダウンロード方式に自動で切り替わります。
 #  ※音楽・写真・書類などの個人データには一切触りません。
-#  ※setup_common.sh が同じフォルダに必要です
 # ============================================================
 cd "$(dirname "$0")"
 clear
@@ -16,49 +13,73 @@ echo "     壊れた残骸を掃除して、必要なものを入れ直します
 echo "========================================================"
 echo ""
 
-# ---- 共通セットアップ部品を読み込む ----
-DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ ! -f "$DIR/setup_common.sh" ]; then
-    echo "❌ setup_common.sh が見つかりません（この.commandと同じフォルダに置いてください）"
+# ---- Homebrew のPATH（Apple Silicon / Intel 両対応）----
+[ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
+[ -x /usr/local/bin/brew ]    && eval "$(/usr/local/bin/brew shellenv)"
+
+# 管理者チェック（Homebrew操作に必要）
+if ! command -v brew &>/dev/null && ! groups | grep -qw admin; then
+    echo "❌ このアカウント（$(whoami)）は管理者ではないため修復できません。"
+    echo "   システム設定 → ユーザとグループ で管理者にして再起動してから、もう一度実行してください。"
     read -p "Enterで閉じる..."; exit 1
 fi
-source "$DIR/setup_common.sh"
-
-# ---- 事前診断（ネット・開発ツール）----
-djvm_check_network
-djvm_check_clt
 
 # ---- ① 壊れた残骸の掃除 ----
 echo "🧹 [1/5] 壊れた古い残骸を掃除しています..."
 # openssl@1.1 の壊れたリンク（is not a valid keg の原因）を直接削除
 rm -f /usr/local/opt/openssl@1.1 /opt/homebrew/opt/openssl@1.1 2>/dev/null
-command -v brew &>/dev/null && brew uninstall --ignore-dependencies openssl@1.1 2>/dev/null
+brew uninstall --ignore-dependencies openssl@1.1 2>/dev/null
 # Pythonキャッシュ・pyc の死骸
-find "$DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
-find "$DIR" -name "*.pyc" -delete 2>/dev/null
-# 以前の静的バイナリも一旦消して入れ直す（半端なDLの残骸対策）
-rm -rf "$DJVM_BIN" 2>/dev/null
-command -v brew &>/dev/null && brew cleanup 2>/dev/null
+find "$(dirname "$0")" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+find "$(dirname "$0")" -name "*.pyc" -delete 2>/dev/null
+if command -v brew &>/dev/null; then
+    brew cleanup 2>/dev/null
+fi
 echo "   完了"
 
-# ---- ② ツールを入れ直す（brew優先 → だめなら直接ダウンロード）----
-echo "🎬 [2/5] ffmpeg / ffprobe / yt-dlp を入れ直しています..."
-if command -v brew &>/dev/null; then
-    brew update 2>/dev/null
-    brew reinstall ffmpeg 2>/dev/null || brew install ffmpeg
-    brew reinstall yt-dlp 2>/dev/null || brew install yt-dlp
-    brew upgrade yt-dlp 2>/dev/null
+# ---- ② Homebrew（無ければ入れる / あれば更新）----
+echo "🍺 [2/5] 基本ツール(Homebrew)を確認・更新しています..."
+if ! command -v brew &>/dev/null; then
+    echo "   Homebrewが無いので入れます（Macのパスワードを1回聞かれます）..."
+    export NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ANALYTICS=1
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < /dev/null
+    [ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
+    [ -x /usr/local/bin/brew ]    && eval "$(/usr/local/bin/brew shellenv)"
 fi
-# brewが無い/失敗した分は共通部品が面倒を見る（Homebrew導入 or 静的DL）
-djvm_ensure_tools
+if ! command -v brew &>/dev/null; then
+    echo "❌ Homebrewが使えません。ネット接続と管理者権限を確認してください。"
+    read -p "Enterで閉じる..."; exit 1
+fi
+export HOMEBREW_NO_ENV_HINTS=1
+brew update 2>/dev/null
 
-# ---- ③ Python環境を作り直す ----
-echo "🐍 [3/5] Python環境を作り直しています..."
-rm -rf "$HOME/.dj_video_maker_env" 2>/dev/null
+# ---- ③ ffmpeg / yt-dlp を入れ直す ----
+echo "🎬 [3/5] ffmpeg と yt-dlp を入れ直しています..."
+brew reinstall ffmpeg 2>/dev/null || brew install ffmpeg
+brew reinstall yt-dlp 2>/dev/null || brew install yt-dlp
+brew upgrade yt-dlp 2>/dev/null
 
-# ---- ④ ライブラリを入れ直す ----
-echo "📚 [4/5] ライブラリを入れ直しています（数分かかります）..."
-djvm_setup_python full
+# ---- ④ Python環境を作り直す ----
+echo "🐍 [4/5] Python環境とライブラリを入れ直しています（数分かかります）..."
+VENV="$HOME/.dj_video_maker_env"
+PYTHON_CMD="$VENV/bin/python3"
+# venvを作り直す（壊れている可能性があるので一度消す）
+rm -rf "$VENV" 2>/dev/null
+python3 -m venv "$VENV" 2>/dev/null || /usr/bin/python3 -m venv "$VENV"
+"$PYTHON_CMD" -m pip install --quiet --no-input --upgrade pip
+"$PYTHON_CMD" -m pip install --no-input numpy scipy mutagen Pillow librosa fastdtw
+# 任意（重い）: リップシンク・口解析。失敗しても本体は動く
+"$PYTHON_CMD" -m pip install --no-input demucs 2>/dev/null \
+  || echo "   （demucsは入りませんでした → 従来方式で動きます）"
+"$PYTHON_CMD" -m pip install --no-input transformers torchaudio 2>/dev/null \
+  || echo "   （HuBERT用は入りませんでした → MFCC方式で動きます）"
+# torchaudio 2.9以降は音声の書き出しに torchcodec が必須（無いとDemucsが保存段で落ちる）
+"$PYTHON_CMD" -m pip install --no-input torchcodec 2>/dev/null \
+  || echo "   （torchcodecは入りませんでした → 保存経路を使わない方式で動きます）"
+"$PYTHON_CMD" -m pip install --no-input faster-whisper 2>/dev/null \
+  || echo "   （Whisper単語アライメントは入りませんでした → その段はスキップ）"
+"$PYTHON_CMD" -m pip install --no-input mediapipe opencv-python 2>/dev/null \
+  || echo "   （口の動き解析は入りませんでした → その機能はスキップ）"
 
 # ---- ⑤ 動作検証 ----
 echo "🔍 [5/5] 正しく入ったか確認しています..."
@@ -75,13 +96,14 @@ if [ -z "$NG" ]; then
     echo "     ffmpeg : $(ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f1-3)"
     echo "     yt-dlp : $(yt-dlp --version 2>/dev/null)"
     echo ""
-    echo "  → 『これをダブルクリック！.command』（または DJ_Video_Maker.command）を"
+    echo "  → 通常の DJ_Video_Maker.command（または URL版）を"
     echo "     ダブルクリックして使ってください。"
 else
     echo "  ⚠️ まだ次が入っていません：$NG"
     echo ""
-    echo "  ・回線を変えて（VPNオフ／iPhoneテザリング等）もう一度実行してください。"
-    echo "  ・それでもダメな場合は、この画面を写真に撮って配布元に送ってください。"
+    echo "  ネット接続を確認して、もう一度この修復ツールを実行してください。"
+    echo "  それでもダメな場合は、ターミナルで次を実行して指示に従ってください："
+    echo "      brew doctor"
 fi
 echo "========================================================"
 echo ""

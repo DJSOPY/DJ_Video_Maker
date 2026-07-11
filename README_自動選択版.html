@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DJ Video Maker（YouTube自動選択版）— 説明書</title>
+<style>
+  :root{
+    --ink:#16181d; --paper:#f7f6f2; --panel:#ffffff;
+    --accent:#0e6b5c;         /* Serato系の深緑 */
+    --hot:#c93a3a;            /* エラー・警告の赤 */
+    --code-bg:#101418; --code-ink:#e8f0ea;
+    --line:#dcd9d0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;
+       line-height:1.75;font-size:15.5px;}
+  .wrap{max-width:820px;margin:0 auto;padding:28px 20px 80px;}
+  header{border-bottom:3px solid var(--ink);padding:18px 0 14px;margin-bottom:8px;}
+  header .brand{font-size:12px;letter-spacing:.18em;color:var(--accent);font-weight:700;}
+  header h1{margin:.15em 0 0;font-size:30px;letter-spacing:.01em;}
+  header p{margin:.5em 0 0;color:#555;}
+  nav{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 6px;}
+  nav a{font-size:12.5px;text-decoration:none;color:var(--ink);
+        border:1.5px solid var(--ink);border-radius:999px;padding:4px 12px;background:var(--panel);}
+  nav a:hover,nav a:focus-visible{background:var(--ink);color:#fff;}
+  h2{font-size:20px;margin:2.2em 0 .6em;padding-top:.4em;border-top:2px solid var(--line);}
+  h2 .tag{display:inline-block;font-size:11px;vertical-align:middle;margin-left:8px;
+          background:var(--accent);color:#fff;border-radius:4px;padding:1px 8px;letter-spacing:.08em;}
+  h3{font-size:16px;margin:1.6em 0 .4em;}
+  .steps{background:var(--panel);border:1.5px solid var(--line);border-radius:10px;
+         padding:14px 18px;margin:.6em 0;}
+  .steps ol{margin:.2em 0;padding-left:1.4em;}
+  .err{font-family:ui-monospace,Menlo,monospace;font-size:13px;background:#fbeaea;
+       border:1px solid #ecc8c8;color:#8c2323;border-radius:6px;padding:8px 12px;
+       margin:.4em 0;white-space:pre-wrap;}
+  .note{border-left:4px solid var(--accent);background:#eef4f2;padding:10px 14px;
+        border-radius:0 8px 8px 0;margin:.6em 0;}
+  .warn{border-left:4px solid var(--hot);background:#fdf1f1;padding:10px 14px;
+        border-radius:0 8px 8px 0;margin:.6em 0;}
+  /* ---- コピーできるコマンド ---- */
+  .cmd{position:relative;background:var(--code-bg);border-radius:10px;
+       margin:.7em 0;overflow:hidden;}
+  .cmd pre{margin:0;padding:14px 96px 14px 16px;overflow-x:auto;}
+  .cmd code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13.5px;
+            color:var(--code-ink);white-space:pre;}
+  .cmd button{position:absolute;top:8px;right:8px;border:0;border-radius:7px;
+              background:var(--accent);color:#fff;font-size:12.5px;font-weight:700;
+              padding:7px 14px;cursor:pointer;font-family:inherit;}
+  .cmd button:hover{filter:brightness(1.15);}
+  .cmd button.done{background:#2e7d32;}
+  .cmd .hint{display:block;font-size:11.5px;color:#9fb3a9;padding:0 16px 10px;}
+  table{border-collapse:collapse;width:100%;background:var(--panel);
+        border:1.5px solid var(--line);border-radius:10px;overflow:hidden;font-size:13.5px;}
+  th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;}
+  th{background:var(--ink);color:#fff;font-weight:600;letter-spacing:.05em;}
+  tr:last-child td{border-bottom:0;}
+  td:first-child{white-space:normal;font-weight:600;width:42%;}
+  .good{color:var(--accent);font-weight:700;}
+  .bad{color:var(--hot);font-weight:700;}
+  footer{margin-top:56px;border-top:3px solid var(--ink);padding-top:14px;
+         font-size:13px;color:#555;}
+  @media (max-width:560px){ .cmd pre{padding-right:16px;padding-top:44px;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">DJ SOPY / @sousouagain</div>
+  <h1>🎧 DJ Video Maker 説明書<br><span style="font-size:16px;color:#0e6b5c">YouTube自動選択版</span></h1>
+  <p>DJ用のRemix/EditのMP3・動画を入れると、公式MVを自動で探して曲に同期したMP4を作るツール。Serato / VirtualDJ 用のビートグリッド・Cueも書き込み済みで出力します。</p>
+</header>
+
+<nav>
+  <a href="#use">使い方</a>
+  <a href="#open">.commandが開けない</a>
+  <a href="#sudo">Need sudo access</a>
+  <a href="#403">403エラー</a>
+  <a href="#name">ファイル名の付け方</a>
+  <a href="#table">よくあるエラー早見表</a>
+  <a href="#feat">できること</a>
+</nav>
+
+<h2 id="use">✅ 使い方（3ステップ）</h2>
+<div class="steps"><ol>
+<li>フォルダの中のファイルを<b>全部同じ場所</b>に置いたまま、<b><code>DJ_Video_Maker.command</code> をダブルクリック</b></li>
+<li>黒い画面（ターミナル）が開くので、案内に従って<b>曲ファイルをドラッグ&amp;ドロップ → Enter</b>。あとは<b>MVを自動で探して</b>同期します</li>
+<li>待つだけ。完成したMP4は<b>デスクトップ</b>に出ます</li>
+</ol></div>
+<div class="note">初回だけ、必要なツールの自動インストールで<b>数分〜30分</b>かかります（2回目以降は速い）。ネット接続が必要です。</div>
+
+<h2 id="open">🚨 「.command が開けない！」を直す <span class="tag">最重要</span></h2>
+<p>macOSは、ネットからもらった <code>.command</code> を<b>最初の1回だけ</b>ブロックします。故障ではありません。症状別にどれかで開けます。</p>
+
+<h3>A．「開発元を検証できないため開けません」と出る</h3>
+<div class="steps"><ol>
+<li><code>DJ_Video_Maker.command</code> を<b>右クリック</b>（または control＋クリック）</li>
+<li>メニューの<b>「開く」</b>を選ぶ</li>
+<li>警告が出るが、もう一度<b>「開く」</b></li>
+</ol></div>
+<p>→ 一度これで開けば、次からはダブルクリックでOK。</p>
+
+<h3>B．Aの「開く」が出てこない／それでもダメ</h3>
+<div class="steps"><ol>
+<li>アップルメニュー →「システム設定」→<b>「プライバシーとセキュリティ」</b></li>
+<li>下の方の「"DJ_Video_Maker.command"は開発元を確認できないため…」の横の<b>「このまま開く」</b></li>
+<li>もう一度ダブルクリック</li>
+</ol></div>
+
+<h3>C．ダブルクリックするとテキストエディタで開いてしまう／何も起きない</h3>
+<h3 style="font-weight:400;font-size:14px;margin-top:-6px;">＝実行の権限が外れています。ターミナル（Spotlightで「ターミナル」と検索）で：</h3>
+<div class="cmd">
+  <button type="button">コピー</button>
+  <pre><code>chmod +x </code></pre>
+  <span class="hint">※末尾に半角スペースが入った状態でコピーされます。貼ったらEnterせず、次へ</span>
+</div>
+<div class="steps"><ol>
+<li>上の「コピー」を押してターミナルに貼る（<b>まだEnterしない</b>）</li>
+<li><code>.command</code> ファイルをターミナルの画面に<b>ドラッグ&amp;ドロップ</b>（パスが自動で入る）</li>
+<li>Enter → もう一度ダブルクリック</li>
+</ol></div>
+
+<h3>D．「壊れているため開けません。ゴミ箱に入れる必要があります」と出る</h3>
+<p>ダウンロード時に付く隔離マークのせいです。同じ要領で：</p>
+<div class="cmd">
+  <button type="button">コピー</button>
+  <pre><code>xattr -cr </code></pre>
+  <span class="hint">※末尾に半角スペース入り。貼ったらEnterせず、フォルダごとドラッグ&amp;ドロップ → Enter</span>
+</div>
+<p>→ フォルダ内すべての隔離が外れます。そのあと<b>A</b>の手順で開いてください。</p>
+
+<h3>E．「適切なアクセス権限がないために実行できません」と出る</h3>
+<p><b>C と同じ直し方</b>です（<code>chmod +x</code> → ファイルをドラッグ&amp;ドロップ → Enter）。ZIPやAirDrop経由で権限が剥がれた時に出ます。</p>
+
+<h2 id="sudo">🔑 「Need sudo access」「Homebrewのインストールに失敗」と出る</h2>
+<div class="err">Need sudo access on macOS (e.g. the user needs to be an Administrator)!
+❌ Homebrewのインストールに失敗しました</div>
+<p>これは<b>ネットの問題ではなく</b>、使っているMacのアカウントが<b>「管理者」ではない</b>のが原因です。初回セットアップだけは管理者権限が必須です（macOSの仕様）。</p>
+<div class="note"><b>安心してください：</b>「管理者にする」はアカウントの切り替えではなく、今のアカウントに権限を足すだけ。<b>音楽・写真・書類などのデータは一切消えません</b>。心配なら、セットアップが終わった後に「通常」へ戻してもOK（入れたツールはそのまま使えます）。</div>
+<div class="steps"><ol>
+<li><b>アカウントを管理者にする</b><br>
+アップルメニュー → システム設定 → <b>ユーザとグループ</b> → 自分のアカウントの (i) →
+<b>「このユーザを管理者として設定」をON</b>（Macの管理者パスワードが必要）→ <b>再起動</b></li>
+<li><b>Homebrewを手動で1回入れる</b>（再起動後、ターミナルにこれを貼ってEnter）
+<div class="cmd">
+  <button type="button">コピー</button>
+  <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"</code></pre>
+</div>
+途中で <code>Password:</code> と出たらMacのパスワードを入力（<b>画面には表示されないが打てています</b>）→ Enter。「Press RETURN…」と出たら Enter。</li>
+<li><b>もう一度 <code>.command</code> をダブルクリック</b> → 続きが自動で進みます</li>
+</ol></div>
+
+<h2 id="403">📡 「HTTP Error 403: Forbidden」「映像ファイルが見つかりません」と出る</h2>
+<div class="err">ERROR: unable to download video data: HTTP Error 403: Forbidden
+❌ 映像ファイルが見つかりません</div>
+<p><b>YouTube側がダウンロードを一時的に拒否した</b>エラーです。ツールやMacの故障ではありません（YouTubeは仕様を頻繁に変えるため、たまに起きます）。上から順に試してください：</p>
+<div class="steps"><ol>
+<li><b>ChromeでYouTubeにログインする（一番効きます）</b><br>
+Chromeを開く → YouTubeにログイン → 動画を1本普通に再生 → <code>.command</code> を再実行<br>
+<span style="color:#666">（このツールはChromeのログイン情報を使うため、未ログインだとボット扱いされやすい）</span></li>
+<li>ターミナルでこれを実行してから再実行：
+<div class="cmd">
+  <button type="button">コピー</button>
+  <pre><code>brew upgrade yt-dlp</code></pre>
+</div></li>
+<li>それでもダメなら<b>数時間〜1日待って再実行</b>（対策版が自動配信されます。大抵数日以内に直ります）</li>
+<li>別の公式動画のURLで試す（URL版の場合）</li>
+</ol></div>
+
+<h2 id="name">🏷 曲ファイルの名前の付け方（正しいMVを見つけるコツ）</h2>
+<p>ツールは ①ファイル内のタグ（曲名/アーティスト）→ ②ファイル名 の順で曲を特定します。<b>タグが無い曲は、ファイル名がすべて</b>です。</p>
+<table>
+<tr><th>例</th><th>判定</th></tr>
+<tr><td><code>DNCE - Cake By The Ocean.mp3</code></td><td class="good">◎ アーティスト - 曲名</td></tr>
+<tr><td><code>前前前世 - Natino Remix.mp3</code></td><td class="good">◎ 曲名 - リミキサー名 Remix</td></tr>
+<tr><td><code>jzIWE3T_R21yFA1Uf....mp3</code></td><td class="bad">✕ ランダム文字列＝何の曲か分からず失敗</td></tr>
+<tr><td><code>… KLICKAUD.mp3</code> などサイト名入り</td><td class="bad">△ 透かしは消しておくと検索が正確に</td></tr>
+</table>
+<div class="note">ファイル名を変えても音や中身には影響しません。この版は<b>ファイル名（またはタグ）だけを頼りにMVを探す</b>ので、名前がすべてです。</div>
+
+<h2 id="table">⚠️ よくあるエラー早見表</h2>
+<table>
+<tr><th>症状</th><th>対処</th></tr>
+<tr><td>「dj_maker_core.py が見つかりません」</td><td>ファイルが同じフォルダに揃っていない。全部同じ場所に置く</td></tr>
+<tr><td>「適切なアクセス権限がない」</td><td>上の <a href="#open">C/E</a>（chmod +x）</td></tr>
+<tr><td>「Need sudo access」/ Homebrew失敗</td><td>上の <a href="#sudo">🔑の章</a>（管理者にする。データは消えない）</td></tr>
+<tr><td>「HTTP Error 403」/ 映像が見つからない</td><td>上の <a href="#403">📡の章</a>（Chromeでログインが一番効く）</td></tr>
+<tr><td>MVが全然違う動画になる</td><td>上の <a href="#name">🏷の章</a>（名前を付け直す or URL版）</td></tr>
+<tr><td>初回がすごく長い／止まって見える</td><td>AIライブラリのDL中（最大30分）。進捗が動いていれば正常。閉じないで待つ</td></tr>
+<tr><td>Macのパスワードを聞かれた</td><td>初回のHomebrew導入時だけ。macOSの仕様なので入力してOK</td></tr>
+<tr><td>口の動き解析が出ない</td><td>mediapipe未導入でも本体は従来通り動く（その機能だけ自動スキップ）</td></tr>
+<tr><td>Intel Macで遅い</td><td>対応済み。ただしAI処理（リップシンク曲）はApple Siliconより数倍かかります</td></tr>
+</table>
+
+<h2 id="feat">💡 できること・出力されるもの</h2>
+<p><b>入れられる曲</b>：MP3 / m4a / wav などの音声、mp4 などの動画。原曲も Remix / Edit も対応（1曲ベースのもの）。複数曲まとめてドロップで一気に書き出し。<span class="bad">Mashup（複数曲ミックス）は非対応</span>（どの曲のMVを使うか決められないため）。</p>
+<p><b>自動でやること</b>：公式MVをYouTubeで自動検索（再生数の多い本物を選択）／曲に映像を自動同期／歌っていない間奏に口パク映像が来ないよう調整。</p>
+<p><b>出力されるMP4（DJ向け）</b>：<b>ビートグリッド書き込み済み</b>（Serato / VirtualDJ に読み込むとBPMとグリッドが合った状態）／<b>元のCueポイントを引き継ぎ</b>（打ち直し不要）／1280×720・30fps／デスクトップに出力。</p>
+<p><b>オプション</b>：起動時の質問で Extended化（イントロ追加）／タイトルテロップの有無を選べます。</p>
+<div class="warn">同じサビを何度も使い回すタイプのリミックスでは、口の同期が完璧にならない場合があります。その場合も全体として自然に仕上がるよう作っています。</div>
+
+<footer>
+  配布時は<b>このフォルダごと</b>渡してください（ファイルは全部同じ場所に置いたまま）。<br>
+  created by DJ SOPY / @sousouagain
+</footer>
+
+</div>
+<script>
+document.querySelectorAll('.cmd').forEach(function(box){
+  var btn = box.querySelector('button');
+  var code = box.querySelector('code');
+  btn.addEventListener('click', function(){
+    var text = code.textContent;              // 末尾スペースもそのままコピー
+    function ok(){ btn.textContent='コピーした！'; btn.classList.add('done');
+      setTimeout(function(){btn.textContent='コピー';btn.classList.remove('done');},1600); }
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(ok).catch(function(){fallback();});
+    } else { fallback(); }
+    function fallback(){
+      var ta=document.createElement('textarea'); ta.value=text;
+      document.body.appendChild(ta); ta.select();
+      try{ document.execCommand('copy'); ok(); }catch(e){}
+      document.body.removeChild(ta);
+    }
+  });
+});
+</script>
+</body>
+</html>
