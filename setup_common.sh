@@ -411,11 +411,17 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
         echo "📦 基本ライブラリをインストール中（初回・数分）..."
         # pipを最新化（古いpipは新しい完成品(wheel)を認識できずビルドに落ちるため必須）
         "$PYTHON_CMD" -m pip install --quiet --no-input --upgrade pip setuptools wheel
-        # まず「完成品(wheel)のみ・ソースビルド禁止」で試す。
-        # これにより llvmlite 等が“延々ビルドして失敗”する事故（3.14で起きたやつ）を防ぐ。
-        # 対応版Python(3.12等)を使っている前提なので、通常はこれで全部そろう。
+        # ★Intel Mac対策：librosaが依存する numba/llvmlite を、
+        #   Intel(x86_64)でもApple Siliconでも完成品(wheel)が確実にあるバージョンに固定して先に入れる。
+        #   （最新のllvmliteはIntel Mac用の完成品macOS wheelが無く、ビルドに落ちるため）
+        #   numba 0.61.2 → llvmlite 0.44.0：両アーキで cp310〜cp313 の完成品あり。
+        "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input \
+              "llvmlite==0.44.0" "numba==0.61.2" 2>/tmp/djvm_pip.log \
+          || "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input "numba<0.62" 2>>/tmp/djvm_pip.log
+        # まず「完成品(wheel)のみ・ソースビルド禁止」で残りを入れる。
+        # numba/llvmliteは上で固定済みなので、librosaはそれを再利用する。
         if "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input \
-              numpy scipy mutagen Pillow librosa fastdtw 2>/tmp/djvm_pip.log; then
+              numpy scipy mutagen Pillow librosa fastdtw 2>>/tmp/djvm_pip.log; then
             :
         else
             # 完成品が一部欠けた場合のみ、通常インストール（ビルド許可）で最後の一押し
@@ -429,12 +435,12 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
             # 原因を分かりやすく振り分けて案内
             pyver="$("$PYTHON_CMD" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)"
             if grep -qi "llvmlite\|numba\|Failed building wheel" /tmp/djvm_pip.log 2>/dev/null; then
-                echo "   原因：このPython($pyver)向けの音声解析部品(llvmlite)がまだ提供されていません。"
-                echo "   対処：修復ツールが対応版Python(3.12)で作り直します。"
-                echo "        『修復_初回からやり直し.command』を実行してください。"
+                echo "   原因：この環境向けの音声解析部品(llvmlite/numba)の準備に失敗しました。"
+                echo "   ネット接続（VPNオフ・別回線）を確認して、もう一度お試しください。"
+                echo "   💬 何度も失敗する場合は、この画面を写真に撮って @sousouagain へ送ってください。"
             else
                 echo "   ネット接続を確認して、もう一度お試しください（VPNオフ／別回線も有効）。"
-                echo "   何度も失敗する場合は『修復_初回からやり直し.command』を実行してください。"
+                echo "   💬 何度も失敗する場合は、この画面を写真に撮って @sousouagain へ送ってください。"
             fi
             djvm_pause_exit
         fi
