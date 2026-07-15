@@ -537,8 +537,18 @@ def choose_video(music_path):
     results, used_query, used_remix = smart_search_mv(full_name, 5, artist=artist, title=title)
     print(f"     検索ワード: {used_query}")
     if not results:
-        print("  ❌ 検索結果なし")
-        return [input("  URLを手動入力:\n  > ").strip()]
+        print("  ❌ MVが見つかりませんでした")
+        if os.environ.get("DJVM_WEB") == "1":
+            # Web版：手入力できないので、この曲は諦めて次へ（全体は止めない）
+            print("     → この曲はスキップします。URL欄にYouTubeのURLを貼ると確実に作れます。")
+            raise RuntimeError("MVが見つかりませんでした（URL欄にURLを貼ると確実です）")
+        try:
+            u = input("  URLを手動入力:\n  > ").strip()
+        except EOFError:
+            u = ""
+        if not u:
+            raise RuntimeError("MVが見つかりませんでした")
+        return [u]
 
     def _url(r): return f"https://www.youtube.com/watch?v={r['id']}"
     all_urls = [_url(r) for r in results]   # best-first（静止画なら順に次を試す）
@@ -1573,10 +1583,14 @@ def concat_segments(segments, out_path, tmp_dir):
 
 CONFIDENCE_THRESHOLD = 0.35
 
-def fit_to_size(video_path, music_path, target_mb, tmp_dir):
+def fit_to_size(video_path, music_path, target_mb, tmp_dir, audio_cap_kbps=320):
     """
-    完成MP4を target_mb 以内に収める。音声は元のまま（音質維持）、
-    映像ビットレートだけ落として調整する。既に収まっていれば何もしない。
+    完成MP4を target_mb 以内に収める。
+    audio_cap_kbps=None のとき：音声は元のまま（音質最優先・従来動作）
+    audio_cap_kbps=320 のとき ：元が320kbps超（WAV/FLAC等）なら320kbpsに変換し、
+                                 浮いた容量を映像に回す（画質優先）。
+                                 元が320kbps以下なら、そのままコピー（無劣化）。
+    映像ビットレートで最終調整する。既に収まっていれば何もしない。
     """
     try:
         cur = video_path.stat().st_size / (1024*1024)
@@ -1589,17 +1603,30 @@ def fit_to_size(video_path, music_path, target_mb, tmp_dir):
     if dur <= 0:
         return video_path
 
-    # 音声のビットレートを取得（元のまま使うので、その分を引く）
-    abr_kbps = 320  # 取得失敗時の保守的な見積り
+    # 音声のビットレートを取得
+    src_abr_kbps = 320  # 取得失敗時の保守的な見積り
     try:
         r = subprocess.run(["ffprobe","-v","quiet","-select_streams","a:0",
             "-show_entries","stream=bit_rate","-of","default=noprint_wrappers=1:nokey=1",
             str(video_path)], capture_output=True, text=True, errors="replace")
         v = r.stdout.strip()
         if v.isdigit() and int(v) > 0:
-            abr_kbps = int(v) / 1000
+            src_abr_kbps = int(v) / 1000
     except Exception:
         pass
+
+    # --- 音声の扱いを決める ---
+    #   audio_cap_kbps=None → 常に元のままコピー（音質最優先）
+    #   元が上限以下         → コピー（無劣化）
+    #   元が上限超(WAV等)    → 上限kbpsのAACに変換し、浮いた分を映像へ
+    if audio_cap_kbps and src_abr_kbps > audio_cap_kbps + 1:
+        abr_kbps  = float(audio_cap_kbps)
+        audio_args = ["-c:a", "aac", "-b:a", f"{audio_cap_kbps}k"]
+        audio_note = f"音声 {src_abr_kbps:.0f}→{audio_cap_kbps}kbps に変換して画質を確保"
+    else:
+        abr_kbps  = src_abr_kbps
+        audio_args = ["-c:a", "copy"]
+        audio_note = "音声は元のまま維持"
 
     # 使える総ビット量から映像ビットレートを逆算
     #   目標サイズ(bits) = target_mb * 8 * 1024 * 1024
@@ -1610,7 +1637,7 @@ def fit_to_size(video_path, music_path, target_mb, tmp_dir):
     if video_kbps < 150:
         video_kbps = 150  # 最低画質の下限（これ以下は見るに耐えない）
 
-    print(f"  📦 {cur:.0f}MB → {target_mb}MB以内に圧縮中（映像 {video_kbps:.0f}kbps・音声は維持）...")
+    print(f"  📦 {cur:.0f}MB → {target_mb}MB以内に圧縮中（映像 {video_kbps:.0f}kbps・{audio_note}）...")
     out = tmp_dir / ("fit_" + video_path.name)
     # 2パスエンコードで目標ビットレートを正確に当てる
     passlog = tmp_dir / "ff2pass"
@@ -1619,10 +1646,10 @@ def fit_to_size(video_path, music_path, target_mb, tmp_dir):
         "-c:v","libx264","-b:v",f"{video_kbps:.0f}k","-pass","1",
         "-passlogfile",str(passlog),"-an","-f","mp4","-preset","medium",
         "/dev/null"], capture_output=True)
-    # 2パス目（音声はコピー＝元のまま）
+    # 2パス目（音声は上の方針に従う）
     r = subprocess.run(["ffmpeg","-y","-i",str(video_path),
         "-c:v","libx264","-b:v",f"{video_kbps:.0f}k","-pass","2",
-        "-passlogfile",str(passlog),"-c:a","copy","-pix_fmt","yuv420p",
+        "-passlogfile",str(passlog)] + audio_args + ["-pix_fmt","yuv420p",
         "-movflags","+faststart","-preset","medium",str(out)], capture_output=True)
     # passログ掃除
     for p in tmp_dir.glob("ff2pass*"):
@@ -3306,156 +3333,8 @@ def add_watermark(video_path, times, tmp_dir, text=None):
 
     return video_path
 
-def build_title_text(music_path):
-    """タグ/ファイル名から『アーティスト - 曲名 (Remix名)』形式のタイトル文字列を組み立てる"""
-    import re
-    tags = get_metadata(music_path)
-    title  = (tags.get("title") or "").strip()
-    artist = (tags.get("artist") or tags.get("album_artist") or "").strip()
 
-    # Remix名は「タグの曲名」と「ファイル名」両方から探す（タグに入ってないことが多い）
-    rmx_kw = r'(remix|rmx|edit|bootleg|rework|refix|flip|mashup|mash-up|bounce|vip|dub|re-?fix|re-?work|mix)'
-    def find_remix(s):
-        if not s:
-            return ""
-        # 1) 括弧/角括弧で囲まれたRemix名: (XXX Remix) [XXX Edit]
-        m = re.search(r'[\(\[\{]([^\)\]\}]*' + rmx_kw + r'[^\)\]\}]*)[\)\]\}]', s, re.I)
-        if m:
-            return m.group(1).strip()
-        # 2) 括弧なし「- XXX Remix」「 XXX Remix」末尾パターン
-        m = re.search(r'[-–—]\s*([^\-–—\(\)\[\]]*' + rmx_kw + r'[^\-–—\(\)\[\]]*)$', s, re.I)
-        if m:
-            return m.group(1).strip()
-        # 3) どこかに "XXX Remix" があれば、その語+直前1語くらい
-        m = re.search(r'([A-Za-z0-9!&\'\.]+\s+' + rmx_kw + r')\b', s, re.I)
-        if m:
-            return m.group(1).strip()
-        return ""
 
-    rmx = find_remix(title) or find_remix(music_path.stem)
-
-    # 曲名本体（Remix表記やノイズを除去）。タグ優先、無ければファイル名
-    base_for_song = title if (title and title.strip()) else music_path.stem
-    song = clean_song_query(strip_filename_noise(base_for_song)).strip()
-    # clean_song_queryで取り切れない括弧なしRemix表記を曲名から削る
-    if rmx:
-        song = re.sub(r'\s*[-–—]?\s*\(?' + re.escape(rmx) + r'\)?\s*$', '', song, flags=re.I).strip()
-        song = re.sub(r'[-–—]\s*[^\-–—]*' + rmx_kw + r'[^\-–—]*$', '', song, flags=re.I).strip()
-
-    # タグにアーティストが無ければ "Artist - Title" 形式から取る
-    if not artist and " - " in song:
-        parts = re.split(r'\s-\s', song, 1)
-        artist = parts[0].strip(); song = parts[1].strip()
-    # ファイル名からアーティストを補完（タグ空のとき）
-    if not artist and " - " in music_path.stem:
-        cand = music_path.stem.split(" - ", 1)[0].strip()
-        if cand and not re.search(rmx_kw, cand, re.I):
-            artist = cand
-
-    # 装飾記号・絵文字を除去（ファイル名整理用の ★ ☆ ◎ ● 【】 などやemoji）
-    def _clean_deco(s):
-        if not s: return s
-        # 記号類を除去（英数字・かな漢字・基本的な区切り( ) - & ' . , スペースは残す）
-        s = re.sub(r'[★☆◎●○■□▲▼◆◇♪♫➤➡⇒\*※\u2000-\u206F\u2600-\u27BF\U0001F000-\U0001FAFF]', '', s)
-        s = re.sub(r'[【】「」『』〈〉《》〔〕\[\]\{\}]', '', s)
-        # よくある日本語ノイズ語
-        s = re.sub(r'(公式|オフィシャル|フル|高音質|歌詞付き?|字幕付き?)', '', s)
-        return re.sub(r'\s+', ' ', s).strip(' -–—_.')
-
-    artist = _clean_deco(artist)
-    song   = _clean_deco(song)
-    rmx    = _clean_deco(rmx)
-
-    # 組み立て: アーティスト - 曲名 (Remix名)
-    pieces = []
-    if artist: pieces.append(artist)
-    if song:   pieces.append(("- " + song) if artist else song)
-    text = " ".join(pieces).strip()
-    if rmx:
-        text = f"{text} ({rmx})"
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text.upper() if text else _clean_deco(music_path.stem).upper()
-
-def make_title_png(text, out_path, W=1280, H=720):
-    """カラフルなタイトルテロップの透過PNGを作る（1単語ごとに色違い・縁取りつき）。
-    Remix名の (..) は途中改行しない。成功でTrue。"""
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception:
-        try:
-            import sys as _sys
-            subprocess.run([_sys.executable, "-m", "pip", "install", "Pillow",
-                            "--break-system-packages", "-q"], capture_output=True, timeout=120)
-            from PIL import Image, ImageDraw, ImageFont
-        except Exception:
-            return False
-    import re, random
-    # ネオン系パレット（明るく視認性の良い色）
-    NEON = [(255,90,160),(90,200,255),(255,225,90),(130,255,150),(255,150,80),(190,130,255)]
-    fp = _find_font()
-    fontsize = 54
-    try:
-        font = ImageFont.truetype(fp, fontsize) if fp else ImageFont.load_default(size=fontsize)
-    except Exception:
-        try:
-            font = ImageFont.load_default(size=fontsize)
-        except Exception:
-            font = ImageFont.load_default()
-
-    img = Image.new("RGBA", (W, H), (0,0,0,0))
-    draw = ImageDraw.Draw(img)
-    # トークン化: (..) のかたまりは1トークン（途中改行しない）
-    tokens = re.findall(r'\([^)]*\)|\S+', text)
-    space_w = draw.textlength(" ", font=font)
-    max_w = W - 120
-    # 折り返し
-    lines = []; cur = []; cur_w = 0
-    for tk in tokens:
-        tw = draw.textlength(tk, font=font)
-        if cur and cur_w + space_w + tw > max_w:
-            lines.append(cur); cur = [tk]; cur_w = tw
-        else:
-            cur.append(tk); cur_w += (space_w + tw if cur_w else tw)
-    if cur: lines.append(cur)
-
-    x0, y0 = 60, 70
-    line_h = fontsize + 16
-    prev_color = None
-    for li, line in enumerate(lines):
-        x = x0; y = y0 + li * line_h
-        for tk in line:
-            choices = [c for c in NEON if c != prev_color] or NEON
-            c = random.choice(choices); prev_color = c
-            # 縁取り(黒)
-            for dx in (-2,-1,0,1,2):
-                for dy in (-2,-1,0,1,2):
-                    if dx or dy:
-                        draw.text((x+dx, y+dy), tk, font=font, fill=(0,0,0,210))
-            draw.text((x, y), tk, font=font, fill=c+(255,))
-            x += draw.textlength(tk, font=font) + space_w
-    img.save(out_path)
-    return True
-
-def apply_title_overlay(video_path, music_path, tmp_dir):
-    """完成動画にカラフルなタイトルテロップを全編オーバーレイする。成功で新パス、失敗で元パス。"""
-    text = build_title_text(music_path)
-    if not text:
-        return video_path
-    png = tmp_dir / "title_overlay.png"
-    if not make_title_png(text, png):
-        print(f"  ⚠️  テロップ生成に失敗（スキップ）")
-        return video_path
-    out = tmp_dir / ("titled_" + Path(video_path).name)
-    # PNGを全編オーバーレイ（音声はそのままコピー）
-    r = subprocess.run(["ffmpeg","-y","-i",str(video_path),"-i",str(png),
-        "-filter_complex","[0:v][1:v]overlay=0:0",
-        "-c:v","libx264","-preset","fast","-crf","18","-pix_fmt","yuv420p",
-        "-c:a","copy","-movflags","+faststart", str(out)], capture_output=True)
-    if out.exists() and out.stat().st_size > 0:
-        print(f"  🎨 タイトルテロップを追加: {text}")
-        return out
-    print(f"  ⚠️  テロップ合成に失敗（スキップ）")
-    return video_path
 
 def detect_chorus_heads(mono, sr, fb, beat_len):
     """サビ頭（高エネルギー区間の開始小節index）を全部検出"""
@@ -3837,99 +3716,135 @@ if ext_yn in ("y", "yes"):
 
 tmp = Path(tempfile.mkdtemp(prefix="djvm_"))
 
-# タイトルテロップを入れるか
-title_yn = input(f"\n🎨 タイトルテロップ（アーティスト名・曲名）を入れますか？ (y → 入れる / Enter → 入れない):\n> ").strip().lower()
-add_title = title_yn in ("y", "yes")
+# ---- 高音質音源（WAV/FLAC/AIFF等）が含まれる時だけ、音質か画質かを選んでもらう ----
+#      audio_cap = 320  → 320kbpsに変換して、浮いた容量を映像に回す（画質優先・既定）
+#      audio_cap = None → 音声は元のまま（音質優先・映像は粗くなる）
+audio_cap = 320
+_HIRES_EXT = {".wav", ".aif", ".aiff", ".flac", ".alac"}
+_hires = [m for m in music_list if m.suffix.lower() in _HIRES_EXT]
+if os.environ.get("DJVM_WEB") == "1":
+    # Web版：ブラウザ側で選んだ結果が環境変数で渡ってくる（"none"=音質優先）
+    _cap_env = os.environ.get("DJVM_AUDIO_CAP", "320").strip().lower()
+    audio_cap = None if _cap_env in ("none", "0", "off") else 320
+    if _hires:
+        print("   → 音質優先：音声は元のまま（映像は粗くなる可能性があります）" if audio_cap is None
+              else "   → 画質優先：音声320kbpsに変換して、映像をきれいに保ちます")
+elif _hires:
+    print(f"\n⚠️ 高音質音源が {len(_hires)}曲 あります（{', '.join(m.suffix.lower().lstrip('.') for m in _hires[:3])}…）")
+    print("   このままだと音声が容量を多く使うため、映像の画質がかなり落ちます（100MB制限のため）。")
+    print("   ※MP3など320kbps以下の曲は、この設定に関わらず常に無劣化のままです。")
+    q = input("   音声を320kbpsに変換して画質を優先しますか？ (Enter → 画質優先【推奨】 / n → 音質優先):\n   > ").strip().lower()
+    if q in ("n", "no"):
+        audio_cap = None
+        print("   → 音質優先：音声は元のまま（映像は粗くなる可能性があります）")
+    else:
+        print("   → 画質優先：音声320kbps（DJ用途では十分な高音質）で、映像をきれいに保ちます")
 
+failed_tracks = []
 try:
     for i, music in enumerate(music_list, 1):
-        print(f"\n{'─'*54}")
-        print(f"  [{i}/{len(music_list)}] {music.name}")
-        print(f"{'─'*54}")
-        orig_music = music  # メタデータコピー用に元ファイルを保持
-        sub_tmp = tmp / f"track_{i}"
-        sub_tmp.mkdir()
+        try:
+            print(f"\n{'─'*54}")
+            print(f"  [{i}/{len(music_list)}] {music.name}")
+            print(f"{'─'*54}")
+            orig_music = music  # メタデータコピー用に元ファイルを保持
+            sub_tmp = tmp / f"track_{i}"
+            sub_tmp.mkdir()
 
-        # Extended化
-        intro_offset = 0.0
-        if extend_bars > 0:
-            if extend_type == "beat":
-                ext = make_beat_extended_audio(music, extend_bars, sub_tmp)
-            else:
-                ext = make_extended_audio(music, extend_bars, sub_tmp, extend_loop_unit)
-            if ext is not None:
-                intro_offset = get_audio_duration_accurate(ext) - get_audio_duration_accurate(music)
-                music = ext
-                out_path = out_dir / f"{Path(music).stem}.mp4"
+            # Extended化
+            intro_offset = 0.0
+            if extend_bars > 0:
+                if extend_type == "beat":
+                    ext = make_beat_extended_audio(music, extend_bars, sub_tmp)
+                else:
+                    ext = make_extended_audio(music, extend_bars, sub_tmp, extend_loop_unit)
+                if ext is not None:
+                    intro_offset = get_audio_duration_accurate(ext) - get_audio_duration_accurate(music)
+                    music = ext
+                    out_path = out_dir / f"{Path(music).stem}.mp4"
+                else:
+                    out_path = out_dir / f"{music.stem}.mp4"
             else:
                 out_path = out_dir / f"{music.stem}.mp4"
-        else:
-            out_path = out_dir / f"{music.stem}.mp4"
 
-        if is_mashup(music):
-            songs = parse_mashup_songs(music)
-            if len(songs) >= 2:
-                # VJモード: 各曲のMVに切り替え
-                make_vj_mashup(music, songs, loop_path, out_path, sub_tmp)
+            if is_mashup(music):
+                songs = parse_mashup_songs(music)
+                if len(songs) >= 2:
+                    # VJモード: 各曲のMVに切り替え
+                    make_vj_mashup(music, songs, loop_path, out_path, sub_tmp)
+                else:
+                    print(f"\n  🎛  マッシュアップ検出（曲名解析不可）→ 通常のMV検索で作成")
+                    urls = choose_video(music)
+                    process_with_youtube(urls, music, loop_path, out_path, sub_tmp)
             else:
-                print(f"\n  🎛  マッシュアップ検出（曲名解析不可）→ 通常のMV検索で作成")
                 urls = choose_video(music)
                 process_with_youtube(urls, music, loop_path, out_path, sub_tmp)
-        else:
-            urls = choose_video(music)
-            process_with_youtube(urls, music, loop_path, out_path, sub_tmp)
 
-        # 元ファイルのメタデータ（曲名・アーティスト・BPMタグ）を最終MP4にコピー
-        if out_path.exists() and out_path.stat().st_size > 0:
-            meta_tmp = out_path.parent / (out_path.stem + ".meta.mp4")
-            r = subprocess.run(
-                ["ffmpeg","-y","-i",str(out_path),"-i",str(orig_music),
-                 "-map","0","-map_metadata","1",
-                 "-c","copy","-movflags","+faststart",str(meta_tmp)],
-                capture_output=True)
-            if r.returncode == 0 and meta_tmp.exists() and meta_tmp.stat().st_size > 0:
-                meta_tmp.replace(out_path)
-            else:
-                meta_tmp.unlink(missing_ok=True)
+            # 元ファイルのメタデータ（曲名・アーティスト・BPMタグ）を最終MP4にコピー
+            if out_path.exists() and out_path.stat().st_size > 0:
+                meta_tmp = out_path.parent / (out_path.stem + ".meta.mp4")
+                r = subprocess.run(
+                    ["ffmpeg","-y","-i",str(out_path),"-i",str(orig_music),
+                     "-map","0","-map_metadata","1",
+                     "-c","copy","-movflags","+faststart",str(meta_tmp)],
+                    capture_output=True)
+                if r.returncode == 0 and meta_tmp.exists() and meta_tmp.stat().st_size > 0:
+                    meta_tmp.replace(out_path)
+                else:
+                    meta_tmp.unlink(missing_ok=True)
 
-            # タイトルテロップ（選択時のみ）。元ファイルからアーティスト/曲名を取る
-            if add_title:
-                _titled = apply_title_overlay(out_path, orig_music, tmp)
-                if _titled != out_path and Path(_titled).exists():
-                    Path(_titled).replace(out_path)
+                # Seratoキューポイント自動設定
+                # ウォーターマーク: 曲を三等分し各ブロック頭で7秒ずつ
+                try:
+                    _tdur = get_duration(out_path)
+                except Exception:
+                    _tdur = 0
+                _wm_times = []
+                if _tdur > 21:
+                    _blk = _tdur / 3.0
+                    for _k in range(3):
+                        _st = _k * _blk
+                        _wm_times.append((_st, min(_st + 7.0, _tdur)))
+                elif _tdur > 0:
+                    _wm_times.append((0.0, min(7.0, _tdur)))
+                if WATERMARK_ENABLED and _wm_times:
+                    _wm_text = "DJ SOPY video/club edit" if extend_bars > 0 else WATERMARK_TEXT
+                    _wm = add_watermark(out_path, _wm_times, tmp, text=_wm_text)
+                    if _wm != out_path and Path(_wm).exists():
+                        Path(_wm).replace(out_path)
+                        print(f"  🏷  ウォーターマーク追加")
 
-            # Seratoキューポイント自動設定
-            # ウォーターマーク: 曲を三等分し各ブロック頭で7秒ずつ
-            try:
-                _tdur = get_duration(out_path)
-            except Exception:
-                _tdur = 0
-            _wm_times = []
-            if _tdur > 21:
-                _blk = _tdur / 3.0
-                for _k in range(3):
-                    _st = _k * _blk
-                    _wm_times.append((_st, min(_st + 7.0, _tdur)))
-            elif _tdur > 0:
-                _wm_times.append((0.0, min(7.0, _tdur)))
-            if WATERMARK_ENABLED and _wm_times:
-                _wm_text = "DJ SOPY video/club edit" if extend_bars > 0 else WATERMARK_TEXT
-                _wm = add_watermark(out_path, _wm_times, tmp, text=_wm_text)
-                if _wm != out_path and Path(_wm).exists():
-                    Path(_wm).replace(out_path)
-                    print(f"  🏷  ウォーターマーク追加")
+                # 100MB以内に収める（音声の扱いは audio_cap で決定）
+                _fit = fit_to_size(out_path, orig_music, 100, tmp, audio_cap_kbps=audio_cap)
+                if _fit != out_path and Path(_fit).exists():
+                    Path(_fit).replace(out_path)
 
-            # 100MB以内に収める（音質は維持・画質で調整）
-            _fit = fit_to_size(out_path, orig_music, 100, tmp)
-            if _fit != out_path and Path(_fit).exists():
-                Path(_fit).replace(out_path)
-
-            write_serato_cues(out_path, orig_music, intro_offset)
+                write_serato_cues(out_path, orig_music, intro_offset)
+        except KeyboardInterrupt:
+            raise
+        except Exception as _e:
+            # 1曲が失敗しても全体は止めない。原因を出して次の曲へ進む。
+            print(f"\n  ❌ この曲は作れませんでした: {_e}")
+            print("     → 次の曲に進みます（他の曲は影響を受けません）")
+            failed_tracks.append(music.name)
+            continue
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
 print(f"\n{'='*54}")
-print(f"🎉 全{len(music_list)}曲 完了！ → {out_dir}")
+_ok = len(music_list) - len(failed_tracks)
+if failed_tracks:
+    print(f"✅ {_ok}曲 完了 / ❌ {len(failed_tracks)}曲 失敗 → {out_dir}")
+    print("")
+    print("  作れなかった曲：")
+    for _t in failed_tracks:
+        print(f"    ・{_t}")
+    print("")
+    print("  よくある原因と対処：")
+    print("    ・MVが見つからない → URL欄にYouTubeのURLを直接貼ると確実です")
+    print("    ・ネットが不安定   → もう一度作成してみてください")
+else:
+    print(f"🎉 全{len(music_list)}曲 完了！ → {out_dir}")
 print(f"{'='*54}")
 if os.environ.get("DJVM_WEB") != "1":
     try:

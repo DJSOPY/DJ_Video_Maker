@@ -123,16 +123,16 @@ def run_repair(job_id, py):
     finally:
         job["done"] = True
 
-def run_engine(job, music_paths, out_dir, extend, title, py, urls=None):
+def run_engine(job, music_paths, out_dir, extend, py, urls=None, audio_cap="320"):
     """urls=None → 自動選択モード。urls=[...] → URLモード（曲順にURLを流す）。"""
     a = [str(p) for p in music_paths] + [""] + [str(out_dir)]
     a += (["y","",""] if extend else [""])
-    a += ["y" if title else ""]
     if urls:                       # URLモード：曲順にURLを1行ずつ
         a += [u for u in urls]
     answers = "\n".join(a) + "\n"
     env = dict(os.environ); env["PYTHONUNBUFFERED"]="1"; env["PYTHONIOENCODING"]="utf-8"
     env["DJVM_WEB"] = "1"
+    env["DJVM_AUDIO_CAP"] = audio_cap    # "320"=画質優先 / "none"=音質優先
     if urls:
         env["DJVM_MANUAL_URL"] = "1"
     else:
@@ -151,7 +151,7 @@ def run_engine(job, music_paths, out_dir, extend, title, py, urls=None):
     except Exception as e:
         job["log"].append(f"❌ サーバー側エラー: {e}")
 
-def run_job(job_id, items, out_dir, extend, title, py):
+def run_job(job_id, items, out_dir, extend, py, audio_cap="320"):
     """items = [(path, url_or_empty), ...]。URLありは URLモード、無しは自動でまとめて実行。"""
     job = JOBS[job_id]
     try:
@@ -159,11 +159,11 @@ def run_job(job_id, items, out_dir, extend, title, py):
         manual = [(p,u) for (p,u) in items if u]
         if auto:
             job["log"].append(f"──── 自動選択で {len(auto)}曲 ────")
-            run_engine(job, auto, out_dir, extend, title, py)
+            run_engine(job, auto, out_dir, extend, py, audio_cap=audio_cap)
         if manual:
             job["log"].append(f"──── 指定URLで {len(manual)}曲 ────")
-            run_engine(job, [p for (p,_) in manual], out_dir, extend, title, py,
-                       urls=[u for (_,u) in manual])
+            run_engine(job, [p for (p,_) in manual], out_dir, extend, py,
+                       urls=[u for (_,u) in manual], audio_cap=audio_cap)
     finally:
         job["done"] = True
 
@@ -256,13 +256,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     u = ""     # YouTube URLでなければ自動選択にフォールバック
                 items.append((p, u))
             extend = fields.get("extend","") == "1"
-            title  = fields.get("title","") == "1"
+            # 音声の扱い："320"=画質優先(既定) / "none"=音質優先
+            audio_cap = "none" if fields.get("audio_cap","320") == "none" else "320"
             browser = fields.get("browser","chrome")
             set_browser(browser)
             JOBS[jid] = {"log":[], "done":False, "outputs":[], "proc":None, "outdir": str(jdir/"out")}
             py = os.environ.get("DJVM_PYTHON", sys.executable)
             threading.Thread(target=run_job,
-                args=(jid, items, jdir/"out", extend, title, py),
+                args=(jid, items, jdir/"out", extend, py, audio_cap),
                 daemon=True).start()
             self._send(200,"application/json",
                        json.dumps({"job":jid}).encode())
