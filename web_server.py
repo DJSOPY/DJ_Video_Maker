@@ -19,6 +19,22 @@ WORK.mkdir(parents=True, exist_ok=True)
 PORT = int(os.environ.get("DJVM_PORT", "8765"))
 
 # Cookie設定を事前に用意（無いと起動時に「どのブラウザ？」で止まるため）
+def normalize_youtube_url(url):
+    """YouTube URLから動画IDだけを抽出しクリーンな単一動画URLにする。再生リスト等を除去。"""
+    import re
+    url = (url or "").strip()
+    vid = None
+    m = re.search(r'youtu\.be/([A-Za-z0-9_-]{11})', url)
+    if m: vid = m.group(1)
+    if not vid:
+        m = re.search(r'[?&]v=([A-Za-z0-9_-]{11})', url)
+        if m: vid = m.group(1)
+    if not vid:
+        m = re.search(r'/(?:shorts|embed|live|v)/([A-Za-z0-9_-]{11})', url)
+        if m: vid = m.group(1)
+    return f"https://www.youtube.com/watch?v={vid}" if vid else None
+
+
 def ensure_config(browser="chrome"):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cfg = {}
@@ -252,8 +268,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             items = []
             for idx, p in enumerate(music_paths):
                 u = fields.get(f"url_{idx}", "").strip()
-                if u and not (u.startswith("http") and ("youtube.com" in u or "youtu.be" in u)):
-                    u = ""     # YouTube URLでなければ自動選択にフォールバック
+                if u:
+                    clean = normalize_youtube_url(u)
+                    u = clean if clean else ""   # YouTube URLとして解釈できなければ自動選択
                 items.append((p, u))
             extend = fields.get("extend","") == "1"
             # 音声の扱い："320"=画質優先(既定) / "none"=音質優先

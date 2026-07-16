@@ -312,6 +312,50 @@
   }
 
   /* ============ 艦内ターミナル：ログ ============ */
+  /* ============ 進捗ステージ（止まってない感を出す） ============ */
+  .stage{display:none;margin-top:16px;padding:16px 18px;
+    background:linear-gradient(180deg,#0a1219,#070c12);
+    border:1px solid var(--seam);
+    clip-path:polygon(12px 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%,0 12px);
+    box-shadow:inset 0 0 30px rgba(79,216,255,.06);}
+  .stage.on{display:block;}
+  .stage-top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;}
+  .stage-track{font-size:10px;letter-spacing:.24em;color:var(--holo);
+    text-shadow:0 0 10px var(--holo);}
+  .stage-now{font-size:12px;color:var(--ink);letter-spacing:.04em;}
+  .steps{display:flex;align-items:center;gap:0;}
+  .step{flex:1;display:flex;flex-direction:column;align-items:center;gap:7px;position:relative;}
+  /* ステップ間をつなぐ線 */
+  .step::before{content:"";position:absolute;top:9px;left:-50%;width:100%;height:2px;
+    background:var(--seam);z-index:0;}
+  .step:first-child::before{display:none;}
+  .step i{width:18px;height:18px;border-radius:50%;z-index:1;
+    background:var(--hull-2);border:2px solid var(--seam);transition:.3s;}
+  .step span{font-size:9.5px;letter-spacing:.1em;color:var(--dim);transition:.3s;}
+  /* 完了したステップ */
+  .step.ok i{background:var(--holo);border-color:var(--holo);
+    box-shadow:0 0 12px var(--holo);}
+  .step.ok::before{background:var(--holo);box-shadow:0 0 8px rgba(79,216,255,.5);}
+  .step.ok span{color:var(--holo-2);}
+  /* 今まさに処理中のステップ（脈打つ＝動いてる証） */
+  .step.active i{background:var(--holo);border-color:var(--holo-2);
+    animation:stepPulse 1.1s ease-in-out infinite;}
+  .step.active span{color:#fff;text-shadow:0 0 8px var(--holo);}
+  @keyframes stepPulse{
+    0%,100%{box-shadow:0 0 8px var(--holo);transform:scale(1);}
+    50%{box-shadow:0 0 22px 4px var(--holo);transform:scale(1.25);}
+  }
+  /* スキャンライン（常に流れる＝生きてる感） */
+  .scan{margin-top:14px;height:3px;background:var(--hull-2);overflow:hidden;border-radius:2px;}
+  .scan-bar{height:100%;width:35%;border-radius:2px;
+    background:linear-gradient(90deg,transparent,var(--holo),var(--holo-2),var(--holo),transparent);
+    box-shadow:0 0 12px rgba(79,216,255,.6);
+    animation:scanmove 1.5s linear infinite;}
+  @keyframes scanmove{from{transform:translateX(-120%);}to{transform:translateX(400%);}}
+  .stage.finished .scan-bar{animation:none;width:100%;
+    background:linear-gradient(90deg,#4fffa8,#4fffa8);box-shadow:0 0 14px rgba(79,255,168,.6);}
+  .stage.finished .scan{background:#06241c;}
+
   .console{
     display:none;margin-top:16px;overflow:hidden;
     background:var(--hull-2);border:1px solid var(--seam);
@@ -324,6 +368,16 @@
     background:linear-gradient(180deg,#0d141d,#0a1018);
     font-size:9.5px;letter-spacing:.22em;color:var(--dim);text-transform:uppercase;
   }
+  .copylog{
+    margin-left:auto;flex:0 0 auto;cursor:pointer;
+    padding:4px 12px;font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;
+    color:var(--holo);text-transform:uppercase;
+    background:var(--hull-2);border:1px solid var(--seam);
+    transition:.15s;
+  }
+  .copylog:hover{border-color:var(--holo);box-shadow:0 0 12px rgba(79,216,255,.3);
+    background:#08222e;}
+  .copylog.done{color:#4fffa8;border-color:#4fffa8;box-shadow:0 0 12px rgba(79,255,168,.4);}
   .led{
     width:7px;height:7px;flex:0 0 auto;transform:rotate(45deg);
     background:var(--holo);box-shadow:0 0 12px var(--holo);
@@ -439,8 +493,23 @@
 
   <button class="go" id="go" disabled>▶ 動画を作成</button>
 
+  <div class="stage" id="stage">
+    <div class="stage-top">
+      <span class="stage-track" id="stageTrack">TRACK 1</span>
+      <span class="stage-now" id="stageNow">準備中…</span>
+    </div>
+    <div class="steps" id="steps">
+      <div class="step" data-k="search"><i></i><span>検索</span></div>
+      <div class="step" data-k="dl"><i></i><span>取得</span></div>
+      <div class="step" data-k="sync"><i></i><span>解析</span></div>
+      <div class="step" data-k="place"><i></i><span>仕上げ</span></div>
+      <div class="step" data-k="done"><i></i><span>完成</span></div>
+    </div>
+    <div class="scan"><div class="scan-bar"></div></div>
+  </div>
+
   <div class="console" id="console">
-    <div class="ct"><span class="led"></span><span id="cstate">処理中…</span></div>
+    <div class="ct"><span class="led"></span><span id="cstate">処理中…</span><button id="copylog" class="copylog">COPY</button></div>
     <div class="log" id="log"></div>
   </div>
   <div class="done" id="done"></div>
@@ -475,6 +544,48 @@ const drop=document.getElementById('drop'), fileInput=document.getElementById('f
 let files=[];
 
 function fmt(n){return n>1e6?(n/1e6).toFixed(1)+'MB':(n/1e3).toFixed(0)+'KB';}
+// ── 進捗ステージ：ログの1行から今の工程を判定する ──
+const STAGE_ORDER=['search','dl','sync','place','done'];
+function detectStage(line){
+  if(/完成:|完了！/.test(line)) return 'done';
+  if(/圧縮中|配置|仕上げ|ビートグリッド|Cue|ウォーターマーク|Extended化/.test(line)) return 'place';
+  if(/リップシンク|区間アライメント|解析中|分離|同期|ボーカル包絡|DTW/.test(line)) return 'sync';
+  if(/ダウンロード中|映像を|DL/.test(line)) return 'dl';
+  if(/検索|MVを探|検索中/.test(line)) return 'search';
+  return null;
+}
+const STAGE_LABEL={search:'MVを検索しています',dl:'映像をダウンロード中',
+  sync:'音と映像を同期解析中',place:'配置して仕上げ中',done:'完成しました'};
+function updateStage(logArr){
+  const stageEl=document.getElementById('stage');
+  if(!stageEl) return;
+  stageEl.classList.add('on');
+  // 現在のトラック番号（[2/3] のような表記を拾う）
+  let track='';
+  for(let i=logArr.length-1;i>=0;i--){
+    const m=logArr[i].match(/\[(\d+)\s*\/\s*(\d+)\]/);
+    if(m){ track=`TRACK ${m[1]} / ${m[2]}`; break; }
+  }
+  document.getElementById('stageTrack').textContent=track||'TRACK 1';
+  // 最新の工程を後ろから探す
+  let cur=null;
+  for(let i=logArr.length-1;i>=0 && !cur;i--) cur=detectStage(logArr[i]);
+  if(!cur) cur='search';
+  const curIdx=STAGE_ORDER.indexOf(cur);
+  document.getElementById('stageNow').textContent=STAGE_LABEL[cur]||'処理中…';
+  document.querySelectorAll('#steps .step').forEach(el=>{
+    const k=el.getAttribute('data-k'); const idx=STAGE_ORDER.indexOf(k);
+    el.classList.remove('ok','active');
+    if(idx<curIdx) el.classList.add('ok');
+    else if(idx===curIdx) el.classList.add(cur==='done'?'ok':'active');
+  });
+}
+function finishStage(){
+  const stageEl=document.getElementById('stage'); if(!stageEl) return;
+  stageEl.classList.add('finished');
+  document.querySelectorAll('#steps .step').forEach(el=>{el.classList.remove('active');el.classList.add('ok');});
+  document.getElementById('stageNow').textContent='完成しました';
+}
 const HIRES=['wav','aif','aiff','flac','alac'];
 function checkHires(){
   const found=[...new Set(files.map(f=>(f.name.split('.').pop()||'').toLowerCase()).filter(e=>HIRES.includes(e)))];
@@ -520,6 +631,9 @@ go.addEventListener('click',async()=>{
   if(files.length===0)return;
   go.disabled=true; go.classList.add('busy'); go.textContent='● 作成中…';
   consoleEl.classList.add('on'); logEl.innerHTML=''; doneEl.innerHTML=''; cstate.textContent='処理中…';
+  { const st=document.getElementById('stage'); if(st){st.classList.remove('finished');
+    document.querySelectorAll('#steps .step').forEach(el=>el.classList.remove('ok','active'));
+    document.getElementById('stageNow').textContent='準備中…'; st.classList.add('on'); } }
   const fd=new FormData();
   files.forEach((f,i)=>{ fd.append('files',f,f.name); fd.append('url_'+i, f.url||''); });
   fd.append('extend', document.getElementById('extend').checked?'1':'0');
@@ -537,8 +651,9 @@ go.addEventListener('click',async()=>{
     const s=await (await fetch('/status?job='+job)).json();
     for(;seen<s.log.length;seen++){ logEl.appendChild(colorize(s.log[seen])); }
     logEl.scrollTop=logEl.scrollHeight;
+    updateStage(s.log);
     if(s.done){
-      clearInterval(poll);
+      clearInterval(poll); finishStage();
       cstate.textContent='完了'; document.querySelector('.led').style.background='#8b95a3';
       document.querySelector('.led').style.boxShadow='none';
       go.classList.remove('busy'); go.disabled=false; go.textContent='▶ もう一度作成';
@@ -557,6 +672,23 @@ go.addEventListener('click',async()=>{
     }
   },700);
 });
+const copyBtn=document.getElementById('copylog');
+if(copyBtn){
+  copyBtn.addEventListener('click',async()=>{
+    const txt=document.getElementById('log').innerText||'';
+    try{
+      await navigator.clipboard.writeText(txt);
+    }catch(e){
+      // クリップボードAPIが使えない環境の保険：一時テキストエリアで選択コピー
+      const ta=document.createElement('textarea');
+      ta.value=txt;document.body.appendChild(ta);ta.select();
+      try{document.execCommand('copy');}catch(_){}
+      document.body.removeChild(ta);
+    }
+    const o=copyBtn.textContent;copyBtn.textContent='COPIED';copyBtn.classList.add('done');
+    setTimeout(()=>{copyBtn.textContent=o;copyBtn.classList.remove('done');},1600);
+  });
+}
 const fixBtn=document.getElementById('fix');
 fixBtn.addEventListener('click',async()=>{
   fixBtn.disabled=true; fixBtn.textContent='● 修復中…';

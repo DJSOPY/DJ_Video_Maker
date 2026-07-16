@@ -418,16 +418,14 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
         "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input \
               "llvmlite==0.44.0" "numba==0.61.2" 2>/tmp/djvm_pip.log \
           || "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input "numba<0.62" 2>>/tmp/djvm_pip.log
-        # まず「完成品(wheel)のみ・ソースビルド禁止」で残りを入れる。
-        # numba/llvmliteは上で固定済みなので、librosaはそれを再利用する。
-        if "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input \
-              numpy scipy mutagen Pillow librosa fastdtw 2>>/tmp/djvm_pip.log; then
-            :
-        else
-            # 完成品が一部欠けた場合のみ、通常インストール（ビルド許可）で最後の一押し
-            echo "   （一部を通常方式で追加インストール中...）"
-            "$PYTHON_CMD" -m pip install --no-input numpy scipy mutagen Pillow librosa fastdtw 2>>/tmp/djvm_pip.log
-        fi
+        # 【グループA】重いC拡張ライブラリ＝完成品(wheel)のみ許可（ビルド地獄を防ぐ）。
+        #   これらは両アーキ×cp310〜cp313で完成品があることを確認済み。
+        "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input \
+              numpy scipy librosa 2>>/tmp/djvm_pip.log
+        # 【グループB】軽い/純Python寄り＝完成品が無くてもソースでOK（コンパイラ不要か軽微）。
+        #   fastdtwは全アーキで新しめの完成品が無いが、ソースで問題なく入る（確認済み）。
+        "$PYTHON_CMD" -m pip install --no-input \
+              mutagen Pillow fastdtw 2>>/tmp/djvm_pip.log
         # --- 本当に使えるか最終確認（必須のものだけ厳しくチェック）---
         if ! "$PYTHON_CMD" -c "import numpy, scipy, mutagen, librosa" &>/dev/null; then
             echo ""

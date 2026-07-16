@@ -499,6 +499,25 @@ def search_youtube_mv(query, n=3):
         results += lyric_results
     return results[:n]
 
+def normalize_youtube_url(url):
+    """YouTube URLから動画IDだけを抽出し、クリーンな単一動画URLに正規化する。
+    再生リスト(list=)・時刻(t=)・その他の余計なパラメータを全て除去して、
+    「その1本だけ」を確実にダウンロードできるようにする。
+    抽出できなければ None。"""
+    import re as _re
+    url = (url or "").strip()
+    vid = None
+    m = _re.search(r'youtu\.be/([A-Za-z0-9_-]{11})', url)
+    if m: vid = m.group(1)
+    if not vid:
+        m = _re.search(r'[?&]v=([A-Za-z0-9_-]{11})', url)
+        if m: vid = m.group(1)
+    if not vid:
+        m = _re.search(r'/(?:shorts|embed|live|v)/([A-Za-z0-9_-]{11})', url)
+        if m: vid = m.group(1)
+    return f"https://www.youtube.com/watch?v={vid}" if vid else None
+
+
 def choose_video(music_path):
     """YouTube候補から動画を選んでURLを返す。Remixは候補選択を省いて自動採用。"""
     tags = get_metadata(music_path)
@@ -511,8 +530,11 @@ def choose_video(music_path):
         print(f"\n  🎵 曲: {_disp}")
         while True:
             u = input("  📋 この曲に使うYouTubeのURLを貼り付けてください:\n  > ").strip()
-            if u.startswith("http") and ("youtube.com" in u or "youtu.be" in u):
-                return [u]
+            clean = normalize_youtube_url(u)
+            if clean:
+                if clean != u:
+                    print(f"  ✓ この動画に確定します（再生リスト等は無視）: {clean}")
+                return [clean]
             print("  ⚠️ YouTubeのURLではないようです（https://www.youtube.com/watch?v=... の形で貼ってください）")
     if title and title.strip():
         # タイトルタグがある → アーティスト + タイトル
