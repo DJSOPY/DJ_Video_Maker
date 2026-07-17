@@ -231,6 +231,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              f"filename*=UTF-8''{_q(target.name)}")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers(); self.wfile.write(data)
+        elif u.path == "/reveal":
+            # 完成フォルダを Finder で開く（同じMac上で動いているので open が使える）
+            q = parse_qs(u.query); jid = q.get("job",[""])[0]
+            job = JOBS.get(jid)
+            od = job.get("outdir") if job else None
+            if od and Path(od).exists():
+                try:
+                    subprocess.Popen(["open", od])
+                    return self._send(200, "text/plain", "ok")
+                except Exception as e:
+                    return self._send(500, "text/plain", f"error: {e}")
+            return self._send(404, "text/plain", "folder not found")
         else:
             self._send(404, "text/plain", "not found")
 
