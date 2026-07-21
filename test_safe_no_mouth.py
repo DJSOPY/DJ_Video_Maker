@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Remixのfail-closed口元非表示経路の回帰テスト。"""
+
+import json
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+CORE_PATH = Path(__file__).with_name("dj_maker_core.py")
+
+
+def _load_core_prefix():
+    # dj_maker_core.pyは対話CLIがtop-levelにあるため、メイン以前だけを読む。
+    source = CORE_PATH.read_text(encoding="utf-8")
+    prefix = source.split("# ─── メイン ───", 1)[0]
+    ns = {"__file__": str(CORE_PATH)}
+    exec(compile(prefix, str(CORE_PATH), "exec"), ns)
+    return ns
+
+
+CORE = _load_core_prefix()
+
+
+def _video_probe(path):
+    raw = subprocess.run(
+        ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+         "-show_entries", "stream=nb_read_frames,r_frame_rate",
+         "-show_entries", "format=duration", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True).stdout
+    return json.loads(raw)
+
+
+class ProfileCertificationTests(unittest.TestCase):
+    def test_only_explicit_absent_with_complete_samples_passes(self):
+        certify = CORE["_profile_certifies_no_mouth"]
+        self.assertTrue(certify({"mouth_absent": np.ones(30)}, 30))
+
+    def test_detection_unknown_and_legacy_profiles_fail(self):
+        certify = CORE["_profile_certifies_no_mouth"]
+        self.assertFalse(certify({"face": np.zeros(30)}, 30))
+        self.assertFalse(certify({"mouth_visible": np.zeros(30)}, 30))
+        self.assertFalse(certify({"mouth_absent": np.r_[np.ones(29), np.nan]}, 30))
+        self.assertFalse(certify({"mouth_absent": np.ones(29)}, 30))
+        self.assertFalse(certify({"mouth_absent": np.r_[np.ones(29), 0]}, 30))
+
+
+class UnsafePlanTests(unittest.TestCase):
+    def test_absolute_mode_disables_real_source_broll(self):
+        self.assertFalse(CORE["_ALLOW_REAL_SOURCE_SAFE_BROLL"])
+
+    def test_visible_faces_require_clean_vocal_timing_proof(self):
+        self.assertTrue(CORE["REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES"])
+
+    def test_clean_vocal_silence_masks_even_a_mapped_waveform_interval(self):
+        got = CORE["_expand_unsafe_plan_ranges"](
+            [(0.0, 4.0, 10.0)], 4.0, pad=0.25, min_show=0.75,
+            extra_unsafe_ranges=[(1.0, 2.0)])
+        self.assertEqual(got, [
+            (0.0, 0.75, 10.0),
+            (0.75, 2.25, None),
+            (2.25, 4.0, 12.25),
+        ])
+
+    def test_padding_and_mv_offset_are_preserved(self):
+        plan = [(0.0, 2.0, 10.0), (2.0, 4.0, None), (4.0, 8.0, 14.0)]
+        got = CORE["_expand_unsafe_plan_ranges"](
+            plan, 8.0, pad=0.25, min_show=0.75)
+        self.assertEqual(got, [
+            (0.0, 1.75, 10.0),
+            (1.75, 4.25, None),
+            (4.25, 8.0, 14.25),
+        ])
+
+    def test_tiny_show_is_removed(self):
+        plan = [(0.0, 1.0, None), (1.0, 1.5, 4.0), (1.5, 3.0, None)]
+        got = CORE["_expand_unsafe_plan_ranges"](
+            plan, 3.0, pad=0.0, min_show=0.75)
+        self.assertEqual(got, [(0.0, 3.0, None)])
+
+    def test_cumulative_frame_budget_avoids_rounding_drift(self):
+        count = CORE["_hybrid_segment_frame_count"]
+        # 1.75秒を単独丸めすると52.5→実装/ffmpeg次第で53になり得るが、
+        # 全体境界の差ではこの区間の担当枚数が一意になる。
+        self.assertEqual(count(0.0, 1.75), 52)
+        self.assertEqual(count(1.75, 3.50), 53)
+        self.assertEqual(count(0.0, 3.50), 105)
+
+    def test_subframe_boundaries_assign_only_the_global_budget(self):
+        count = CORE["_hybrid_segment_frame_count"]
+        ranges = [(0.0, 0.01), (0.01, 0.025), (0.025, 0.05)]
+        assigned = [count(a, b) for a, b in ranges]
+        self.assertEqual(assigned, [0, 1, 1])
+        self.assertEqual(sum(assigned), count(0.0, 0.05))
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
+                     "ffmpeg/ffprobeが必要")
+class SafeBackgroundIntegrationTests(unittest.TestCase):
+    def _make_audio(self, path, duration=2.03):
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+             "sine=frequency=440:sample_rate=44100", "-t", str(duration),
+             str(path)], check=True)
+
+    def test_abstract_background_has_exact_frames_and_no_audio(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "abstract.mp4"
+            self.assertTrue(CORE["make_abstract_no_mouth_segment"](
+                2.0, out, frame_count=60))
+            info = _video_probe(out)
+            self.assertEqual(info["streams"][0]["r_frame_rate"], "30/1")
+            self.assertEqual(info["streams"][0]["nb_read_frames"], "60")
+            audio = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", str(out)],
+                check=True, capture_output=True, text=True).stdout.strip()
+            self.assertEqual(audio, "")
+
+    def test_missing_or_uncertified_source_falls_back_to_background(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "fallback.mp4"
+            self.assertTrue(CORE["make_safe_no_mouth_filler_segment"](
+                Path(td) / "missing.mp4", 1.1, out, Path(td), frame_count=33))
+            info = _video_probe(out)
+            self.assertEqual(info["streams"][0]["nb_read_frames"], "33")
+
+    def test_full_safe_fallback_overwrites_stale_output_and_has_av(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            audio = td / "music.wav"
+            out = td / "result.mp4"
+            self._make_audio(audio)
+            out.write_bytes(b"stale previous person video")
+
+            self.assertTrue(CORE["make_plain_mv_sync"](
+                td / "missing_mv.mp4", audio, out, td,
+                safe_no_mouth=True))
+            info = _video_probe(out)
+            self.assertEqual(info["streams"][0]["nb_read_frames"], "61")
+            streams = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "stream=codec_type", "-of", "csv=p=0", str(out)],
+                check=True, capture_output=True, text=True).stdout.split()
+            self.assertEqual(set(streams), {"video", "audio"})
+
+    def test_failed_safe_fallback_removes_stale_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            audio = td / "music.wav"
+            out = td / "result.mp4"
+            self._make_audio(audio, duration=0.5)
+            out.write_bytes(b"stale previous person video")
+            old = CORE["make_safe_no_mouth_filler_segment"]
+            CORE["make_safe_no_mouth_filler_segment"] = lambda *a, **k: False
+            try:
+                with self.assertRaises(RuntimeError):
+                    CORE["make_plain_mv_sync"](
+                        td / "missing_mv.mp4", audio, out, td,
+                        safe_no_mouth=True)
+            finally:
+                CORE["make_safe_no_mouth_filler_segment"] = old
+            self.assertFalse(out.exists())
+
+    def test_aligned_segment_filter_outputs_exact_cumulative_frames(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "src.mp4"
+            out = td / "aligned.mp4"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                 "color=c=blue:s=320x180:r=24000/1001", "-t", "2.0",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
+                check=True)
+            frames = CORE["_hybrid_segment_frame_count"](0.0, 1.75)
+            vf = CORE["_hybrid_exact_frame_filter"](CORE["VF_NORM"], frames)
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", str(src),
+                 "-t", "1.75", "-vf", vf, "-frames:v", str(frames),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)],
+                check=True)
+            info = _video_probe(out)
+            self.assertEqual(info["streams"][0]["r_frame_rate"], "30/1")
+            self.assertEqual(info["streams"][0]["nb_read_frames"], "52")
+
+
+if __name__ == "__main__":
+    unittest.main()

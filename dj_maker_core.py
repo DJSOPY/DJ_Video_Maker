@@ -9,6 +9,17 @@ sys.path.insert(0, str(SCRIPT_DIR))  # 同じフォルダの lipsync_pro.py / vo
 CONFIG_DIR = Path.home() / ".dj_video_maker"
 CONFIG_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = CONFIG_DIR / "config.json"
+try:
+    _numba_cache = CONFIG_DIR / "numba_cache"
+    _numba_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(_numba_cache))
+except OSError:
+    try:
+        _numba_cache = Path(tempfile.gettempdir()) / f"djvm_numba_{os.getuid()}"
+        _numba_cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("NUMBA_CACHE_DIR", str(_numba_cache))
+    except OSError:
+        pass
 
 def load_config():
     if CONFIG_FILE.exists():
@@ -128,7 +139,32 @@ def get_duration(path):
     sys.exit(1)
 
 def _decode_duration(path):
-    """実デコードで長さ測定。-progress pipe:1 はffmpegの全バージョンで機械可読。"""
+    """実測で長さを求める（VBR MP3のヘッダ詐称対策）。
+    まず全パケットをdemuxし『最後のパケットのPTS+尺』を終端とする。
+    ffmpegの -progress out_time_us は最後のパケットの“開始”PTSを報告する
+    バージョン（6.x系）があり、音声が末尾1パケット分（数十ms）短く測られて
+    映像フレーム予算が音声より1枚不足する。パケット走査はこの差が出ない。"""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0",
+         str(path)],
+        capture_output=True, text=True, errors="replace")
+    best = 0.0
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                pts = float(parts[0])
+                dur = float(parts[1]) if parts[1] not in ("N/A", "") else 0.0
+            except ValueError:
+                continue
+            if np.isfinite(pts):
+                best = max(best, pts + max(0.0, dur))
+    if best > 0.5:
+        return best
+    # パケット走査が使えない形式は従来の実デコード進捗で測る
     r = subprocess.run(
         ["ffmpeg","-nostats","-i",str(path),"-f","null","-progress","pipe:1","-"],
         capture_output=True, text=True, errors="replace")
@@ -1528,7 +1564,230 @@ def make_filler_segment(loop_path, duration, out_path, tmp_dir=None):
     for p_ in pieces:
         p_.unlink(missing_ok=True)
 
-def ensure_video_length(video_path, required_dur, loop_path, tmp_dir):
+
+# 低信頼の口パク区間に、未検証の人物映像を出さないための専用経路。
+# 通常のフィラーとは意図的に分離する。解析器が無い/落ちた/判定不能なら、
+# 「顔なし」と推測せず抽象背景へ退避する（fail closed）。
+_SAFE_BROLL_USED = {}
+# 実写MVでは、検出済みの顔以外に見逃した人物がいないことを証明できない。
+# 「口元が一切映らない」を絶対条件にするため、既定は実写Bロールを使わず
+# 人物を生成しない抽象背景だけに固定する。
+_ALLOW_REAL_SOURCE_SAFE_BROLL = False
+
+
+def _safe_video_frame_count(duration, fps=30.0):
+    """durationをCFRの整数フレーム数へ変換する。"""
+    try:
+        duration = float(duration); fps = float(fps)
+    except (TypeError, ValueError, OverflowError):
+        return 1
+    if not np.isfinite(duration) or not np.isfinite(fps) or fps <= 0.0:
+        return 1
+    return max(1, int(round(max(0.0, duration) * fps)))
+
+
+def _decoded_video_frame_count(path):
+    """コンテナの申告値ではなく、最後までデコードできた映像枚数を返す。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, errors="replace")
+        if r.returncode != 0:
+            return None
+        values = (r.stdout or "").strip().splitlines()
+        if not values or values[0] in ("", "N/A"):
+            return None
+        count = int(values[0])
+        return count if count >= 0 else None
+    except (OSError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _video_has_exact_frames(path, expected_frames):
+    """非空ファイルだけでなく、全フレームが揃ったときだけTrue。"""
+    try:
+        expected_frames = int(expected_frames)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    p = Path(path)
+    return bool(expected_frames > 0 and p.exists() and p.stat().st_size > 0
+                and _decoded_video_frame_count(p) == expected_frames)
+
+
+def _has_av_streams(path):
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, errors="replace")
+        kinds = set((r.stdout or "").split())
+        return r.returncode == 0 and {"video", "audio"}.issubset(kinds)
+    except OSError:
+        return False
+
+
+def _profile_certifies_no_mouth(profile, expected_frames=None):
+    """全サンプルが明示的 MOUTH_ABSENT のときだけ True。
+
+    face=0、landmarksなし、旧profile、NaN、サンプル不足はすべて不明扱い。
+    mouth_visible=False だけでは、単なる検出失敗や閉口を区別できないので
+    決して安全判定に使わない。
+    """
+    if not profile or "mouth_absent" not in profile:
+        return False
+    try:
+        absent = np.asarray(profile["mouth_absent"], dtype=float)
+    except (TypeError, ValueError):
+        return False
+    if absent.ndim != 1 or len(absent) == 0 or not np.all(np.isfinite(absent)):
+        return False
+    if expected_frames is not None:
+        try:
+            # 1枚でも解析できなければ「全フレーム確認」ではないため不採用。
+            if len(absent) < max(1, int(expected_frames)):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return bool(np.all(absent >= 0.5))
+
+
+def make_abstract_no_mouth_segment(duration, out_path, frame_count=None):
+    """人物を含まない暗い抽象背景を、30fps・正確な枚数で生成する。
+
+    装飾filterが使えないffmpegでも、最後は純黒へ必ず退避する。
+    戻り値は出力に成功したか。
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        frames = (max(1, int(frame_count)) if frame_count is not None
+                  else _safe_video_frame_count(duration))
+    except (TypeError, ValueError, OverflowError):
+        frames = _safe_video_frame_count(duration)
+    out_path.unlink(missing_ok=True)
+    base = "color=c=0x05070d:s=1280x720:r=30"
+    # 微細な粒子とビネットだけの非人物映像。顔や口に見える図形は生成しない。
+    cmd = [
+        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", base,
+        "-vf", "noise=alls=4:allf=t,vignette=PI/5,format=yuv420p",
+        "-frames:v", str(frames), *ENC_ARGS, "-an", str(out_path),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if r.returncode == 0 and _video_has_exact_frames(out_path, frames):
+        return True
+    out_path.unlink(missing_ok=True)
+    # 最小構成の純黒。ここでも枚数を固定し、concat時の累積誤差を防ぐ。
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", base,
+         "-frames:v", str(frames), *ENC_ARGS, "-an", str(out_path)],
+        capture_output=True, text=True, errors="replace")
+    return bool(r.returncode == 0 and _video_has_exact_frames(out_path, frames))
+
+
+def _render_safe_broll_candidate(source, start, frame_count, out_path):
+    """候補を正規化して整数フレームで切り出す（まだ採用はしない）。"""
+    out_path = Path(out_path)
+    out_path.unlink(missing_ok=True)
+    frames = max(1, int(frame_count))
+    vf = (f"{VF_NORM},tpad=stop_mode=clone:stop_duration=1,"
+          f"trim=end_frame={frames},setpts=PTS-STARTPTS")
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-ss", f"{float(start):.6f}",
+         "-i", str(source), "-vf", vf, "-frames:v", str(frames),
+         *ENC_ARGS, "-an", str(out_path)],
+        capture_output=True, text=True, errors="replace")
+    return bool(r.returncode == 0 and _video_has_exact_frames(out_path, frames))
+
+
+def make_safe_no_mouth_filler_segment(loop_path, duration, out_path, tmp_dir=None,
+                                      frame_count=None):
+    """口元が一切見えないと全フレームで証明できた映像だけを採用する。
+
+    1) 全編の粗いprofileから候補を探す。
+    2) 切り出した候補を全デコードフレームで再解析する。
+    3) 全サンプルが明示的 MOUTH_ABSENT の場合だけ採用する。
+    解析不能・未検出・閉口・小さい口・旧API・候補なしは抽象/黒背景にする。
+    """
+    out_path = Path(out_path)
+    tmp_dir = Path(tmp_dir) if tmp_dir is not None else out_path.parent
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        frames = (max(1, int(frame_count)) if frame_count is not None
+                  else _safe_video_frame_count(duration))
+    except (TypeError, ValueError, OverflowError):
+        frames = _safe_video_frame_count(duration)
+    exact_dur = frames / 30.0
+
+    if not _ALLOW_REAL_SOURCE_SAFE_BROLL:
+        print("     🛡️ 絶対安全モード: 実写Bロールを使わず非人物背景へ退避")
+        return make_abstract_no_mouth_segment(
+            exact_dur, out_path, frame_count=frames)
+
+    try:
+        raw_vids = get_loop_videos(loop_path)
+    except (Exception, SystemExit):
+        raw_vids = None
+    vids = []
+    for value in (raw_vids or []):
+        try:
+            source = Path(value)
+            if get_duration(source) > exact_dur + 0.10:
+                vids.append(source)
+        except (Exception, SystemExit):
+            continue
+    try:
+        import mouth_sync
+        picker = getattr(mouth_sync, "pick_no_mouth_mv_time", None)
+        if not vids or not callable(picker):
+            raise RuntimeError("厳格な口元なし判定APIがありません")
+
+        # 毎回同じカットへ戻らないよう、動画単位で利用位置を記録する。
+        for vi, source in enumerate(vids):
+            source_dur = get_duration(source)
+            profile = mouth_sync.build_mouth_profile(
+                str(source), fps=12.0, max_seconds=None)
+            if not profile or "mouth_absent" not in profile:
+                continue
+            cache_key = str(source.resolve())
+            avoid = _SAFE_BROLL_USED.setdefault(cache_key, [])
+            # 不合格候補もavoidへ加え、同じ誤候補を繰り返さず最大6箇所試す。
+            for attempt in range(6):
+                start = picker(profile, exact_dur, source_dur,
+                               avoid=avoid, avoid_win=max(1.0, exact_dur * 0.35))
+                if start is None:
+                    break
+                start = float(start)
+                avoid.append(start)
+                candidate = tmp_dir / f"safe_broll_{out_path.stem}_{vi}_{attempt}.mp4"
+                if not _render_safe_broll_candidate(source, start, frames, candidate):
+                    candidate.unlink(missing_ok=True)
+                    continue
+
+                # fpsを十分高く指定するとstep=1になり、元映像の全フレームを検査する。
+                # build失敗やlandmarks未検出は mouth_absent にならず、必ず不採用。
+                verified = mouth_sync.build_mouth_profile(
+                    str(candidate), fps=1000.0, max_seconds=None,
+                    use_cache=False)
+                if _profile_certifies_no_mouth(verified, expected_frames=frames):
+                    shutil.move(str(candidate), str(out_path))
+                    if not _video_has_exact_frames(out_path, frames):
+                        out_path.unlink(missing_ok=True)
+                        continue
+                    print(f"     🛡️ 口元なし認証Bロール: {source.name} {start:.2f}秒〜"
+                          f"（全{frames}フレーム検査）")
+                    return True
+                candidate.unlink(missing_ok=True)
+    except (Exception, SystemExit) as e:
+        print(f"     ⚠️ 口元なしBロールを認証できません: {str(e)[:100]}")
+
+    print("     🛡️ 安全な口元なし映像が無いため、非人物の抽象背景へ退避")
+    return make_abstract_no_mouth_segment(exact_dur, out_path, frame_count=frames)
+
+def ensure_video_length(video_path, required_dur, loop_path, tmp_dir,
+                        safe_no_mouth=False):
     """映像がrequired_durより短ければフィラーを足して延長した新ファイルを返す"""
     vid_dur = get_duration(video_path)
     if vid_dur >= required_dur - 0.05:
@@ -1536,7 +1795,10 @@ def ensure_video_length(video_path, required_dur, loop_path, tmp_dir):
     # 不足分+1秒のフィラーを作って後ろに連結
     shortage = required_dur - vid_dur + 1.0
     pad = tmp_dir / f"pad_{video_path.stem}.mp4"
-    make_filler_segment(loop_path, shortage, pad, tmp_dir)
+    if safe_no_mouth:
+        make_safe_no_mouth_filler_segment(loop_path, shortage, pad, tmp_dir)
+    else:
+        make_filler_segment(loop_path, shortage, pad, tmp_dir)
     extended = tmp_dir / f"ext_{video_path.stem}.mp4"
     list_file = tmp_dir / f"extlist_{video_path.stem}.txt"
     with open(list_file, "w") as f:
@@ -1546,37 +1808,79 @@ def ensure_video_length(video_path, required_dur, loop_path, tmp_dir):
          "-i",str(list_file),"-c","copy",str(extended)])
     return extended
 
-def make_plain_mv_sync(mv_path, music_path, output_path, tmp_dir):
+def make_plain_mv_sync(mv_path, music_path, output_path, tmp_dir,
+                       safe_no_mouth=False):
     """
     リップシンクや同期が使えない時の最終フォールバック。
     原曲MVを頭からそのまま流し、音楽の長さに合わせる（短ければループ、長ければカット）。
     2デッキ・カット編集の代わり：関連動画やフェスを使わず、原曲MVだけで作る。
     """
     music_dur = get_audio_duration_accurate(music_path)
+    output_path = Path(output_path)
+    tmp_dir = Path(tmp_dir)
+    output_path.unlink(missing_ok=True)
+    expected_frames = _safe_video_frame_count(music_dur)
+
+    def _mux_plain_exact(video_only):
+        """古い出力や部分muxを成功扱いせず、曲長の全frame+AVを要求。"""
+        output_path.unlink(missing_ok=True)
+        run(["ffmpeg", "-y", "-i", str(video_only), "-i", str(music_path),
+             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+             "-c:a", "aac", "-b:a", "320k",
+             "-frames:v", str(expected_frames), "-t", f"{music_dur:.3f}",
+             "-movflags", "+faststart", str(output_path)])
+        if (not _video_has_exact_frames(output_path, expected_frames)
+                or not _has_av_streams(output_path)):
+            output_path.unlink(missing_ok=True)
+            raise RuntimeError("最終安全出力が途中欠け、または音声/映像不足です")
+        return True
+
+    if safe_no_mouth:
+        # 同期そのものが成立しなかったRemixでは、MVを頭から流すと
+        # 合っていない口が必ず露出する。全編を認証済みBロール、無ければ
+        # 非人物の抽象背景に固定してから音声を載せる。
+        tmp_safe = tmp_dir / "plain_safe_no_mouth.mp4"
+        tmp_safe.unlink(missing_ok=True)
+        made = make_safe_no_mouth_filler_segment(
+            mv_path, expected_frames / 30.0, tmp_safe, tmp_dir,
+            frame_count=expected_frames)
+        if not made or not _video_has_exact_frames(tmp_safe, expected_frames):
+            tmp_safe.unlink(missing_ok=True)
+            raise RuntimeError("全編の口元なし安全背景を生成できませんでした")
+        try:
+            return _mux_plain_exact(tmp_safe)
+        finally:
+            tmp_safe.unlink(missing_ok=True)
     mv_dur = get_duration(mv_path) if mv_path else 0
     if not mv_path or mv_dur <= 0.5:
         # MVが無い/壊れている → 黒背景で音楽の長さぶん作る（最低限破綻させない）
         tmp_black = tmp_dir / "plain_black.mp4"
-        run(["ffmpeg","-y","-f","lavfi","-i",f"color=c=black:s=1280x720:r=30:d={music_dur+2.0:.1f}",
-             *ENC_ARGS,"-an",str(tmp_black)])
-        run(["ffmpeg","-y","-i",str(tmp_black),"-i",str(music_path),
-             "-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","320k",
-             "-t",f"{music_dur:.3f}","-movflags","+faststart",str(output_path)])
         tmp_black.unlink(missing_ok=True)
-        return
+        if not make_abstract_no_mouth_segment(
+                expected_frames / 30.0, tmp_black,
+                frame_count=expected_frames):
+            raise RuntimeError("黒背景を予定フレーム数で生成できませんでした")
+        try:
+            return _mux_plain_exact(tmp_black)
+        finally:
+            tmp_black.unlink(missing_ok=True)
     tmp_video = tmp_dir / "plain_mv_tmp.mp4"
+    tmp_video.unlink(missing_ok=True)
     # MVが音楽より短ければループ回数を計算（+1で余裕）
     loops = max(0, int(music_dur / mv_dur) + 1)
+    vf = (f"{VF_NORM},tpad=stop_mode=clone:stop_duration=1,"
+          f"trim=end_frame={expected_frames},setpts=PTS-STARTPTS")
     run(["ffmpeg","-y","-stream_loop",str(loops),"-i",str(mv_path),
-         "-t",f"{music_dur + 2.0:.3f}","-vf",VF_NORM,*ENC_ARGS,"-an",str(tmp_video)])
+         "-vf",vf,*ENC_ARGS,"-an", "-frames:v", str(expected_frames),
+         str(tmp_video)])
+    if not _video_has_exact_frames(tmp_video, expected_frames):
+        tmp_video.unlink(missing_ok=True)
+        raise RuntimeError("MVフォールバック映像が途中欠けです")
     # 音声を載せて正確な長さにカット
-    run(["ffmpeg","-y",
-         "-i",str(tmp_video),"-i",str(music_path),
-         "-map","0:v:0","-map","1:a:0",
-         "-c:v","copy","-c:a","aac","-b:a","320k",
-         "-t",f"{music_dur:.3f}","-movflags","+faststart",
-         str(output_path)])
-    tmp_video.unlink(missing_ok=True)
+    try:
+        return _mux_plain_exact(tmp_video)
+    finally:
+        tmp_video.unlink(missing_ok=True)
 
 
 def make_loop_only(loop_path, music_path, output_path):
@@ -1827,24 +2131,175 @@ def _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
         import vocal_sync
         return bool(vocal_sync.make_vocal_lipsync_remix(
             music_path, video_path, output_path, tmp_dir, music_dur,
-            filler_cb=lambda d, o: make_filler_segment(video_path, d, o, tmp_dir)))
+            filler_cb=lambda d, o, frames=None: make_safe_no_mouth_filler_segment(
+                video_path, d, o, tmp_dir, frame_count=frames),
+            strict_fail_closed=True))
     except Exception as e:
         print(f"  ⚠️ ボーカル分離リップシンクで例外: {e}")
+        return False
+
+
+# 生波形で正確に当たる区間はそのまま使い、後半の連続した弱区間だけを
+# Proへ渡す。数秒の無声/トランジションまで重いPro処理に回さないための下限。
+HYBRID_PRO_MIN_WEAK_SEC = 6.0
+HYBRID_PRO_LATE_FRAC = 0.35
+HYBRID_PRO_MIN_LATE_OVERLAP_SEC = 4.0
+HYBRID_PRO_CONTEXT_SEC = 4.0
+HYBRID_PRO_OUTPUT_FPS = 30.0
+
+
+def _should_use_pro_for_weak_segment(start, end, music_dur, is_remix, same_source,
+                                     min_duration=HYBRID_PRO_MIN_WEAK_SEC,
+                                     late_frac=HYBRID_PRO_LATE_FRAC,
+                                     min_late_overlap=HYBRID_PRO_MIN_LATE_OVERLAP_SEC):
+    """波形でNoneになった区間を局所Pro同期へ渡すかの純粋判定。
+
+    「前半の一部が強一致した」ことだけで曲全体をsame_sourceとした場合でも、
+    後半側に食い込む長い弱区間はフィラーにせずProで再解析する。
+    短い会話/無声/トランジションは従来どおりフィラーに残す。
+    """
+    if not (is_remix and same_source):
+        return False
+    try:
+        start = max(0.0, float(start))
+        end = max(start, float(end))
+        music_dur = max(0.0, float(music_dur))
+        min_duration = max(0.0, float(min_duration))
+        late_frac = min(1.0, max(0.0, float(late_frac)))
+        min_late_overlap = max(0.0, float(min_late_overlap))
+    except (TypeError, ValueError):
+        return False
+    duration = end - start
+    if music_dur <= 0.0 or duration < min_duration:
+        return False
+    late_start = music_dur * late_frac
+    late_overlap = max(0.0, end - max(start, late_start))
+    # 6秒未満の短い区間は上で除外。長い区間は後半側に最低4秒あれば対象。
+    return late_overlap >= min(min_late_overlap, duration)
+
+
+def _hybrid_segment_frame_count(start, end, fps=HYBRID_PRO_OUTPUT_FPS):
+    """曲全体の時刻境界から、この区間が担当するフレーム数を返す。
+
+    `round((end-start)*fps)` を区間ごとに繰り返すと、小数フレームの
+    丸め誤差が連結回数分積み上がる。始点/終点を同じ全体時間軸上で
+    丸め、その差を取れば隣接区間の端数が相殺される。
+    """
+    try:
+        start = max(0.0, float(start))
+        end = max(start, float(end))
+        fps = float(fps)
+    except (TypeError, ValueError):
+        return 0
+    if fps <= 0.0:
+        return 0
+    return max(0, int(round(end * fps)) - int(round(start * fps)))
+
+
+def _hybrid_exact_frame_filter(base_filter, frame_count):
+    """不足時は最終画を補い、区間を指定整数フレームへ固定する。"""
+    frames = max(1, int(frame_count))
+    return (f"{base_filter},tpad=stop_mode=clone:stop_duration=1.0,"
+            f"trim=end_frame={frames},setpts=PTS-STARTPTS")
+
+
+def _try_pro_lipsync_segment(music_path, video_path, output_path, tmp_dir,
+                              start, end, music_dur,
+                              context_sec=HYBRID_PRO_CONTEXT_SEC):
+    """生波形で合わなかった1区間だけをProで再解析する。
+
+    境界直前直後の歌詞/発音文脈を失わないよう前後数秒を付けてPro処理し、
+    成功した映像の中央部分だけを正確なフレーム数で取り出す。
+    Proの品質ゲートが不合格/未導入/例外ならFalseで従来フィラーへ戻す。
+    """
+    try:
+        start = max(0.0, float(start))
+        end = min(max(start, float(end)), float(music_dur))
+        duration = end - start
+        if duration < 0.2:
+            return False
+        context_sec = max(0.0, float(context_sec))
+        clip_start = max(0.0, start - context_sec)
+        clip_end = min(float(music_dur), end + context_sec)
+        clip_duration = clip_end - clip_start
+        trim_start = start - clip_start
+        if clip_duration < 1.0:
+            return False
+
+        tmp_dir = Path(tmp_dir)
+        tag = Path(output_path).stem
+        clip_audio = tmp_dir / f"{tag}_pro_context.wav"
+        pro_mux = tmp_dir / f"{tag}_pro_context.mp4"
+
+        # -ssを入力後に置き、MP3/AACでも区間頭の発音を正確にデコードする。
+        cut = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(music_path),
+             "-ss", f"{clip_start:.3f}", "-t", f"{clip_duration:.3f}",
+             "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le",
+             str(clip_audio)],
+            capture_output=True, text=True, errors="replace")
+        if (cut.returncode != 0 or not clip_audio.exists()
+                or clip_audio.stat().st_size <= 44):
+            print(f"  ⚠️ 局所Pro用の音声切り出しに失敗 "
+                  f"（曲 {start:.1f}〜{end:.1f}秒）")
+            return False
+
+        import lipsync_pro
+        print(f"  🧠 後半の弱区間 {start:.1f}〜{end:.1f}秒を局所Pro同期"
+              f"（前後文脈 {context_sec:.0f}秒付き）...")
+        ok = bool(lipsync_pro.process(
+            str(clip_audio), str(video_path), str(pro_mux),
+            use_hubert=True, placement="equal", sync_offset_ms="auto"))
+        if (not ok or not pro_mux.exists() or pro_mux.stat().st_size <= 0):
+            print(f"  ↪︎ 局所Proの信頼度不足 → この区間は口元なし映像へ退避")
+            return False
+
+        # Pro出力には切り出し音声も入る。後段のvideo-only連結と
+        # ストリーム構成を揃えるため音声を外し、不足時は最終フレームで埋める。
+        # 区間長を個別に丸めず、曲全体の開始/終了境界の差を使う。
+        # これにより小数フレームの丸め誤差が区間連結ごとに蓄積しない。
+        target_frames = max(1, _hybrid_segment_frame_count(start, end))
+        # -ssとtrim=end_frameを併用すると、trimのフレーム番号が
+        # コンテキスト先頭から数えられ、前文脈分だけ出力が短くなる。
+        # 開始トリムもfilter内で行い、一度PTSをゼロに戻してから枚数を固定する。
+        vf = (f"{VF_NORM},trim=start={trim_start:.6f},setpts=PTS-STARTPTS,"
+              f"tpad=stop_mode=clone:stop_duration={duration + 1.0:.3f},"
+              f"trim=end_frame={target_frames},setpts=PTS-STARTPTS")
+        render = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(pro_mux),
+             "-vf", vf, *ENC_ARGS,
+             "-an", "-frames:v", str(target_frames), str(output_path)],
+            capture_output=True, text=True, errors="replace")
+        if (render.returncode != 0
+                or not _video_has_exact_frames(output_path, target_frames)):
+            print(f"  ⚠️ 局所Pro映像の取り出しに失敗 "
+                  f"（曲 {start:.1f}〜{end:.1f}秒）")
+            return False
+        print(f"  ✅ 局所Pro採用: 曲 {start:.1f}〜{end:.1f}秒"
+              f"（{target_frames}フレーム）")
+        return True
+    except (Exception, SystemExit) as e:
+        print(f"  ⚠️ 局所Proで例外 → 口元なし映像へ退避: {e}")
         return False
 
 
 def _remix_with_lipsync(music_path, video_path, chosen_url, loop_path, output_path, tmp_dir, music_dur):
     """
     Remix経路: まず Demucs ボーカル分離でリップシンク同期を試し、
-    成功すればそれを採用。素材不足/分離不可/一致不足なら原曲MVをそのまま流す。
+    成功すればそれを採用。素材不足/分離不可/一致不足なら、未同期の口を
+    見せず、認証済み口元なしBロールまたは非人物背景だけで仕上げる。
     """
     if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
         return
-    print(f"  → リップシンク不可 → 原曲MVをそのまま流します")
-    make_plain_mv_sync(video_path, music_path, output_path, tmp_dir)
+    print(f"  → リップシンク不可 → 口元なし映像だけで安全側に仕上げます")
+    make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
+                       safe_no_mouth=True)
 
 
-STRAIGHT_MODE = False   # True: MVを時系列そのまま等速で被せる（リップシンク・多様化オフ）
+STRAIGHT_MODE = False   # 診断用。絶対安全ポリシー下では人物MVを直接表示しない。
+# ファイル名や伴奏波形だけでは発音時刻を証明できない。人物の口元を出すには
+# Pro/strict Demucsのclean-vocal timing proofを必須にする。
+REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES = True
 
 
 def _wf_best_pos(m, video_audio, sr):
@@ -1870,7 +2325,8 @@ def _wf_best_pos(m, video_audio, sr):
 
 
 def waveform_track_plan(music_audio, video_audio, sr, music_dur, vid_dur,
-                        win=4.0, hop=2.0, match_th=0.60, jump_tol=0.5, strong=0.82):
+                        win=4.0, hop=2.0, match_th=0.60, jump_tol=0.5,
+                        strong=0.82, interpolate_single_gap=True):
     """全編を hop秒ごとに区切り、各窓の【絶対ベスト】MV位置を生波形NCCで実測（単調制約なし）。
     ・conf>=match_th の窓 → 波形が指すMV位置に配置（連続はまとめ、飛びでカット）
     ・conf<match_th の窓 → MVに無い区間（追加イントロ/つなぎ/SE）とみなしフィラー(None)
@@ -1894,11 +2350,15 @@ def waveform_track_plan(music_audio, video_audio, sr, music_dur, vid_dur,
     match_ratio = float(np.mean(confs >= match_th))
     score = {"p80": p80, "strong_frac": strong_frac, "match_ratio": match_ratio}
 
-    # 孤立した1窓だけの落ち込み(transient)は等速予測で補間し有効化＝フィラー断片化を防ぐ
-    for i in range(1, N - 1):
-        if pts[i][3] < match_th and pts[i - 1][3] >= match_th and pts[i + 1][3] >= match_th:
-            pts[i][2] = pts[i - 1][2] + (pts[i][0] - pts[i - 1][0])
-            pts[i][3] = match_th
+    # 原曲/Editでは孤立した1窓の落ち込みを補間できる。Remixはその2秒が
+    # 構成差や別ボーカルである可能性があるため、呼び出し側で無効化して
+    # 口元なし映像へ送る。
+    if interpolate_single_gap:
+        for i in range(1, N - 1):
+            if (pts[i][3] < match_th and pts[i - 1][3] >= match_th
+                    and pts[i + 1][3] >= match_th):
+                pts[i][2] = pts[i - 1][2] + (pts[i][0] - pts[i - 1][0])
+                pts[i][3] = match_th
 
     # セグメント構築：弱窓の連続=フィラー(None)、マッチ窓=波形位置（飛びでカット）
     def _clamp(x): return max(0.0, min(x, max(0.1, vid_dur - 0.1)))
@@ -1923,6 +2383,80 @@ def waveform_track_plan(music_audio, video_audio, sr, music_dur, vid_dur,
                     break                              # 波形が飛ぶ → カット
             seg_plan.append((cs, ce, _clamp(cmv)))
     return seg_plan, confs, score
+
+
+def _expand_unsafe_plan_ranges(seg_plan, total_dur, pad=0.25, min_show=0.75,
+                               extra_unsafe_ranges=None):
+    """None区間を前後へ広げ、短すぎるSHOW島を除去する。
+
+    理想動画と同じく、判定境界で口が1〜2フレーム漏れることを避ける。
+    mapped区間を分割した場合は、開始のMV時刻も同じ秒数だけ進める。
+    """
+    try:
+        total_dur = max(0.0, float(total_dur))
+        pad = max(0.0, float(pad)); min_show = max(0.0, float(min_show))
+        clean = [(max(0.0, float(s)), min(total_dur, float(e)),
+                  None if mv is None else float(mv))
+                 for s, e, mv in seg_plan if float(e) > float(s)]
+    except (TypeError, ValueError, OverflowError):
+        return list(seg_plan or [])
+    if not clean:
+        return []
+
+    raw_ranges = [(s, e) for s, e, mv in clean if mv is None]
+    for item in extra_unsafe_ranges or []:
+        try:
+            a, b = float(item[0]), float(item[1])
+            if np.isfinite(a) and np.isfinite(b) and b > a:
+                raw_ranges.append((max(0.0, a), min(total_dur, b)))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue
+    raw_unsafe = [(max(0.0, s - pad), min(total_dur, e + pad))
+                  for s, e in raw_ranges]
+    unsafe = []
+    for s, e in sorted(raw_unsafe):
+        if unsafe and s <= unsafe[-1][1] + 1e-9:
+            unsafe[-1] = (unsafe[-1][0], max(unsafe[-1][1], e))
+        else:
+            unsafe.append((s, e))
+
+    boundaries = {0.0, total_dur}
+    for s, e, _ in clean:
+        boundaries.update((s, e))
+    for s, e in unsafe:
+        boundaries.update((s, e))
+    boundaries = sorted(x for x in boundaries if 0.0 <= x <= total_dur)
+
+    pieces = []
+    oi = 0
+    for a, b in zip(boundaries, boundaries[1:]):
+        if b <= a + 1e-9:
+            continue
+        mid = (a + b) * 0.5
+        while oi + 1 < len(clean) and mid >= clean[oi][1] - 1e-9:
+            oi += 1
+        os_, oe, omv = clean[oi]
+        in_source = os_ - 1e-9 <= mid < oe + 1e-9
+        blocked = any(a < ue - 1e-9 and b > us + 1e-9 for us, ue in unsafe)
+        mapped = None
+        if in_source and omv is not None and not blocked:
+            mapped = omv + (a - os_)
+        if mapped is not None and b - a < min_show - 1e-9:
+            mapped = None
+        pieces.append((a, b, mapped))
+
+    merged = []
+    for s, e, mv in pieces:
+        if not merged:
+            merged.append((s, e, mv)); continue
+        ps, pe, pmv = merged[-1]
+        continuous_map = (pmv is not None and mv is not None
+                          and abs(mv - (pmv + (s - ps))) <= 0.03)
+        if (pmv is None and mv is None) or continuous_map:
+            merged[-1] = (ps, e, pmv)
+        else:
+            merged.append((s, e, mv))
+    return merged
 
 
 def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
@@ -2008,8 +2542,10 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
 
     # 時系列そのまま等速モード：手動フラグ STRAIGHT_MODE=True の時だけ（editは口パク同期に戻す）
     if STRAIGHT_MODE:
-        print("  🎞 時系列そのまま等速で配置（口パク・多様化オフ）→ MVを頭から流します")
-        make_plain_mv_sync(video_path, music_path, output_path, tmp_dir)
+        print("  🛡️ 絶対安全ポリシー: 時系列直流しでも未証明の人物MVは表示しません")
+        make_plain_mv_sync(
+            video_path, music_path, output_path, tmp_dir,
+            safe_no_mouth=True)
         try:
             mb = output_path.stat().st_size / 1024 / 1024
             print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
@@ -2018,8 +2554,28 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         return
 
     if not has_audio(video_path):
-        print(f"  ⚠️  映像に音声なし → 原曲MVをそのまま流して全編作成")
-        make_plain_mv_sync(video_path, music_path, output_path, tmp_dir)
+        # ファイル名にRemix表記が無くても、比較音声が無ければ同期は証明不能。
+        # Club Mix等の命名漏れで未同期の人物MVを出さない。
+        print(f"  ⚠️  映像に音声なしで同期不能 → 口元なし映像だけで全編作成")
+        make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
+                           safe_no_mouth=True)
+        mb = output_path.stat().st_size / 1024 / 1024
+        print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
+        return
+
+    if REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES:
+        # 伴奏が同一なら、歌詞が別でもfull-mix NCCは0.98近くになり得る。
+        # したがってファイル名・テンポ・伴奏波形を人物表示の証明に使わず、
+        # clean vocal + HuBERT/strict Demucsが全編品質ゲートを通った場合だけ
+        # 人物MVを採用する。部分成功はPro側のunsafe rangeで非人物背景へ送る。
+        print("  🎤 人物表示の必須条件: clean-vocal発音タイミングを全編検証")
+        if _try_vocal_lipsync(
+                music_path, video_path, output_path, tmp_dir, music_dur):
+            return
+        print("  🛡️ 発音タイミングを証明できません → 全編を口元なし映像へ退避")
+        make_plain_mv_sync(
+            video_path, music_path, output_path, tmp_dir,
+            safe_no_mouth=True)
         mb = output_path.stat().st_size / 1024 / 1024
         print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
         return
@@ -2040,8 +2596,9 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             print(f"  ⚠️ どのテンポでも波形が一直線に揃わない（別アレンジ）→ リップシンクに切替")
             if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
                 return
-            print(f"  → リップシンクも弱い → 原曲MVをそのまま流します")
-            make_plain_mv_sync(video_path, music_path, output_path, tmp_dir)
+            print(f"  → リップシンクも弱い → 口元なし映像だけで安全側に仕上げます")
+            make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
+                               safe_no_mouth=True)
             try:
                 mb = output_path.stat().st_size / 1024 / 1024
                 print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
@@ -2079,63 +2636,84 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     #   各窓の絶対ベストMV位置を生波形NCCで実測し、波形が指す所へそのまま置く。
     #   クロマ補正もインスタンス選択もドリフト補正も使わない（同一音源なら波形が一意に指す）。
     print(f"  🌊 全編を生波形で追従中（単調制約なし）...")
+    # 名前だけでRemixを識別すると「Club Mix」「Version」等が漏れる。
+    # 口を見せる全経路を同じ厳格基準に固定し、確証のある波形一致島だけSHOW。
+    # 孤立した弱窓は推測補間せず、残りはPro/安全映像へ送る。
+    _strict_remix_show = True
+    _wf_match_th = 0.72
     seg_plan, _confs, score = waveform_track_plan(
-        music_audio, video_audio, 11025, music_dur, vid_dur, win=4.0, hop=2.0)
+        music_audio, video_audio, 11025, music_dur, vid_dur,
+        win=4.0, hop=2.0, match_th=_wf_match_th,
+        interpolate_single_gap=False)
     p80 = score["p80"]; strong_frac = score["strong_frac"]; match_ratio = score["match_ratio"]
     print(f"  📊 波形一致: 強一致率{strong_frac*100:.0f}% / p80={p80:.2f} / 一致区間{match_ratio*100:.0f}%")
     print(f"     （短いEdit/Hook/Introは“合う所が強ければ”同一音源。MV外の区間はフィラーに回します）")
 
     if not seg_plan:
-        print(f"  ⚠️  MVと対応する区間が見つからず → 原曲MVをそのまま流します")
-        make_plain_mv_sync(video_path, music_path, output_path, tmp_dir)
+        safe_fallback = True
+        print(f"  ⚠️  MVと対応する区間が見つからず → 口元なし映像だけで作成")
+        make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
+                           safe_no_mouth=safe_fallback)
         mb = output_path.stat().st_size / 1024 / 1024
         print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
         return
 
-    # 同一音源判定：全体の平均ではなく「合う所がどれだけ強いか」で見る。
+    # 同一音源の「信頼できる部分があるか」の判定。
     #   ・p80が高い（大半が高精度で一致）   …通常のEdit/原曲
     #   ・または強一致率が一定以上（一部しかMVに無くても、その一部が確実に一致）
     #     →短いHook/Intro/Short Editでも同一音源と正しく判定できる
+    # ただし、これは弱区間まで「同一音源」とみなす許可ではない。
+    # Remixの後半にある連続弱区間は、下の局所Pro経路で別々に再解析する。
     same_source = (p80 >= 0.78) or (strong_frac >= 0.30)
     _content_align_used = False   # 音内容アライン採用時のみ末尾ズレ補正を効かせる
     if not same_source:
-        # 生波形が合わない＝別マスターの可能性。だが同じ曲ならクロマ(メロディ)は合う。
-        print(f"  ↪︎ 生波形では合わない（強一致率{strong_frac*100:.0f}%）→ クロマ（メロディ）で合わせ直します...")
-        cseg_plan, cconf, cuniq = align_segments(video_audio, music_audio)
-        cmatch = (sum(e - s for s, e, mv in cseg_plan if mv is not None) / music_dur) if music_dur > 0 else 0.0
-        cn = sum(1 for s, e, mv in cseg_plan if mv is not None)
-        chroma_ok = (cn > 0 and cconf >= 0.50 and cmatch >= 0.40)
-        is_rmx = bool(_is_remix_word and not is_quasi_original)
+        # 和音/メロディの一致は同じ曲らしさを示すだけで、発音時刻や口形の
+        # 一致証明にはならない。まずボーカルProを試し、失敗時はクロマで
+        # 口を再表示せず、既に得た強い生波形島だけを残す。
+        print(f"  ↪︎ 生波形の全体一致が不足（強一致率{strong_frac*100:.0f}%）"
+              " → ボーカル・リップシンクを試します")
+        if not remix_lipsync_attempted:
+            remix_lipsync_attempted = True
+            if _try_vocal_lipsync(
+                    music_path, video_path, output_path, tmp_dir, music_dur):
+                return
+        print("  🛡️ Pro不採用後はクロマ推測へ戻さず、"
+              "強い波形一致島以外を口元なし映像へ退避")
 
-        if chroma_ok and cuniq >= 0.12:
-            # メロディが一意に合う（別マスターでも素直に対応）→ そのまま採用（令和ver等）
-            print(f"  ✅ クロマで一致（スコア{cconf:.2f} / 一致率{cmatch*100:.0f}% / 一意性{cuniq:.2f}）→ メロディ基準で配置")
-            seg_plan = cseg_plan
-        elif chroma_ok and (_cap := content_align_plan(music_audio, video_audio, music_dur, vid_dur, 11025)):
-            # 音内容アライン（6/24 fix_mv_align 方式）。slope≈1 の連続ランだけ使うので
-            # 反復のドリフト・末尾巻き戻りが出ない。リミックスにも“原曲＋イントロ”なEditにも有効。
-            print(f"  ↪︎ 音内容アラインで配置（slope≈1ラン {len(_cap)}区間 / 連続前進）")
-            seg_plan = _cap
-            _content_align_used = True
-        else:
-            # クロマも安定ランも無い。確立済みの設計方針に従う:
-            #   ・テンポ差Remix（構成も別）→ リップシンク → ダメなら原曲MV
-            #   ・原曲/Intro/Extended系 → 無理に口パクせず “原曲MVをそのまま流す”
-            if is_rmx:
-                print(f"  ⚠️ クロマでも合わない（{cconf:.2f}）→ リップシンクに切替")
-                if (not remix_lipsync_attempted
-                        and _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur)):
-                    return
-                print(f"  → リップシンクも弱い → 原曲MVをそのまま流します")
-            else:
-                print(f"  ⚠️ クロマでも合わない（{cconf:.2f} / 一意性{cuniq:.2f}）→ 原曲MVをそのまま流します（原曲MV主体）")
-            make_plain_mv_sync(video_path, music_path, output_path, tmp_dir)
-            try:
-                mb = output_path.stat().st_size / 1024 / 1024
-                print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
-            except Exception:
-                pass
-            return
+    # フルミックスNCCだけでは、伴奏が同じまま歌だけ抜けるEditを見抜けない。
+    # Demucsのclean vocalで持続無声を確認し、その範囲は波形一致が高くても隠す。
+    vocal_silence_ranges = None
+    try:
+        import vocal_sync
+        vocal_silence_ranges = vocal_sync.clean_vocal_silence_ranges(
+            music_path, tmp_dir / "core_vocal_safety", music_dur,
+            min_silence=0.02, verbose=False)
+    except Exception:
+        vocal_silence_ranges = None
+
+    if vocal_silence_ranges is None:
+        print("  ⚠️ clean vocalの無声確認ができません → 波形一致だけでは人物を表示しません")
+        if not remix_lipsync_attempted:
+            remix_lipsync_attempted = True
+            if _try_vocal_lipsync(
+                    music_path, video_path, output_path, tmp_dir, music_dur):
+                return
+        seg_plan = [(0.0, music_dur, None)]
+    elif vocal_silence_ranges:
+        hidden_vocal = sum(max(0.0, b - a) for a, b in vocal_silence_ranges)
+        print(f"  🛡️ clean vocal無声: {len(vocal_silence_ranges)}区間 / "
+              f"{hidden_vocal:.1f}秒を口元非表示")
+
+    if _strict_remix_show:
+        strict_plan = _expand_unsafe_plan_ranges(
+            seg_plan, music_dur, pad=0.25, min_show=0.75,
+            extra_unsafe_ranges=vocal_silence_ranges)
+        hidden_before = sum(e - s for s, e, mv in seg_plan if mv is None)
+        hidden_after = sum(e - s for s, e, mv in strict_plan if mv is None)
+        seg_plan = strict_plan
+        if hidden_after > hidden_before + 0.01:
+            print(f"  🛡️ Remix安全境界: NG側を前後0.25秒拡張 / "
+                  f"0.75秒未満の口元SHOWを除外（非表示 {hidden_after:.1f}秒）")
 
     # 波形が指すプランをそのまま採用（並べ替え・hook-firstは自然に出る）
     print(f"\n🎬 映像構成プラン（波形追従・{len(seg_plan)}区間）:")
@@ -2144,6 +2722,20 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             print(f"  曲 {s:6.1f}〜{e:6.1f}秒 : フィラー映像（MVに無い区間）")
         else:
             print(f"  曲 {s:6.1f}〜{e:6.1f}秒 : MVの {mv:.1f}秒〜")
+
+    # 「前半の強一致だけでsame_source=True」の場合でも、Noneを
+    # 一律にMVループへ逃がさない。Remix後半の長い弱区間だけ局所Pro候補にする。
+    is_rmx_for_hybrid = (vocal_silence_ranges is not None)
+    hybrid_pro_segments = {
+        i for i, (s, e, mv) in enumerate(seg_plan)
+        if mv is None and _should_use_pro_for_weak_segment(
+            s, e, music_dur, is_rmx_for_hybrid, same_source)
+    }
+    if hybrid_pro_segments:
+        hybrid_sec = sum(seg_plan[i][1] - seg_plan[i][0]
+                         for i in hybrid_pro_segments)
+        print(f"  🧩 ハイブリッド同期: 波形一致区間は保持 / "
+              f"後半の弱区間{len(hybrid_pro_segments)}個（計{hybrid_sec:.1f}秒）は局所Pro")
     seg_rates = [1.0] * len(seg_plan)
     if _content_align_used:
         # 区間末尾ズレ→内部で微伸縮: 各区間を、次区間のMV開始（最終区間はMV終端＝フィナーレ）に
@@ -2171,51 +2763,97 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     seg_files = []
     for si, (s, e, mv) in enumerate(seg_plan):
         dur = e - s
-        if dur < 0.2: continue
+        # 秒数の短さで切らず、全体タイムライン上で1枚以上を担当する
+        # 区間は必ず描画する。これで後続人物映像の前詰めを防ぐ。
+        if dur <= 0.0:
+            continue
+        target_frames = _hybrid_segment_frame_count(s, e)
+        if target_frames <= 0:
+            continue
         out_seg = tmp_dir / f"seg_{si:03d}.mp4"
+        out_seg.unlink(missing_ok=True)
         if mv is None:
-            make_filler_segment(video_path, dur, out_seg, tmp_dir)
+            pro_ok = False
+            if si in hybrid_pro_segments:
+                pro_ok = _try_pro_lipsync_segment(
+                    music_path, video_path, out_seg, tmp_dir,
+                    s, e, music_dur)
+            if not pro_ok:
+                make_safe_no_mouth_filler_segment(
+                    video_path, dur, out_seg, tmp_dir,
+                    frame_count=target_frames)
         else:
             # MVの該当箇所を切り出し。rで内部伸縮する場合は「消費するMV秒 = r*dur」で判定する。
             r = seg_rates[si]
             avail = max(0.0, vid_dur - mv)
             src_want = max(0.1, r * dur)          # この区間が消費すべきMV秒
             if avail < 0.5:
-                make_filler_segment(video_path, dur, out_seg, tmp_dir)
+                make_safe_no_mouth_filler_segment(
+                    video_path, dur, out_seg, tmp_dir,
+                    frame_count=target_frames)
             elif src_want <= avail + 0.05:
                 # rで伸縮すればMV内に収まる（r=1なら等速）
                 if abs(r - 1.0) > 0.002:
+                    vf = _hybrid_exact_frame_filter(
+                        f"setpts=PTS/{r:.6f},{VF_NORM}", target_frames)
                     run(["ffmpeg","-y","-ss",f"{mv:.3f}","-t",f"{src_want:.3f}","-i",str(video_path),
-                         "-vf",f"setpts=PTS/{r:.6f},{VF_NORM}",*ENC_ARGS,"-an",str(out_seg)])
+                         "-vf",vf,*ENC_ARGS,"-an",
+                         "-frames:v",str(target_frames),str(out_seg)])
                 else:
+                    vf = _hybrid_exact_frame_filter(VF_NORM, target_frames)
                     run(["ffmpeg","-y","-ss",f"{mv:.3f}","-i",str(video_path),
-                         "-t",f"{dur:.3f}","-vf",VF_NORM,*ENC_ARGS,"-an",str(out_seg)])
+                         "-t",f"{dur:.3f}","-vf",vf,*ENC_ARGS,"-an",
+                         "-frames:v",str(target_frames),str(out_seg)])
             else:
                 # rで伸縮してもMVが足りない → 使える分を出し、残りを埋める
                 out_v_dur = avail / r             # 出力での長さ
+                split_t = min(e, s + out_v_dur)
+                part_v_frames = max(
+                    1, int(round(split_t * HYBRID_PRO_OUTPUT_FPS))
+                    - int(round(s * HYBRID_PRO_OUTPUT_FPS)))
+                part_v_frames = min(target_frames - 1, part_v_frames)
+                rest_frames = max(1, target_frames - part_v_frames)
                 part_v = tmp_dir / f"seg_{si:03d}_v.mp4"
+                part_v.unlink(missing_ok=True)
                 if abs(r - 1.0) > 0.002:
+                    vf = _hybrid_exact_frame_filter(
+                        f"setpts=PTS/{r:.6f},{VF_NORM}", part_v_frames)
                     run(["ffmpeg","-y","-ss",f"{mv:.3f}","-t",f"{avail:.3f}","-i",str(video_path),
-                         "-vf",f"setpts=PTS/{r:.6f},{VF_NORM}",*ENC_ARGS,"-an",str(part_v)])
+                         "-vf",vf,*ENC_ARGS,"-an",
+                         "-frames:v",str(part_v_frames),str(part_v)])
                 else:
+                    vf = _hybrid_exact_frame_filter(VF_NORM, part_v_frames)
                     run(["ffmpeg","-y","-ss",f"{mv:.3f}","-i",str(video_path),
-                         "-t",f"{avail:.3f}","-vf",VF_NORM,*ENC_ARGS,"-an",str(part_v)])
-                rest = max(0.1, dur - out_v_dur)
+                         "-t",f"{avail:.3f}","-vf",vf,*ENC_ARGS,"-an",
+                         "-frames:v",str(part_v_frames),str(part_v)])
+                rest = rest_frames / HYBRID_PRO_OUTPUT_FPS
                 part_f = tmp_dir / f"seg_{si:03d}_f.mp4"
-                if _content_align_used:
-                    # 音内容アライン: MVが尽きた残りは、フェス/静止ではなくMV内の別の映像を流す
-                    # （MVの頭の方から rest 秒。MV尺が足りなければ0秒から）
-                    fb_start = max(0.0, min(mv * 0.5, vid_dur - rest - 0.1))
-                    run(["ffmpeg","-y","-ss",f"{fb_start:.3f}","-i",str(video_path),
-                         "-t",f"{rest:.3f}","-vf",VF_NORM,*ENC_ARGS,"-an",str(part_f)])
-                else:
-                    make_filler_segment(video_path, rest, part_f, tmp_dir)
-                lst = tmp_dir / f"seg_{si:03d}_l.txt"
-                with open(lst, "w") as f:
-                    f.write(f"file '{part_v}'\nfile '{part_f}'\n")
-                run(["ffmpeg","-y","-f","concat","-safe","0",
-                     "-i",str(lst),"-c","copy",str(out_seg)])
-        seg_files.append(out_seg)
+                part_f.unlink(missing_ok=True)
+                # 対応MVが尽きた時点から先は同期を証明できない。
+                # content-align採用時も任意の人物カットへ戻さず、口元なし認証を通す。
+                make_safe_no_mouth_filler_segment(
+                    video_path, rest, part_f, tmp_dir,
+                    frame_count=rest_frames)
+                if (_video_has_exact_frames(part_v, part_v_frames)
+                        and _video_has_exact_frames(part_f, rest_frames)):
+                    lst = tmp_dir / f"seg_{si:03d}_l.txt"
+                    with open(lst, "w") as f:
+                        f.write(f"file '{part_v}'\nfile '{part_f}'\n")
+                    run(["ffmpeg","-y","-f","concat","-safe","0",
+                         "-i",str(lst),"-c","copy",str(out_seg)])
+        # どの映像生成失敗も区間削除にしない。削除すると後続の人物映像が
+        # 音声より前詰めされるため、同じ整数枚数の安全背景で置き換える。
+        if not _video_has_exact_frames(out_seg, target_frames):
+            out_seg.unlink(missing_ok=True)
+            make_abstract_no_mouth_segment(
+                target_frames / HYBRID_PRO_OUTPUT_FPS, out_seg,
+                frame_count=target_frames)
+        if _video_has_exact_frames(out_seg, target_frames):
+            seg_files.append(out_seg)
+        else:
+            # 区間を省略して後続人物映像を前詰めするくらいなら、曲自体を
+            # 失敗扱いにする。安全背景も作れない環境で人物へ戻らない。
+            raise RuntimeError(f"安全映像を生成できませんでした: {s:.3f}-{e:.3f}s")
 
     print(f"\n🔗 結合・合成中...")
     combined = tmp_dir / "combined.mp4"
@@ -2224,14 +2862,40 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     else:
         concat_segments(seg_files, combined, tmp_dir)
 
-    combined = ensure_video_length(combined, music_dur, video_path, tmp_dir)
+    # 連結が一部だけ成功したケースも後続映像を前詰めするため不採用。
+    expected_full_frames = max(
+        1, int(round(music_dur * HYBRID_PRO_OUTPUT_FPS)))
+    combined_frames = _decoded_video_frame_count(combined) if combined.exists() else None
+    if combined_frames != expected_full_frames:
+        print(f"  ⚠️ 連結枚数が不一致（{combined_frames} / {expected_full_frames} frames）"
+              " → 全編を安全背景へ置換")
+        combined.unlink(missing_ok=True)
+        make_safe_no_mouth_filler_segment(
+            video_path, music_dur, combined, tmp_dir,
+            frame_count=expected_full_frames)
 
+    if not _video_has_exact_frames(combined, expected_full_frames):
+        raise RuntimeError("全編の安全映像を予定フレーム数で生成できませんでした")
+
+    combined = ensure_video_length(
+        combined, music_dur, video_path, tmp_dir, safe_no_mouth=True)
+
+    if not _video_has_exact_frames(combined, expected_full_frames):
+        raise RuntimeError("音声合成前の映像フレーム数が一致しません")
+
+    Path(output_path).unlink(missing_ok=True)
     run(["ffmpeg","-y",
          "-i",str(combined),"-i",str(music_path),
          "-map","0:v:0","-map","1:a:0",
          "-c:v","copy","-c:a","aac","-b:a","320k",
+         "-frames:v",str(expected_full_frames),
          "-t",f"{music_dur:.3f}","-movflags","+faststart",
          str(output_path)])
+
+    if (not _video_has_exact_frames(output_path, expected_full_frames)
+            or not _has_av_streams(output_path)):
+        Path(output_path).unlink(missing_ok=True)
+        raise RuntimeError("最終出力が途中欠け、または映像/音声ストリーム不足です")
 
     mb = output_path.stat().st_size / 1024 / 1024
     out_dur = get_duration(output_path)

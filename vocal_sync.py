@@ -13,12 +13,26 @@
 #
 #  公開API:
 #    make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir,
-#                             music_dur, filler_cb=None) -> bool
+#                             music_dur, filler_cb=None,
+#                             strict_fail_closed=False) -> bool
 # ============================================================
 
-import subprocess, shutil, sys, importlib
+import os, subprocess, shutil, sys, importlib, tempfile
+from fractions import Fraction
 from pathlib import Path
 import numpy as np
+
+try:
+    _numba_cache = Path.home() / ".dj_video_maker" / "numba_cache"
+    _numba_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(_numba_cache))
+except OSError:
+    try:
+        _numba_cache = Path(tempfile.gettempdir()) / f"djvm_numba_{os.getuid()}"
+        _numba_cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("NUMBA_CACHE_DIR", str(_numba_cache))
+    except OSError:
+        pass
 
 SR = 22050
 
@@ -27,6 +41,11 @@ VF_NORM = ("scale=1280:720:force_original_aspect_ratio=decrease,"
            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1")
 ENC_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-pix_fmt", "yuv420p", "-video_track_timescale", "15360"]
+OUTPUT_FPS = Fraction(30, 1)
+# 旧方式は声の包絡/クロマ中心で、反復サビの別歌詞を
+# phoneme内容で区別できない。ProのHuBERT局所証明を迂回しないよう、
+# strict呼び出しでは旧方式の人物表示を無効化する。
+ALLOW_LEGACY_VISIBLE_FACES_IN_STRICT_MODE = False
 
 # 顔優先（歌唱シーン寄せ）の探索窓（秒）。
 #   0    = 顔優先オフ（DTWの対応時刻をそのまま使う）← 現在の推奨
@@ -114,9 +133,128 @@ def _valid_video(path, expected_dur=None, tolerance=1.0):
             or abs(dur - float(expected_dur)) <= float(tolerance))
 
 
+def _decoded_video_frame_count(path):
+    """実際に最後までデコードできた映像フレーム数。取得不能はNone。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, errors="replace")
+        if r.returncode != 0:
+            return None
+        values = (r.stdout or "").strip().splitlines()
+        if not values or values[0] in ("", "N/A"):
+            return None
+        count = int(values[0])
+        return count if count >= 0 else None
+    except (OSError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _video_has_exact_frames(path, expected_frames):
+    try:
+        expected_frames = int(expected_frames)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    p = Path(path)
+    return bool(expected_frames > 0 and p.exists() and p.stat().st_size > 0
+                and _decoded_video_frame_count(p) == expected_frames)
+
+
+def _concat_video_exact(list_path, output_path, expected_frames):
+    """結合結果が途中欠けなら再エンコードし、それでも違えば不採用。"""
+    output_path = Path(output_path)
+    output_path.unlink(missing_ok=True)
+    r = _run(["ffmpeg", "-v", "error", "-y", "-fflags", "+genpts",
+              "-f", "concat", "-safe", "0", "-i", str(list_path),
+              "-c", "copy", str(output_path)])
+    if r.returncode == 0 and _video_has_exact_frames(output_path, expected_frames):
+        return True, r
+    output_path.unlink(missing_ok=True)
+    vf = _exact_frame_filter(VF_NORM, expected_frames)
+    r = _run(["ffmpeg", "-v", "error", "-y", "-fflags", "+genpts",
+              "-f", "concat", "-safe", "0", "-i", str(list_path),
+              "-vf", vf, *ENC_ARGS, "-an", "-frames:v", str(int(expected_frames)),
+              str(output_path)])
+    return bool(r.returncode == 0
+                and _video_has_exact_frames(output_path, expected_frames)), r
+
+
+def _mux_video_audio_exact(video_path, audio_path, output_path,
+                           expected_frames, music_dur):
+    output_path = Path(output_path)
+    output_path.unlink(missing_ok=True)
+    r = _run(["ffmpeg", "-v", "error", "-y", "-i", str(video_path),
+              "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0",
+              "-c:v", "copy", "-c:a", "aac", "-b:a", "320k",
+              "-frames:v", str(int(expected_frames)), "-t", f"{music_dur:.3f}",
+              "-movflags", "+faststart", str(output_path)])
+    ok = bool(r.returncode == 0
+              and _video_has_exact_frames(output_path, expected_frames)
+              and _has_av_streams(output_path))
+    return ok, r
+
+
 def _tail(text, n=15):
     lines = (text or "").strip().splitlines()
     return lines[-n:] if lines else []
+
+
+def _to_fraction(value):
+    """秒/FPSを、長尺でも浮動小数誤差が蓄積しない有理数へ変換する。"""
+    if isinstance(value, Fraction):
+        return value
+    return Fraction(str(value))
+
+
+def _round_frame_boundary(seconds, fps=OUTPUT_FPS):
+    """時刻を最寄りのフレーム境界へ丸める（0.5は未来側）。"""
+    seconds = _to_fraction(seconds)
+    fps = _to_fraction(fps)
+    if seconds < 0:
+        raise ValueError("seconds must be non-negative")
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    frames = seconds * fps
+    return (2 * frames.numerator + frames.denominator) // (2 * frames.denominator)
+
+
+class _CumulativeFrameClock:
+    """各区間を独立丸めせず、累積時刻の境界差から必要フレーム数を返す。"""
+
+    def __init__(self, fps=OUTPUT_FPS):
+        self.fps = _to_fraction(fps)
+        if self.fps <= 0:
+            raise ValueError("fps must be positive")
+        self.elapsed = Fraction(0, 1)
+        self.frame_boundary = 0
+
+    def take(self, duration):
+        duration = _to_fraction(duration)
+        if duration < 0:
+            raise ValueError("duration must be non-negative")
+        self.elapsed += duration
+        next_boundary = _round_frame_boundary(self.elapsed, self.fps)
+        count = next_boundary - self.frame_boundary
+        self.frame_boundary = next_boundary
+        return count
+
+
+def _cumulative_frame_counts(durations, fps=OUTPUT_FPS):
+    """テストや事前計画用。合計誤差を半フレーム以内に保つ区間別枚数。"""
+    clock = _CumulativeFrameClock(fps)
+    return [clock.take(duration) for duration in durations]
+
+
+def _exact_frame_filter(base_filter, frame_count):
+    """不足時は末尾を補い、指定枚数で必ず打ち切る映像フィルター。"""
+    frame_count = int(frame_count)
+    if frame_count <= 0:
+        raise ValueError("frame_count must be positive")
+    return (f"{base_filter},tpad=stop_mode=clone:stop_duration=1,"
+            f"trim=end_frame={frame_count},setpts=PTS-STARTPTS")
 
 
 # ------------------------------------------------------------
@@ -494,6 +632,265 @@ def _vocal_envelope(y, sr=SR, fps=50):
     return env.astype(np.float32), sr / hop
 
 
+def _vocal_active_mask_from_envelope(env, fps, max_active_island=0.20):
+    """silence分割と全frame視覚証明で共有するclean-vocal mask。"""
+    try:
+        env = np.asarray(env, dtype=float).reshape(-1)
+        fps = float(fps)
+        max_active_island = max(0.0, float(max_active_island))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if len(env) == 0 or not np.isfinite(fps) or fps <= 0.0:
+        return None
+    finite = np.where(np.isfinite(env), env, 0.0)
+    peak = float(np.max(finite)) if len(finite) else 0.0
+    if peak <= 1e-9:
+        return np.zeros(len(finite), dtype=bool)
+    threshold = max(0.06, peak * 0.12)
+    active = finite >= threshold
+    # 無声に挟まれた短いactive島はstem分離ノイズとして閉じる。
+    max_island_frames = int(np.ceil(max_active_island * fps))
+    if max_island_frames > 0:
+        i = 0
+        while i < len(active):
+            if not active[i]:
+                i += 1; continue
+            j = i + 1
+            while j < len(active) and active[j]:
+                j += 1
+            if i > 0 and j < len(active) and j - i <= max_island_frames:
+                active[i:j] = False
+            i = j
+    return active
+
+
+def _vocal_silence_ranges_from_envelope(env, fps, duration=None,
+                                         min_silence=0.02,
+                                         max_active_island=0.20,
+                                         guard=0.12):
+    """clean vocal stemの全無声区間を、安全側に抽出する。
+
+    分離ノイズによる短いactive島（既定0.20秒以下）は無声へ戻す。
+    1解析frameの無声から隠し、短い歌抜きでも原曲MVの口を表示しない。
+    境界はguard秒広げて子音端の漏れも防ぐ。
+    """
+    try:
+        env = np.asarray(env, dtype=float).reshape(-1)
+        fps = float(fps); min_silence = max(0.0, float(min_silence))
+        max_active_island = max(0.0, float(max_active_island))
+        guard = max(0.0, float(guard))
+        duration = (len(env) / fps if duration is None else float(duration))
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return []
+    if len(env) == 0 or not np.isfinite(fps) or fps <= 0.0:
+        return []
+    active = _vocal_active_mask_from_envelope(
+        env, fps, max_active_island=max_active_island)
+    if active is None:
+        return []
+    if not np.any(active):
+        return [(0.0, max(0.0, duration))] if duration > 0.0 else []
+
+    ranges = []
+    min_frames = max(1, int(np.ceil(min_silence * fps)))
+    i = 0
+    while i < len(active):
+        if active[i]:
+            i += 1; continue
+        j = i + 1
+        while j < len(active) and not active[j]:
+            j += 1
+        if j - i >= min_frames:
+            ranges.append((max(0.0, i / fps - guard),
+                           min(max(0.0, duration), j / fps + guard)))
+        i = j
+
+    merged = []
+    for start, end in ranges:
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1] + 1e-9:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _build_all_frame_visual_profile(mv_path):
+    """検出失敗をNoneで返す、旧方式用の全source frame profile。"""
+    try:
+        import mouth_sync
+        profile = mouth_sync.build_mouth_profile(
+            str(mv_path), fps=1000.0, use_cache=False)
+        if not isinstance(profile, dict):
+            return None
+        profile = dict(profile)
+        profile["_all_source_frames"] = True
+        return profile
+    except Exception:
+        return None
+
+
+def _strict_vocal_onset_envelope(voc, sr=SR):
+    try:
+        import librosa
+        y = np.asarray(voc, dtype=np.float32).reshape(-1)
+        if len(y) < int(sr):
+            return None, None
+        hop = 256
+        env = librosa.onset.onset_strength(y=y, sr=int(sr), hop_length=hop)
+        if len(env) < 4 or not np.all(np.isfinite(env)):
+            return None, None
+        peak = float(np.max(env))
+        if peak <= 1e-9:
+            return None, None
+        return (np.arange(len(env), dtype=float) * hop / float(sr),
+                np.asarray(env / peak, dtype=np.float32))
+    except Exception:
+        return None, None
+
+
+def _strict_onset_peak_count(times, env, lo, hi):
+    try:
+        times = np.asarray(times, dtype=float); env = np.asarray(env, dtype=float)
+        values = env[(times >= float(lo)) & (times < float(hi))]
+        if len(values) < 5 or not np.all(np.isfinite(values)):
+            return 0
+        threshold = max(0.08, float(np.percentile(values, 70)) * 0.65)
+        return int(np.sum((values[1:-1] >= values[:-2])
+                          & (values[1:-1] > values[2:])
+                          & (values[1:-1] >= threshold)))
+    except Exception:
+        return 0
+
+
+def _mapped_segment_has_visual_proof(profile, remix_start, duration, nframes,
+                                     source_start, source_duration,
+                                     vocal_active, vocal_fps,
+                                     output_start_frame=None,
+                                     onset_times=None, onset_envelope=None):
+    """旧方式の実際の各出力frameを、Proと同じ厳格基準で証明。"""
+    try:
+        nframes = int(nframes); duration = float(duration)
+        source_start = float(source_start); source_duration = float(source_duration)
+        vocal_fps = float(vocal_fps)
+        raw_active = np.asarray(vocal_active).reshape(-1)
+        if (np.issubdtype(raw_active.dtype, np.number)
+                and not np.all(np.isfinite(raw_active.astype(float)))):
+            return False
+        active = raw_active.astype(bool)
+        if (profile is None or nframes <= 0 or duration <= 0.0
+                or source_duration <= 0.0 or len(active) == 0
+                or not np.isfinite(vocal_fps) or vocal_fps <= 0.0):
+            return False
+        local = np.arange(nframes, dtype=float) / float(OUTPUT_FPS)
+        local = np.clip(local, 0.0, max(0.0, duration - 1e-9))
+        if output_start_frame is None:
+            output_start_frame = int(round(float(remix_start) * float(OUTPUT_FPS)))
+        remix_times = ((int(output_start_frame) + np.arange(nframes, dtype=float))
+                       / float(OUTPUT_FPS))
+        source_times = source_start + local * (source_duration / duration)
+        frame_span = 1.0 / float(OUTPUT_FPS)
+        frame_active = np.zeros(nframes, dtype=bool)
+        for j, t in enumerate(remix_times):
+            i0 = int(np.floor((float(t) + 1e-12) * vocal_fps))
+            i1 = int(np.ceil((float(t) + frame_span - 1e-12) * vocal_fps))
+            if i0 < 0 or i1 <= i0 or i1 > len(active):
+                return False
+            frame_active[j] = bool(np.all(active[i0:i1]))
+        import mouth_sync
+        verifier = getattr(
+            mouth_sync, "mapped_frames_have_verified_lipsync_visual", None)
+        if (not callable(verifier)
+                or not verifier(profile, source_times, frame_active)):
+            return False
+        if (_strict_onset_peak_count(
+                onset_times, onset_envelope, remix_times[0],
+                remix_times[-1] + frame_span) < 3):
+            return False
+        phase_measure = getattr(mouth_sync, "measure_micro_mouth_lag", None)
+        if not callable(phase_measure):
+            return False
+        lag, corr, fcov, prom = phase_measure(
+            profile, remix_times, source_times,
+            onset_times, onset_envelope, max_lag=0.60, step=0.02,
+            min_face=0.45)
+        return bool(
+            lag is not None and np.isfinite(lag) and abs(float(lag)) <= 0.12
+            and float(corr) >= 0.32 and float(fcov) >= 0.45
+            and float(prom) >= 2.0)
+    except Exception:
+        return False
+
+
+def clean_vocal_silence_ranges(audio_path, work_dir, duration,
+                               min_silence=0.02, verbose=False):
+    """Demucs clean vocalで無声区間を返す。証明不能ならNone。"""
+    try:
+        ready = ensure_demucs(verbose=verbose)
+        if not ready:
+            return None
+        vocals, method = separate_vocals(
+            audio_path, Path(work_dir), sr=SR, max_sec=duration,
+            verbose=verbose, demucs_ready=True)
+        if method != "demucs" or vocals is None or len(vocals) < SR:
+            return None
+        env, fps = _vocal_envelope(vocals, SR, fps=50)
+        return _vocal_silence_ranges_from_envelope(
+            env, fps, duration=duration, min_silence=min_silence)
+    except Exception:
+        return None
+
+
+def _split_segments_on_vocal_silence(segs, remix_to_orig, silence_ranges):
+    """歌唱対応segmentを持続無声境界で分割し、無声片を安全側へ送る。"""
+    out = []
+    ranges = list(silence_ranges or [])
+    for original in segs or []:
+        try:
+            s0 = float(original["r_start"]); e0 = float(original["r_end"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if e0 <= s0:
+            continue
+        cuts = {s0, e0}
+        for lo, hi in ranges:
+            if lo < e0 and hi > s0:
+                cuts.update((max(s0, float(lo)), min(e0, float(hi))))
+        cuts = sorted(cuts)
+        for a, b in zip(cuts, cuts[1:]):
+            if b <= a + 1e-9:
+                continue
+            mid = (a + b) * 0.5
+            silent = any(float(lo) <= mid < float(hi) for lo, hi in ranges)
+            piece = dict(original)
+            piece["r_start"] = a; piece["r_end"] = b
+            if silent:
+                piece.update(o_start=None, o_end=None, anchor_o=None,
+                             voiced_sec=0.0, conf=0.0)
+            elif original.get("o_start") is not None:
+                anchor = original.get("anchor_o")
+                if anchor is not None:
+                    new_anchor = float(anchor) + (a - s0)
+                    piece["anchor_o"] = new_anchor
+                    piece["o_start"] = new_anchor
+                    piece["o_end"] = new_anchor + (b - a)
+                else:
+                    piece["o_start"] = float(remix_to_orig(a))
+                    piece["o_end"] = float(remix_to_orig(b))
+                piece["voiced_sec"] = b - a
+            else:
+                # 声はあるが一致が弱い片。品質分母には残し、映像は安全側。
+                piece["voiced_sec"] = b - a
+            out.append(piece)
+    # 境界に残った短い人物SHOW島は、理想動画と同じく安全側へ吸収する。
+    for piece in out:
+        if (piece.get("o_start") is not None
+                and float(piece["r_end"] - piece["r_start"]) < 0.75):
+            piece.update(o_start=None, o_end=None, anchor_o=None)
+    return out
+
+
 def _tempo_ratio(remix_mix, orig_mix, sr=SR):
     """remix と原曲のテンポ比 (remix/orig) を推定。librosa無し/失敗時は1.0。"""
     try:
@@ -805,7 +1202,8 @@ def _build_vj_drop(mv_path, mv_dur, dur, out, tmp_dir, pool, state, cut=1.8):
     return out.exists() and out.stat().st_size > 0
 
 
-def _legacy_alignment_quality(segs, remix_method, orig_method):
+def _legacy_alignment_quality(segs, remix_method, orig_method,
+                              strict_fail_closed=False):
     """旧エンジンの採用品質を「全曲尺」ではなく歌唱区間基準で評価。"""
     n_lip = sum(1 for s in segs if s.get("o_start") is not None)
     lip_sec = sum(float(s["r_end"] - s["r_start"])
@@ -814,18 +1212,79 @@ def _legacy_alignment_quality(segs, remix_method, orig_method):
     voiced_coverage = lip_sec / max(voiced_sec, 1e-6)
     matched_conf = [float(s.get("conf", 0.0)) for s in segs if s.get("o_start") is not None]
     median_conf = float(np.median(matched_conf)) if matched_conf else 0.0
+    weakest_conf = float(np.min(matched_conf)) if matched_conf else 0.0
     clean_stems = (remix_method == "demucs" and orig_method == "demucs")
     min_coverage = 0.55 if clean_stems else 0.70
     min_conf = 0.48 if clean_stems else 0.56
+    max_end = max((float(s.get("r_end", 0.0)) for s in segs), default=0.0)
+    tail_start = max_end * 0.60
+    tail_voiced = 0.0; tail_matched = 0.0
+    for s in segs:
+        rs = float(s.get("r_start", 0.0)); re = float(s.get("r_end", rs))
+        dur = max(0.0, re - rs)
+        overlap = max(0.0, re - max(rs, tail_start))
+        if dur <= 0.0 or overlap <= 0.0:
+            continue
+        voiced_fraction = min(1.0, max(0.0, float(s.get("voiced_sec", 0.0)) / dur))
+        v = overlap * voiced_fraction
+        tail_voiced += v
+        if s.get("o_start") is not None:
+            tail_matched += v
+    tail_coverage = tail_matched / max(tail_voiced, 1e-6)
+    tail_ok = (tail_voiced < 1.0 or
+               (tail_matched >= 2.0 and tail_coverage >= 0.55))
     accepted = bool(voiced_sec > 0.0 and lip_sec >= 4.0
-                    and voiced_coverage >= min_coverage and median_conf >= min_conf)
+                    and voiced_coverage >= min_coverage and median_conf >= min_conf
+                    and tail_ok)
+    if strict_fail_closed:
+        # HPSS/raw近似や前半だけの成功を、Remix全編の成功と見なさない。
+        accepted = bool(accepted and clean_stems
+                        and voiced_coverage >= 0.68 and median_conf >= 0.55
+                        and weakest_conf >= 0.62
+                        and (tail_voiced < 1.0 or tail_coverage >= 0.60))
     return {"accepted": accepted, "n_lip": n_lip, "lip_sec": lip_sec,
             "voiced_sec": voiced_sec, "voiced_coverage": voiced_coverage,
-            "median_conf": median_conf, "clean_stems": clean_stems}
+            "median_conf": median_conf, "clean_stems": clean_stems,
+            "weakest_conf": weakest_conf,
+            "tail_voiced_sec": tail_voiced, "tail_matched_sec": tail_matched,
+            "tail_coverage": tail_coverage}
+
+
+def _call_filler_exact(filler_cb, duration, out, frame_count):
+    """新3引数callbackを優先し、旧2引数callbackとも互換を保つ。"""
+    if filler_cb is None:
+        return False
+    try:
+        import inspect
+        sig = inspect.signature(filler_cb)
+        params = list(sig.parameters.values())
+        accepts_three = (any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+                         or len([p for p in params
+                                 if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                               inspect.Parameter.POSITIONAL_OR_KEYWORD)]) >= 3)
+        if accepts_three:
+            filler_cb(duration, out, frame_count)
+        else:
+            filler_cb(duration, out)
+    except Exception:
+        return False
+    return bool(Path(out).exists() and Path(out).stat().st_size > 0)
+
+
+def _make_black_no_mouth(out, frame_count):
+    """callback失敗時も人物MVへ戻らず、正確な枚数の純黒にする。"""
+    frames = max(1, int(frame_count))
+    out = Path(out)
+    out.unlink(missing_ok=True)
+    r = _run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+              "color=c=black:s=1280x720:r=30", "-frames:v", str(frames),
+              *ENC_ARGS, "-an", str(out)])
+    return bool(r.returncode == 0 and _video_has_exact_frames(out, frames))
 
 
 def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_dur,
-                             filler_cb=None, verbose=True):
+                             filler_cb=None, verbose=True,
+                             strict_fail_closed=False):
     """
     Demucsでボーカルを分離し、原曲MVを remix にリップシンク同期した mp4 を作る。
     成功で True。素材不足/一致不足なら False（→従来法へフォールバック）。
@@ -838,12 +1297,16 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
     output_path = Path(output_path)
 
     mv_dur = _get_duration(mv_path)
-    if mv_dur < 3.0:
+    if not np.isfinite(mv_dur) or mv_dur < 3.0:
         if verbose:
             print("  ⚠️ MVが短すぎ → リップシンク不可")
         return False
 
     demucs_ready = ensure_demucs(verbose)
+    if strict_fail_closed and not demucs_ready:
+        if verbose:
+            print("  ⚠️ 厳格モードではHPSS近似を採用しません → 安全背景へ切替")
+        return False
     if not demucs_ready and verbose:
         print("  ℹ️ Demucs無しのためHPSS近似で続行します（精度は落ちます）")
 
@@ -866,21 +1329,62 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
 
     if verbose:
         print("  🔬 ボーカル包絡でリップシンク区間を解析中...")
-    segs, remix_to_orig = find_vocal_lipsync_segments(remix_voc, orig_voc, ratio=ratio, verbose=verbose)
+    # 厳格モードでは0.45程度の和音一致を人物表示へ通さない。
+    # 個々の6秒区間が0.62以上のときだけ歌唱MVとして採用し、弱い区間は
+    # o_start=Noneのまま安全フィラーへ送る。
+    segs, remix_to_orig = find_vocal_lipsync_segments(
+        remix_voc, orig_voc, ratio=ratio,
+        conf_th=(0.62 if strict_fail_closed else 0.45), verbose=verbose)
     if not segs:
         return False
 
-    q = _legacy_alignment_quality(segs, m1, m2)
+    strict_vocal_active = None
+    strict_vocal_fps = None
+    if strict_fail_closed:
+        env, env_fps = _vocal_envelope(remix_voc, SR, fps=50)
+        strict_vocal_active = _vocal_active_mask_from_envelope(
+            env, env_fps, max_active_island=0.20)
+        strict_vocal_fps = env_fps
+        silence_ranges = _vocal_silence_ranges_from_envelope(
+            env, env_fps, duration=music_dur, min_silence=0.02)
+        if silence_ranges:
+            segs = _split_segments_on_vocal_silence(
+                segs, remix_to_orig, silence_ranges)
+            if verbose:
+                hidden = sum(max(0.0, b - a) for a, b in silence_ranges)
+                print(f"     🛡️ 持続無声{len(silence_ranges)}区間・{hidden:.1f}秒を"
+                      "人物映像から分離")
+
+    q = _legacy_alignment_quality(
+        segs, m1, m2, strict_fail_closed=strict_fail_closed)
     if verbose:
         print(f"     リップシンク採用 {q['n_lip']}/{len(segs)} 区間（{q['lip_sec']:.0f}秒 / "
               f"歌唱{q['voiced_sec']:.0f}秒 = {q['voiced_coverage']*100:.0f}% / "
-              f"一致中央{q['median_conf']:.2f}）")
+              f"一致中央{q['median_conf']:.2f}・最低{q['weakest_conf']:.2f} / "
+              f"後半{q['tail_coverage']*100:.0f}%）")
 
     if not q["accepted"]:
         if verbose:
             method_note = "Demucs" if q["clean_stems"] else "HPSS/raw（厳格判定）"
             print(f"     ⚠️ ボーカル一致品質が不足（{method_note}） → この方式は採用しない")
         return False
+
+    # Pro不採用後の旧方式が、視覚検出失敗を人物表示の
+    # 許可としないよう同じ全frame profileを必須化する。Noneなら
+    # 以下の全matched片が安全背景になる。
+    strict_visual_profile = None
+    strict_onset_times = None
+    strict_onset_envelope = None
+    if strict_fail_closed:
+        if verbose:
+            print("  🛡️ 旧方式も口元を全source frameで安全確認中...")
+        strict_visual_profile = _build_all_frame_visual_profile(mv_path)
+        strict_onset_times, strict_onset_envelope = (
+            _strict_vocal_onset_envelope(remix_voc, SR))
+        if strict_visual_profile is None and verbose:
+            print("     ⚠️ 視覚証明不能 → 人物区間は全て安全背景")
+        if strict_onset_times is None and verbose:
+            print("     ⚠️ 発音onset証明不能 → 人物区間は全て安全背景")
 
     # --- 原曲MVの顔アップ時間帯を検出（歌唱シーン優先のため）---
     # FACE_PRIORITY_WINDOW=0 なら顔優先オフ（DTWの対応をそのまま信頼）
@@ -906,9 +1410,14 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
     seg_files = []
     seg_idx = 0
     seg_fail = 0
+    filler_fail = 0
+    visual_hidden = 0
+    # 各2秒片を個別に丸めると、setptsの倍率次第で60枚/61枚が混在し、
+    # 結合後の後半ほど映像が遅れる。全区間共通の時刻境界で枚数を割り当てる。
+    frame_clock = _CumulativeFrameClock(OUTPUT_FPS)
     for s in segs:
         total_dur = s["r_end"] - s["r_start"]
-        if total_dur < 0.3:
+        if total_dur <= 0.0:
             continue
 
         if s["o_start"] is not None:
@@ -916,16 +1425,29 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
             anchor = s.get("anchor_o")   # 後半の再アンカー区間のみ非None（前半=Noneで素のDTW）
             seg_r0 = s["r_start"]
             done = 0.0
-            while done < total_dur - 0.05:
+            while done < total_dur - 1e-9:
                 sub_dur = min(SUBSEG, total_dur - done)
+                target_frames = frame_clock.take(sub_dur)
+                if target_frames <= 0:
+                    done += sub_dur
+                    continue
+                output_start_frame = frame_clock.frame_boundary - target_frames
                 r0 = seg_r0 + done
                 if anchor is None:
-                    o_pos = remix_to_orig(r0)          # DTW対応位置（前半はここ＝doc12と同じ）
-                    o_end = remix_to_orig(r0 + sub_dur)
+                    raw_o_pos = remix_to_orig(r0)      # DTW対応位置
+                    raw_o_end = remix_to_orig(r0 + sub_dur)
                 else:
-                    o_pos = anchor + (r0 - seg_r0)      # 再アンカー位置から等速で進める（後半）
-                    o_end = o_pos + sub_dur
-                o_pos = max(0.0, o_pos)
+                    raw_o_pos = anchor + (r0 - seg_r0) # 再アンカー位置から等速
+                    raw_o_end = raw_o_pos + sub_dur
+                try:
+                    raw_o_pos = float(raw_o_pos); raw_o_end = float(raw_o_end)
+                    mapping_finite = bool(
+                        np.isfinite(raw_o_pos) and np.isfinite(raw_o_end))
+                except (TypeError, ValueError, OverflowError):
+                    raw_o_pos = raw_o_end = 0.0
+                    mapping_finite = False
+                o_pos = max(0.0, float(raw_o_pos)) if mapping_finite else 0.0
+                o_end = float(raw_o_end) if mapping_finite else 0.0
                 local_src = float(o_end - o_pos)
                 ratio_local = local_src / max(0.05, sub_dur)
                 use_rate = 0.8 <= ratio_local <= 1.25
@@ -935,6 +1457,33 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                 src_dur = min(src_dur, max(0.05, mv_dur - o_pos - 0.02))
                 out = tmp_dir / f"vlip_{seg_idx:03d}.mp4"
                 seg_idx += 1
+                out.unlink(missing_ok=True)
+                visually_proven = (mapping_finite and (
+                                    not strict_fail_closed
+                                    or (ALLOW_LEGACY_VISIBLE_FACES_IN_STRICT_MODE
+                                        and _mapped_segment_has_visual_proof(
+                                        strict_visual_profile, r0, sub_dur,
+                                        target_frames, o_pos, src_dur,
+                                        strict_vocal_active,
+                                        strict_vocal_fps,
+                                        output_start_frame=output_start_frame,
+                                        onset_times=strict_onset_times,
+                                        onset_envelope=strict_onset_envelope))))
+                if not visually_proven:
+                    visual_hidden += 1
+                    made = _call_filler_exact(
+                        filler_cb, sub_dur, out, target_frames)
+                    made = bool(made and _video_has_exact_frames(
+                        out, target_frames))
+                    if not made:
+                        out.unlink(missing_ok=True)
+                        made = _make_black_no_mouth(out, target_frames)
+                    if made and _video_has_exact_frames(out, target_frames):
+                        seg_files.append(out)
+                    else:
+                        filler_fail += 1
+                    done += sub_dur
+                    continue
                 if use_rate:
                     # DTWが示す局所的なMV進行量をそのままsub_durに収める。
                     # 従来は常に等速だったため、10%テンポ差なら4秒窓の
@@ -943,9 +1492,14 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                     vf = f"setpts={factor:.6f}*PTS,{VF_NORM}"
                 else:
                     vf = VF_NORM
+                # fpsフィルター任せの区間別丸めを禁止し、累積境界で決めた枚数に固定。
+                # tpadは入力末尾の丸めで1枚不足する場合だけ最終フレームを補う。
+                vf = _exact_frame_filter(vf, target_frames)
                 rr = _run(["ffmpeg", "-y", "-ss", f"{o_pos:.3f}", "-t", f"{src_dur:.3f}",
-                           "-i", str(mv_path), "-vf", vf, *ENC_ARGS, "-an", str(out)])
-                if out.exists() and out.stat().st_size > 0:
+                           "-i", str(mv_path), "-vf", vf, *ENC_ARGS, "-an",
+                           "-frames:v", str(target_frames), str(out)])
+                if (rr.returncode == 0
+                        and _video_has_exact_frames(out, target_frames)):
                     seg_files.append(out)
                 else:
                     seg_fail += 1
@@ -956,33 +1510,39 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                 done += sub_dur
         else:
             # ドロップ/VJ区間（歌詞なし）→ filler_cb（原曲MVループ等）。doc12はVJカット無し。
+            # 歌唱区間のフレーム境界を全体タイムライン上で維持するため進めておく。
+            target_frames = frame_clock.take(total_dur)
+            if target_frames <= 0:
+                continue
             out = tmp_dir / f"vlip_{seg_idx:03d}.mp4"
             seg_idx += 1
             dur = total_dur
-            made = False
-            if filler_cb is not None:
-                try:
-                    filler_cb(dur, out)
-                    made = out.exists() and out.stat().st_size > 0
-                except Exception:
-                    made = False
-            # フォールバック: 原曲MVの適当なシーンを単発切り出し
+            made = _call_filler_exact(filler_cb, dur, out, target_frames)
+            made = bool(made and _video_has_exact_frames(out, target_frames))
+            # 認証callbackが使えない場合も、未検証の原曲MVへは戻さない。
             if not made:
+                out.unlink(missing_ok=True)
                 out = tmp_dir / f"vlip_{seg_idx:03d}.mp4"
                 seg_idx += 1
-                import random
-                ss = random.uniform(0, max(0.0, mv_dur - dur - 0.5)) if mv_dur > dur + 1 else 0.0
-                _run(["ffmpeg", "-y", "-ss", f"{ss:.3f}", "-i", str(mv_path),
-                      "-t", f"{dur:.3f}", "-vf", VF_NORM, *ENC_ARGS, "-an", str(out)])
-            if out and out.exists() and out.stat().st_size > 0:
+                made = _make_black_no_mouth(out, target_frames)
+            if made and _video_has_exact_frames(out, target_frames):
                 seg_files.append(out)
+            else:
+                filler_fail += 1
+
+    if verbose and visual_hidden:
+        print(f"     🛡️ 全frame視覚証明の不合格 {visual_hidden}片を"
+              "安全背景へ退避")
 
     if not seg_files:
         if verbose:
             print(f"  ❌ リップシンク映像を1本も作れませんでした（切り出し失敗{seg_fail}件）")
         return False
-    if verbose and seg_fail:
-        print(f"     ℹ️ 切り出し失敗 {seg_fail}件（残り{len(seg_files)}本で続行）")
+    if seg_fail or filler_fail:
+        if verbose:
+            print(f"  ⚠️ 映像区間が欠落（歌唱{seg_fail}/安全背景{filler_fail}）。"
+                  "後半を前詰めせず全体を不採用")
+        return False
 
     # --- 結合（concat demuxerは相対パスをlistの場所基準で解決するので絶対パスで書く） ---
     listf = tmp_dir / "vlip_concat.txt"
@@ -990,22 +1550,13 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
         for s in seg_files:
             f.write(f"file '{Path(s).resolve()}'\n")
     combined = tmp_dir / "vlip_combined.mp4"
-    expected_video_dur = sum(_get_duration(s) for s in seg_files)
-    concat_tol = max(1.0, min(3.0, expected_video_dur * 0.01))
-    rr = _run(["ffmpeg", "-y", "-fflags", "+genpts",
-               "-f", "concat", "-safe", "0", "-i", str(listf),
-               "-c", "copy", str(combined)])
-    if not _valid_video(combined, expected_video_dur, concat_tol):
-        # ストリーム不一致等でcopy結合が失敗することがある → 再エンコードで結合し直す
-        if verbose:
-            print("     🔧 映像結合を互換モードで再試行します")
-            for ln in _tail(rr.stderr or rr.stdout, 6):
-                print("        ", ln)
-        combined.unlink(missing_ok=True)
-        rr = _run(["ffmpeg", "-y", "-fflags", "+genpts",
-                   "-f", "concat", "-safe", "0", "-i", str(listf),
-                   "-vf", VF_NORM, *ENC_ARGS, "-an", str(combined)])
-    if not _valid_video(combined, expected_video_dur, concat_tol):
+    expected_video_frames = frame_clock.frame_boundary
+    expected_video_dur = expected_video_frames / OUTPUT_FPS
+    concat_tol = (0.20 if strict_fail_closed else
+                  max(1.0, min(3.0, expected_video_dur * 0.01)))
+    concat_ok, rr = _concat_video_exact(
+        listf, combined, expected_video_frames)
+    if not concat_ok or not _valid_video(combined, expected_video_dur, concat_tol):
         if verbose:
             print("  ❌ リップシンク映像の結合に失敗（ffmpeg出力・末尾）:")
             for ln in _tail(rr.stderr or rr.stdout, 8):
@@ -1013,52 +1564,49 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
         return False
 
     # --- 長さ合わせ（音声より短ければ延長） ---
-    cdur = _get_duration(combined)
-    if cdur < music_dur - 0.1:
-        pad = music_dur - cdur + 0.5
+    current_frames = _decoded_video_frame_count(combined) or 0
+    target_music_frames = max(1, int(round(float(music_dur) * OUTPUT_FPS)))
+    if current_frames < target_music_frames:
+        pad_frames = target_music_frames - current_frames
+        pad = pad_frames / OUTPUT_FPS
         padf = tmp_dir / "vlip_pad.mp4"
-        made = False
-        if filler_cb is not None:
-            try:
-                filler_cb(pad, padf)
-                made = padf.exists() and padf.stat().st_size > 0
-            except Exception:
-                made = False
+        made = _call_filler_exact(filler_cb, pad, padf, pad_frames)
+        made = bool(made and _video_has_exact_frames(padf, pad_frames))
         if not made:
-            _run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(combined),
-                  "-t", f"{pad:.3f}", "-vf", VF_NORM, *ENC_ARGS, "-an", str(padf)])
-            made = padf.exists() and padf.stat().st_size > 0
+            padf.unlink(missing_ok=True)
+            made = _make_black_no_mouth(padf, pad_frames)
+        if strict_fail_closed and not made:
+            if verbose:
+                print("  ⚠️ 末尾の安全背景を生成できないため全体を不採用")
+            return False
         if made:
             l2 = tmp_dir / "vlip_ext.txt"
             with open(l2, "w") as f:
                 f.write(f"file '{Path(combined).resolve()}'\n"
                         f"file '{Path(padf).resolve()}'\n")
             ext = tmp_dir / "vlip_combined_ext.mp4"
-            ext_expected = _get_duration(combined) + _get_duration(padf)
-            ext_tol = max(1.0, min(3.0, ext_expected * 0.01))
-            er = _run(["ffmpeg", "-y", "-fflags", "+genpts",
-                       "-f", "concat", "-safe", "0", "-i", str(l2),
-                       "-c", "copy", str(ext)])
-            if not _valid_video(ext, ext_expected, ext_tol):
-                ext.unlink(missing_ok=True)
-                er = _run(["ffmpeg", "-y", "-fflags", "+genpts",
-                           "-f", "concat", "-safe", "0", "-i", str(l2),
-                           "-vf", VF_NORM, *ENC_ARGS, "-an", str(ext)])
-            if _valid_video(ext, ext_expected, ext_tol):
+            ext_expected_frames = current_frames + pad_frames
+            ext_expected = ext_expected_frames / OUTPUT_FPS
+            ext_tol = (0.20 if strict_fail_closed else
+                       max(1.0, min(3.0, ext_expected * 0.01)))
+            ext_ok, er = _concat_video_exact(
+                l2, ext, ext_expected_frames)
+            if ext_ok and _valid_video(ext, ext_expected, ext_tol):
                 combined = ext
-            elif verbose:
-                print("     ⚠️ 延長映像の結合に失敗。元の長さで続行します")
-                for ln in _tail(er.stderr or er.stdout, 5):
-                    print("        ", ln)
+            else:
+                if verbose:
+                    print("     ⚠️ 延長映像の結合に失敗。元の長さで続行します")
+                    for ln in _tail(er.stderr or er.stdout, 5):
+                        print("        ", ln)
+                if strict_fail_closed:
+                    return False
 
     # --- 音楽と合成 ---
     output_path = Path(output_path)
-    output_path.unlink(missing_ok=True)
-    rr = _run(["ffmpeg", "-y", "-i", str(combined), "-i", str(music_path),
-               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-               "-b:a", "320k", "-t", f"{music_dur:.3f}", "-movflags", "+faststart",
-               str(output_path)])
-    if (_valid_video(output_path, music_dur, tolerance=1.0)
+    mux_ok, rr = _mux_video_audio_exact(
+        combined, music_path, output_path, target_music_frames, music_dur)
+    final_tol = 0.20 if strict_fail_closed else 1.0
+    if (mux_ok and _valid_video(output_path, music_dur, tolerance=final_tol)
             and _has_av_streams(output_path)):
         if verbose:
             mb = output_path.stat().st_size / 1024 / 1024
