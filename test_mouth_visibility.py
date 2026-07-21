@@ -125,7 +125,10 @@ class ExtractorSafetyTests(unittest.TestCase):
         fake_mp = types.ModuleType("mediapipe")
         with mock.patch.dict(sys.modules, {"mediapipe": fake_mp}):
             with mock.patch.object(mouth_sync.sys, "platform", "darwin"):
-                with self.assertRaisesRegex(RuntimeError, "Tasks"):
+                # メッセージは原因(face_mesh未同梱)と復旧コマンドを示す形に変更。
+                # 「macOSでTasksを起動しない」保証自体は変わらない。
+                with self.assertRaisesRegex(
+                        RuntimeError, "face_mesh|mediapipe==0.10.21"):
                     mouth_sync._make_extractor()
 
 

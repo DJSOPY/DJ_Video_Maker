@@ -470,13 +470,25 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
                   || echo "   （WhisperXは入りませんでした → faster-whisperで単語アライメントします）"
             fi
         fi
-        if ! "$PYTHON_CMD" -c "import mediapipe, cv2" &>/dev/null; then
-            "$PYTHON_CMD" -m pip install --no-input mediapipe opencv-python \
-              || "$PYTHON_CMD" -m pip install --no-input mediapipe opencv-python \
-              || echo "   （口の動き解析ライブラリは入りませんでした → その機能はスキップして動きます）"
+        # ★mediapipeは 0.10.31以降のmacOS wheelから旧solutions API(face_mesh)が
+        #   削除された。DJ Video Makerの口元解析は face_mesh を使い、新Tasks APIは
+        #   macOSでMetal初期化に失敗してプロセスごと落ちる環境があるため使わない。
+        #   → 口元解析が動く最後のバージョン 0.10.21 に固定する(universal2＝Intel/Silicon両対応)。
+        #   solutionsが無い版が既に入っている場合は入れ直す。
+        if ! "$PYTHON_CMD" -c "import mediapipe.python.solutions.face_mesh, cv2" &>/dev/null; then
+            echo "   🔧 口元解析ライブラリ(mediapipe)を対応版に調整中..."
+            "$PYTHON_CMD" -m pip install --no-input --force-reinstall "mediapipe==0.10.21" opencv-python \
+              || "$PYTHON_CMD" -m pip install --no-input "mediapipe==0.10.21" opencv-python \
+              || echo "   （口の動き解析ライブラリは入りませんでした → 人物カットは安全のため非表示になります）"
+        fi
+        if ! "$PYTHON_CMD" -c "import mediapipe.python.solutions.face_mesh" &>/dev/null; then
+            echo "   ⚠️ 口元解析(mediapipe face_mesh)が使えません。"
+            echo "      → 人物が映るカットは安全のため背景に置き換わります。"
+            echo "      復旧するには次を実行してください:"
+            echo "      $PYTHON_CMD -m pip install --force-reinstall \"mediapipe==0.10.21\""
         fi
     else
-        "$PYTHON_CMD" -c "import mediapipe, cv2" 2>/dev/null || "$PYTHON_CMD" -m pip install --no-input mediapipe opencv-python 2>/dev/null || true
+        "$PYTHON_CMD" -c "import mediapipe.python.solutions.face_mesh, cv2" 2>/dev/null || "$PYTHON_CMD" -m pip install --no-input --force-reinstall "mediapipe==0.10.21" opencv-python 2>/dev/null || true
         "$PYTHON_CMD" -c "import demucs" 2>/dev/null || "$PYTHON_CMD" -m pip install --no-input demucs 2>/dev/null || true
         "$PYTHON_CMD" -c "import faster_whisper" 2>/dev/null || "$PYTHON_CMD" -m pip install --no-input faster-whisper 2>/dev/null || true
     fi

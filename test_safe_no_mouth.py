@@ -67,6 +67,22 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertIn('if "_pro_context" in Path(out_path).name:', pro_src)
         self.assertIn("Pro区間クリップ生成", pro_src)
 
+    def test_same_source_finishes_with_waveform_only(self):
+        # 「波形で合うものは波形だけで終わらせる」:
+        # 同一音源(波形厳密一致)では clean vocal マスクも安全境界拡張も掛けない。
+        # 音の同一性そのものが口元の証明であり、息継ぎやインスト部で
+        # 人物が消える問題の根治。別マスター推定時は従来どおり厳格検証。
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("_strict_remix_show = not same_source", src)
+        self.assertIn("波形で同一音源と確定 → 波形プランだけで完成させます", src)
+        # 同一音源では Demucs 検証を走らせない(vocal_silence_ranges は None のまま)
+        i_flag = src.index("if same_source:\n        # 同一音源は波形だけで完結")
+        i_call = src.index("vocal_sync.clean_vocal_silence_ranges", i_flag)
+        i_else = src.index("    else:", i_flag)
+        self.assertLess(i_else, i_call)
+        # その結果、局所Proにも回らない(is_rmx_for_hybrid が False になる)
+        self.assertIn("is_rmx_for_hybrid = (vocal_silence_ranges is not None)", src)
+
     def test_identity_plan_masks_only_sustained_vocal_silence(self):
         # 回帰: min_silence=0.02 は息継ぎ(0.2〜0.5秒)を全部隠して波形プランを
         # 細断し、同一音源のEditまでリップシンク/フィラー行きにしていた。
@@ -75,7 +91,8 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertNotIn("min_silence=0.02", src)
         self.assertIn("_mask_min_silence = 1.6 if same_source else 0.8", src)
         # Demucs不可の環境でも、同一音源なら波形プランを潰さない(音の同一性が証明)
-        self.assertIn("clean vocal確認は省略（波形厳密一致＝同一音源のため", src)
+        # 同一音源は Demucs 検証自体を省略して波形だけで完結させる
+        self.assertIn("波形で同一音源と確定 → 波形プランだけで完成させます", src)
 
 
     def test_clean_vocal_silence_masks_even_a_mapped_waveform_interval(self):

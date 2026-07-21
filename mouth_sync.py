@@ -217,9 +217,18 @@ def _make_extractor():
     # Pythonのtry/exceptでは捕捉不能でDJ Maker全体を落とすため、legacy solutions
     # が無いmacOSではTasksを起動せず、呼び出し側をUNCERTAIN→安全背景へ倒す。
     if sys.platform == "darwin":
+        # mediapipe 0.10.31以降のmacOS wheelは旧solutions(face_mesh)を同梱しない。
+        # このバージョンだと口元解析が一切できず、fail-closedにより人物カットが
+        # すべて安全背景へ退避してしまう。原因と復旧手順をそのまま表示する。
+        try:
+            import mediapipe as _mp
+            _ver = getattr(_mp, "__version__", "不明")
+        except Exception:
+            _ver = "不明"
         raise RuntimeError(
-            "macOSでは不安定なMediaPipe Tasks顔解析を無効化しました"
-            "（legacy solutions未搭載）")
+            f"mediapipe {_ver} は口元解析(face_mesh)を同梱していません"
+            "／このままだと人物カットは安全背景に置き換わります"
+            "／復旧: python -m pip install --force-reinstall \"mediapipe==0.10.21\"")
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision
     if not os.path.exists(_TASK_PATH):

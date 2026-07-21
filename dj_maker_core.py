@@ -2659,7 +2659,6 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # 名前だけでRemixを識別すると「Club Mix」「Version」等が漏れる。
     # 口を見せる全経路を同じ厳格基準に固定し、確証のある波形一致島だけSHOW。
     # 孤立した弱窓は推測補間せず、残りはPro/安全映像へ送る。
-    _strict_remix_show = True
     _wf_match_th = 0.72
     seg_plan, _confs, score = waveform_track_plan(
         music_audio, video_audio, 11025, music_dur, vid_dur,
@@ -2685,6 +2684,12 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # ただし、これは弱区間まで「同一音源」とみなす許可ではない。
     # Remixの後半にある連続弱区間は、下の局所Pro経路で別々に再解析する。
     same_source = (p80 >= 0.78) or (strong_frac >= 0.30)
+    # 波形が「同一音源」と断じた場合は、その一致区間のMVはまさにこの音を
+    # 鳴らしている本人の映像＝音の同一性そのものが口元の証明になる。
+    # よって同一音源は波形だけで完結させ、clean vocal無声マスクも安全境界拡張も
+    # 適用しない（息継ぎやインスト部で人物が消える問題の根治）。
+    # 別マスター推定（クロマ/音内容アライン）でのみ厳格な追加検証を課す。
+    _strict_remix_show = not same_source
     _content_align_used = False   # 音内容アライン採用時のみ末尾ズレ補正を効かせる
     if not same_source:
         # 生波形が合わない＝別マスターの可能性。だが同じ曲ならクロマ(メロディ)は合う。
@@ -2738,20 +2743,20 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     #   クロマ/音内容アライン配置(別マスター推定)は根拠が弱いぶん短め(≥0.8秒)で検出。
     _mask_min_silence = 1.6 if same_source else 0.8
     vocal_silence_ranges = None
-    try:
-        import vocal_sync
-        vocal_silence_ranges = vocal_sync.clean_vocal_silence_ranges(
-            music_path, tmp_dir / "core_vocal_safety", music_dur,
-            min_silence=_mask_min_silence, verbose=False)
-    except Exception:
-        vocal_silence_ranges = None
+    if same_source:
+        # 同一音源は波形だけで完結。Demucs検証も走らせない（時間短縮にもなる）。
+        print("  ✅ 波形で同一音源と確定 → 波形プランだけで完成させます"
+              "（一致区間のMVはこの音そのものの映像）")
+    else:
+        try:
+            import vocal_sync
+            vocal_silence_ranges = vocal_sync.clean_vocal_silence_ranges(
+                music_path, tmp_dir / "core_vocal_safety", music_dur,
+                min_silence=_mask_min_silence, verbose=False)
+        except Exception:
+            vocal_silence_ranges = None
 
-    if vocal_silence_ranges is None:
-        if same_source:
-            # 波形厳密一致＝同一音源。音の同一性が口元の証明なので、
-            # Demucsが使えない環境でも波形プランをそのまま生かす（元祖挙動）。
-            print("  ℹ️ clean vocal確認は省略（波形厳密一致＝同一音源のため、一致区間は音の同一性で証明済み）")
-        else:
+        if vocal_silence_ranges is None:
             print("  ⚠️ clean vocalの無声確認ができません → 波形一致だけでは人物を表示しません")
             if not remix_lipsync_attempted:
                 remix_lipsync_attempted = True
@@ -2759,10 +2764,10 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                         music_path, video_path, output_path, tmp_dir, music_dur):
                     return
             seg_plan = [(0.0, music_dur, None)]
-    elif vocal_silence_ranges:
-        hidden_vocal = sum(max(0.0, b - a) for a, b in vocal_silence_ranges)
-        print(f"  🛡️ clean vocal無声: {len(vocal_silence_ranges)}区間 / "
-              f"{hidden_vocal:.1f}秒を口元非表示")
+        elif vocal_silence_ranges:
+            hidden_vocal = sum(max(0.0, b - a) for a, b in vocal_silence_ranges)
+            print(f"  🛡️ clean vocal無声: {len(vocal_silence_ranges)}区間 / "
+                  f"{hidden_vocal:.1f}秒を口元非表示")
 
     if _strict_remix_show:
         strict_plan = _expand_unsafe_plan_ranges(
