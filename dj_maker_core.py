@@ -1668,8 +1668,21 @@ def make_abstract_no_mouth_segment(duration, out_path, frame_count=None):
     except (TypeError, ValueError, OverflowError):
         frames = _safe_video_frame_count(duration)
     out_path.unlink(missing_ok=True)
+    # 真っ黒だと“壊れた動画”に見えるため、ゆっくり動く抽象グラデーションを既定に。
+    # 人物・顔・口に見える図形は生成しない(安全性の意味は従来と同じ)。
+    grad = ("gradients=s=1280x720:n=3:c0=0x0b1e4a:c1=0x3a0ca3:c2=0x7209b7"
+            ":speed=0.04:r=30")
+    cmd = [
+        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", grad,
+        "-vf", "hue=H=0.12*t,vignette=PI/6,noise=alls=3:allf=t,format=yuv420p",
+        "-frames:v", str(frames), *ENC_ARGS, "-an", str(out_path),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if r.returncode == 0 and _video_has_exact_frames(out_path, frames):
+        return True
+    out_path.unlink(missing_ok=True)
     base = "color=c=0x05070d:s=1280x720:r=30"
-    # 微細な粒子とビネットだけの非人物映像。顔や口に見える図形は生成しない。
+    # gradients非対応ffmpeg向け: 微細な粒子とビネットだけの非人物映像。
     cmd = [
         "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", base,
         "-vf", "noise=alls=4:allf=t,vignette=PI/5,format=yuv420p",
@@ -2717,24 +2730,35 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             return
 
     # フルミックスNCCだけでは、伴奏が同じまま歌だけ抜けるEditを見抜けない。
-    # Demucsのclean vocalで持続無声を確認し、その範囲は波形一致が高くても隠す。
+    # Demucsのclean vocalで“持続的な”無声を確認し、その範囲は波形一致が高くても隠す。
+    # ★同一音源(波形厳密一致)のプランでは、一致区間のMVはまさにこの音を歌っている
+    #   本人の映像＝口元は音の同一性で証明済み。息継ぎやフレーズ間の短い間(0.2〜0.5秒)
+    #   まで隠すと計画が細断されて波形プランが死ぬ(実測: 156秒中125秒が非表示化)。
+    #   → 「歌を丸ごと抜いた区間」だけを対象に持続無声(≥1.6秒)のみ検出する。
+    #   クロマ/音内容アライン配置(別マスター推定)は根拠が弱いぶん短め(≥0.8秒)で検出。
+    _mask_min_silence = 1.6 if same_source else 0.8
     vocal_silence_ranges = None
     try:
         import vocal_sync
         vocal_silence_ranges = vocal_sync.clean_vocal_silence_ranges(
             music_path, tmp_dir / "core_vocal_safety", music_dur,
-            min_silence=0.02, verbose=False)
+            min_silence=_mask_min_silence, verbose=False)
     except Exception:
         vocal_silence_ranges = None
 
     if vocal_silence_ranges is None:
-        print("  ⚠️ clean vocalの無声確認ができません → 波形一致だけでは人物を表示しません")
-        if not remix_lipsync_attempted:
-            remix_lipsync_attempted = True
-            if _try_vocal_lipsync(
-                    music_path, video_path, output_path, tmp_dir, music_dur):
-                return
-        seg_plan = [(0.0, music_dur, None)]
+        if same_source:
+            # 波形厳密一致＝同一音源。音の同一性が口元の証明なので、
+            # Demucsが使えない環境でも波形プランをそのまま生かす（元祖挙動）。
+            print("  ℹ️ clean vocal確認は省略（波形厳密一致＝同一音源のため、一致区間は音の同一性で証明済み）")
+        else:
+            print("  ⚠️ clean vocalの無声確認ができません → 波形一致だけでは人物を表示しません")
+            if not remix_lipsync_attempted:
+                remix_lipsync_attempted = True
+                if _try_vocal_lipsync(
+                        music_path, video_path, output_path, tmp_dir, music_dur):
+                    return
+            seg_plan = [(0.0, music_dur, None)]
     elif vocal_silence_ranges:
         hidden_vocal = sum(max(0.0, b - a) for a, b in vocal_silence_ranges)
         print(f"  🛡️ clean vocal無声: {len(vocal_silence_ranges)}区間 / "

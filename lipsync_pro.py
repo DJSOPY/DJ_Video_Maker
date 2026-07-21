@@ -2823,18 +2823,47 @@ def _safe_visual_plan(requires_safe_visual, certified_mv_time=None):
     return "safe_background", None
 
 
+_SAFE_BG_PALETTE = "c0=0x0b1e4a:c1=0x3a0ca3:c2=0x7209b7"   # 深青→紫→マゼンタ(クラブ調)
+_safe_bg_gradient_ok = None
+
+
+def _gradient_background_supported():
+    """このffmpegで gradients ソースが使えるか(初回だけ実測して以後キャッシュ)。"""
+    global _safe_bg_gradient_ok
+    if _safe_bg_gradient_ok is None:
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                 f"gradients=s=64x36:n=3:{_SAFE_BG_PALETTE}:r=30",
+                 "-frames:v", "1", "-f", "null", "-"],
+                capture_output=True, text=True, errors="replace", timeout=20)
+            _safe_bg_gradient_ok = (r.returncode == 0)
+        except Exception:
+            _safe_bg_gradient_ok = False
+    return _safe_bg_gradient_ok
+
+
 def _safe_background_ffmpeg_command(output_path, nframes, width=OUT_W,
                                     height=OUT_H, fps=FPS):
-    """口元が存在しない黒背景を指定フレーム数ぴったり作る。"""
+    """口元が存在しない安全背景を指定フレーム数ぴったり作る。
+    真っ黒だと“壊れた動画”に見えるため、ゆっくり動く抽象グラデーション
+    (人物・顔・口に見える図形なし)を既定にする。gradients非対応のffmpegでは
+    従来の黒に自動退避する(枚数保証はどちらも同じ)。"""
     nframes = int(nframes); width = int(width); height = int(height); fps = float(fps)
     if nframes <= 0:
         raise ValueError("nframes must be positive")
     if width <= 0 or height <= 0 or not np.isfinite(fps) or fps <= 0.0:
         raise ValueError("invalid background video geometry")
+    if _gradient_background_supported():
+        src = (f"gradients=s={width}x{height}:n=3:{_SAFE_BG_PALETTE}"
+               f":speed=0.04:r={fps:g}")
+        vf = "hue=H=0.12*t,vignette=PI/6,noise=alls=3:allf=t,format=yuv420p,setsar=1"
+    else:
+        src = f"color=c=black:s={width}x{height}:r={fps:g}"
+        vf = "format=yuv420p,setsar=1"
     return [
-        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
-        f"color=c=black:s={width}x{height}:r={fps:g}", "-an",
-        "-vf", "format=yuv420p,setsar=1", "-c:v", "libx264",
+        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", src, "-an",
+        "-vf", vf, "-c:v", "libx264",
         "-preset", "veryfast", "-crf", "20", "-frames:v", str(nframes),
         str(output_path),
     ]
@@ -3400,7 +3429,13 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
             vocal_sr=SR)
         if ok and _validate_rendered_output(render_out, music_dur):
             if _publish_rendered_output(render_out, final_out, music_dur):
-                print(f"✅ 完成: {out_path}")
+                if "_pro_context" in Path(out_path).name:
+                    # ハイブリッド局所Proの作業用クリップ。Web UIはログの
+                    # 「✅ 完成: *.mp4」を完成品としてダウンロード一覧に載せるため、
+                    # 中間ファイルはその書式で印字しない（一覧混入バグの修正）。
+                    print(f"     ✔ Pro区間クリップ生成: {Path(out_path).name}")
+                else:
+                    print(f"✅ 完成: {out_path}")
                 return True
             print("     ⚠️ 検証済み出力の安全な公開に失敗")
             final_out.unlink(missing_ok=True)

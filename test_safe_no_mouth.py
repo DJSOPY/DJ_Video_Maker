@@ -2,6 +2,7 @@
 """Remixのfail-closed口元非表示経路の回帰テスト。"""
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -57,6 +58,24 @@ class UnsafePlanTests(unittest.TestCase):
         # 既定は波形同期ファースト（元祖版の順序）。Trueにすると発音証明
         # ファーストの最厳格モードへ切り替わる（分岐自体は保持されている）。
         self.assertFalse(CORE["REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES"])
+
+    def test_hybrid_context_clip_is_not_advertised_as_final_output(self):
+        # 回帰: Web UIはログの「✅ 完成: *.mp4」をダウンロード一覧に載せる。
+        # ハイブリッド局所Proの作業用クリップ(_pro_context)がその書式で
+        # 印字されると中間ファイルが一覧に混入する。
+        pro_src = CORE_PATH.with_name("lipsync_pro.py").read_text(encoding="utf-8")
+        self.assertIn('if "_pro_context" in Path(out_path).name:', pro_src)
+        self.assertIn("Pro区間クリップ生成", pro_src)
+
+    def test_identity_plan_masks_only_sustained_vocal_silence(self):
+        # 回帰: min_silence=0.02 は息継ぎ(0.2〜0.5秒)を全部隠して波形プランを
+        # 細断し、同一音源のEditまでリップシンク/フィラー行きにしていた。
+        # 同一音源(same_source)は持続無声(≥1.6秒)のみ、推定配置は≥0.8秒のみ検出する。
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("min_silence=0.02", src)
+        self.assertIn("_mask_min_silence = 1.6 if same_source else 0.8", src)
+        # Demucs不可の環境でも、同一音源なら波形プランを潰さない(音の同一性が証明)
+        self.assertIn("clean vocal確認は省略（波形厳密一致＝同一音源のため", src)
 
 
     def test_clean_vocal_silence_masks_even_a_mapped_waveform_interval(self):
@@ -173,6 +192,20 @@ class SafeBackgroundIntegrationTests(unittest.TestCase):
                  "-show_entries", "stream=index", "-of", "csv=p=0", str(out)],
                 check=True, capture_output=True, text=True).stdout.strip()
             self.assertEqual(audio, "")
+            # 回帰: 真っ黒(YAVG=16)の“壊れて見える”背景に戻らないこと。
+            # gradients対応ffmpegなら十分な明るさが出る(非対応環境は黒退避を許容)。
+            stats = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", str(out), "-frames:v", "1",
+                 "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+                 "-f", "null", "-"], capture_output=True, text=True).stdout
+            m = re.search(r"YAVG=([0-9.]+)", stats)
+            probe = subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                 "gradients=s=64x36:r=30", "-frames:v", "1", "-f", "null", "-"],
+                capture_output=True, text=True)
+            if m and probe.returncode == 0:
+                self.assertGreater(float(m.group(1)), 25.0,
+                                   "安全背景が真っ黒に退行")
 
     def test_missing_or_uncertified_source_falls_back_to_background(self):
         with tempfile.TemporaryDirectory() as td:

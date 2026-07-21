@@ -220,7 +220,12 @@ class SafeBackgroundCommandTests(unittest.TestCase):
         command = lipsync_pro._safe_background_ffmpeg_command(
             "/tmp/safe.mp4", 60, width=1280, height=720, fps=30)
 
-        self.assertIn("color=c=black:s=1280x720:r=30", command)
+        lavfi_src = command[command.index("-i") + 1]
+        # 既定は動く抽象グラデーション(gradients)、非対応ffmpegでは黒。
+        # どちらでも「人物素材を読まない合成ソース」「正しい形状/レート」であること。
+        self.assertTrue(lavfi_src.startswith(("gradients=", "color=")), lavfi_src)
+        self.assertIn("s=1280x720", lavfi_src)
+        self.assertIn("r=30", lavfi_src)
         self.assertEqual(command[command.index("-frames:v") + 1], "60")
         self.assertNotIn("movie=", " ".join(command))
         self.assertNotIn("-shortest", command)
