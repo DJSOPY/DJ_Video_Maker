@@ -477,9 +477,13 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
         #   solutionsが無い版が既に入っている場合は入れ直す。
         if ! "$PYTHON_CMD" -c "import mediapipe.python.solutions.face_mesh, cv2" &>/dev/null; then
             echo "   🔧 口元解析ライブラリ(mediapipe)を対応版に調整中..."
-            "$PYTHON_CMD" -m pip install --no-input --force-reinstall "mediapipe==0.10.21" opencv-python \
-              || "$PYTHON_CMD" -m pip install --no-input "mediapipe==0.10.21" opencv-python \
-              || echo "   （口の動き解析ライブラリは入りませんでした → 人物カットは安全のため非表示になります）"
+            # mediapipeは jax / jaxlib を必須依存に書いているが、口元解析
+            # (legacy solutions face_mesh)はjaxを一切importしない（実測確認済み）。
+            # jaxlibにはIntel Mac(x86_64)版wheelが無く、依存解決が延々と過去へ遡って
+            # 失敗/長時間化するため、--no-deps で入れて必要な物だけ自分で足す。
+            # これでIntel/Apple Siliconのどちらでも同じ手順で確実に入る。
+            "$PYTHON_CMD" -m pip install --no-input --force-reinstall --no-deps "mediapipe==0.10.21" 2>>/tmp/djvm_pip.log
+            "$PYTHON_CMD" -m pip install --no-input "numpy<2" "protobuf<5,>=4.25.3" absl-py attrs flatbuffers sounddevice sentencepiece matplotlib opencv-python opencv-contrib-python 2>>/tmp/djvm_pip.log || echo "   （口の動き解析ライブラリは入りませんでした → 人物カットは安全のため背景に置き換わります）"
         fi
         if ! "$PYTHON_CMD" -c "import mediapipe.python.solutions.face_mesh" &>/dev/null; then
             echo "   ⚠️ 口元解析(mediapipe face_mesh)が使えません。"
@@ -488,7 +492,7 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
             echo "      $PYTHON_CMD -m pip install --force-reinstall \"mediapipe==0.10.21\""
         fi
     else
-        "$PYTHON_CMD" -c "import mediapipe.python.solutions.face_mesh, cv2" 2>/dev/null || "$PYTHON_CMD" -m pip install --no-input --force-reinstall "mediapipe==0.10.21" opencv-python 2>/dev/null || true
+        "$PYTHON_CMD" -c "import mediapipe.python.solutions.face_mesh, cv2" 2>/dev/null || { "$PYTHON_CMD" -m pip install --no-input --force-reinstall --no-deps "mediapipe==0.10.21" 2>/dev/null; "$PYTHON_CMD" -m pip install --no-input "numpy<2" "protobuf<5,>=4.25.3" absl-py attrs flatbuffers sounddevice sentencepiece matplotlib opencv-python opencv-contrib-python 2>/dev/null; } || true
         "$PYTHON_CMD" -c "import demucs" 2>/dev/null || "$PYTHON_CMD" -m pip install --no-input demucs 2>/dev/null || true
         "$PYTHON_CMD" -c "import faster_whisper" 2>/dev/null || "$PYTHON_CMD" -m pip install --no-input faster-whisper 2>/dev/null || true
     fi

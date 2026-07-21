@@ -2659,11 +2659,17 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # 名前だけでRemixを識別すると「Club Mix」「Version」等が漏れる。
     # 口を見せる全経路を同じ厳格基準に固定し、確証のある波形一致島だけSHOW。
     # 孤立した弱窓は推測補間せず、残りはPro/安全映像へ送る。
-    _wf_match_th = 0.72
+    # 元祖版と同じ検出設定に戻す。fail-closed版は「未証明の口を絶対出さない」ために
+    #   ・しきい値を 0.60→0.72 に上げ
+    #   ・孤立1窓の補間を止めて
+    # 一致区間を意図的に削っていた（実測 94%→84%／7区間→16区間にフィラー断片が発生）。
+    # 波形が同一音源を指す限り、その1窓(2秒)も同じテイクの続きなので、
+    # 元祖の 0.60＋孤立窓補間でつなぎ、フィラー断片化を防ぐ。
+    _wf_match_th = 0.60
     seg_plan, _confs, score = waveform_track_plan(
         music_audio, video_audio, 11025, music_dur, vid_dur,
         win=4.0, hop=2.0, match_th=_wf_match_th,
-        interpolate_single_gap=False)
+        interpolate_single_gap=True)
     p80 = score["p80"]; strong_frac = score["strong_frac"]; match_ratio = score["match_ratio"]
     print(f"  📊 波形一致: 強一致率{strong_frac*100:.0f}% / p80={p80:.2f} / 一致区間{match_ratio*100:.0f}%")
     print(f"     （短いEdit/Hook/Introは“合う所が強ければ”同一音源。MV外の区間はフィラーに回します）")

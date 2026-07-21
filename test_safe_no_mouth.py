@@ -67,6 +67,16 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertIn('if "_pro_context" in Path(out_path).name:', pro_src)
         self.assertIn("Pro区間クリップ生成", pro_src)
 
+    def test_waveform_detection_uses_original_settings(self):
+        # 回帰: fail-closed版は match_th 0.72 + 孤立窓補間OFF で一致区間を
+        # 意図的に削っていた(実測 94%→84% / 7区間→16区間にフィラー断片)。
+        # 同一音源なら孤立1窓も同じテイクの続きなので、元祖の 0.60 + 補間ONに戻す。
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("_wf_match_th = 0.60", src)
+        self.assertNotIn("_wf_match_th = 0.72", src)
+        self.assertIn("interpolate_single_gap=True)", src)
+        self.assertNotIn("interpolate_single_gap=False", src)
+
     def test_same_source_finishes_with_waveform_only(self):
         # 「波形で合うものは波形だけで終わらせる」:
         # 同一音源(波形厳密一致)では clean vocal マスクも安全境界拡張も掛けない。
