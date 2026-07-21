@@ -53,8 +53,11 @@ class UnsafePlanTests(unittest.TestCase):
     def test_absolute_mode_disables_real_source_broll(self):
         self.assertFalse(CORE["_ALLOW_REAL_SOURCE_SAFE_BROLL"])
 
-    def test_visible_faces_require_clean_vocal_timing_proof(self):
-        self.assertTrue(CORE["REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES"])
+    def test_waveform_first_is_default_and_strict_mode_is_available(self):
+        # 既定は波形同期ファースト（元祖版の順序）。Trueにすると発音証明
+        # ファーストの最厳格モードへ切り替わる（分岐自体は保持されている）。
+        self.assertFalse(CORE["REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES"])
+
 
     def test_clean_vocal_silence_masks_even_a_mapped_waveform_interval(self):
         got = CORE["_expand_unsafe_plan_ranges"](
@@ -96,6 +99,56 @@ class UnsafePlanTests(unittest.TestCase):
         assigned = [count(a, b) for a, b in ranges]
         self.assertEqual(assigned, [0, 1, 1])
         self.assertEqual(sum(assigned), count(0.0, 0.05))
+
+
+class WaveformFirstOrderTests(unittest.TestCase):
+    """元祖版の絶対順序『①波形合わせ → ②微調整 → ③無理ならリップシンク』を固定する。
+
+    この順序・構成要素がリファクタで崩れたらここで落ちる。
+    ソース構造のテストなので文言マーカーに依存する（意図的）。
+    """
+
+    SRC = CORE_PATH.read_text(encoding="utf-8")
+
+    def _idx(self, marker):
+        self.assertIn(marker, self.SRC, f"マーカー消失: {marker}")
+        return self.SRC.index(marker)
+
+    def test_stage1_waveform_alignment_comes_first(self):
+        # 証明ファースト分岐は存在してよいが、既定Falseで波形節が先頭で実行される
+        i_flag = self._idx("if REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES:")
+        i_wf = self._idx("波形ファースト：edit / Remix / 原曲すべて、まず波形でMVに合わせる")
+        i_plan = self._idx("waveform_track_plan(\n        music_audio, video_audio")
+        self.assertLess(i_flag, i_wf)
+        self.assertLess(i_wf, i_plan)
+
+    def test_stage2_fine_adjustments_are_inside_waveform_path(self):
+        # 微調整: テンポ補正MV・波形オフセット精密化・末尾ズレの内部伸縮
+        i_wf = self._idx("波形ファースト：edit / Remix / 原曲すべて、まず波形でMVに合わせる")
+        i_tempo_adj = self._idx("make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)")
+        i_stretch = self._idx("内部で×{r:.3f} 伸縮して補正")
+        self.assertLess(i_wf, i_tempo_adj)
+        self.assertLess(i_wf, i_stretch)
+        self.assertIn("refine_offset_waveform(video_audio, music_audio", self.SRC)
+
+    def test_stage3_lipsync_is_fallback_only(self):
+        # リップシンクへ行くのは『波形が揃わない』時だけ:
+        #   テンポ不揃い(lock不足) / クロマ・音内容アラインでも合わない時
+        i_plan = self._idx("waveform_track_plan(\n        music_audio, video_audio")
+        i_tempo_fb = self._idx("どのテンポでも波形が一直線に揃わない（別アレンジ）→ リップシンクに切替")
+        i_chroma = self._idx("→ クロマ（メロディ）で合わせ直します")
+        i_chroma_fb = self._idx("クロマでも合わない（{cconf:.2f}）→ リップシンクに切替")
+        self.assertLess(i_chroma, i_chroma_fb)
+        # クロマ経路（一致率表示つき）が波形プランの後段にあること
+        self.assertLess(i_plan, i_chroma)
+        self.assertIn("クロマで一致（スコア{cconf:.2f} / 一致率{cmatch*100:.0f}% / 一意性{cuniq:.2f}）",
+                      self.SRC)
+        # 波形ファースト節より前に無条件のリップシンク実行が無いこと
+        #（証明ファースト分岐の内側は except: フラグFalseで到達しない）
+        head = self.SRC[:self._idx("波形ファースト：edit / Remix / 原曲すべて、まず波形でMVに合わせる")]
+        flag_branch_start = head.index("if REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES:")
+        before_flag = head[:flag_branch_start]
+        self.assertNotIn("_try_vocal_lipsync(\n                music_path", before_flag)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),

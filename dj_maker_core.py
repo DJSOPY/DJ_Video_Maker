@@ -2299,7 +2299,14 @@ def _remix_with_lipsync(music_path, video_path, chosen_url, loop_path, output_pa
 STRAIGHT_MODE = False   # 診断用。絶対安全ポリシー下では人物MVを直接表示しない。
 # ファイル名や伴奏波形だけでは発音時刻を証明できない。人物の口元を出すには
 # Pro/strict Demucsのclean-vocal timing proofを必須にする。
-REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES = True
+# 同期の順序ポリシー。
+#   False（既定）: 波形同期ファースト。まず生波形でMV対応箇所を探して合わせ、
+#                  波形が揃わない時だけボーカル・リップシンクへ切り替える（元祖版の順序）。
+#                  波形経路にも clean-vocal 無声マスク・安全境界拡張・弱区間の局所Pro
+#                  という後付けの安全機構は効いたまま。
+#   True         : 発音証明ファースト。波形を配置に使わず、clean-vocal の全編検証を
+#                  通った時だけ人物を表示する最厳格モード（証明不能なら全編口元なし）。
+REQUIRE_VOCAL_PROOF_FOR_VISIBLE_FACES = False
 
 
 def _wf_best_pos(m, video_audio, sr):
@@ -2667,18 +2674,47 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     same_source = (p80 >= 0.78) or (strong_frac >= 0.30)
     _content_align_used = False   # 音内容アライン採用時のみ末尾ズレ補正を効かせる
     if not same_source:
-        # 和音/メロディの一致は同じ曲らしさを示すだけで、発音時刻や口形の
-        # 一致証明にはならない。まずボーカルProを試し、失敗時はクロマで
-        # 口を再表示せず、既に得た強い生波形島だけを残す。
-        print(f"  ↪︎ 生波形の全体一致が不足（強一致率{strong_frac*100:.0f}%）"
-              " → ボーカル・リップシンクを試します")
-        if not remix_lipsync_attempted:
-            remix_lipsync_attempted = True
-            if _try_vocal_lipsync(
-                    music_path, video_path, output_path, tmp_dir, music_dur):
-                return
-        print("  🛡️ Pro不採用後はクロマ推測へ戻さず、"
-              "強い波形一致島以外を口元なし映像へ退避")
+        # 生波形が合わない＝別マスターの可能性。だが同じ曲ならクロマ(メロディ)は合う。
+        # 元祖版のカスケード: クロマ一致 → 音内容アライン → リップシンク → 原曲MVそのまま。
+        # クロマ/音内容で配置した場合も、この後の clean-vocal 無声マスク等の安全機構は
+        # seg_plan に対して従来どおり効く（配置の根拠が増えるだけで検証は減らない）。
+        print(f"  ↪︎ 生波形では合わない（強一致率{strong_frac*100:.0f}%）→ クロマ（メロディ）で合わせ直します...")
+        cseg_plan, cconf, cuniq = align_segments(video_audio, music_audio)
+        cmatch = (sum(e - s for s, e, mv in cseg_plan if mv is not None) / music_dur) if music_dur > 0 else 0.0
+        cn = sum(1 for s, e, mv in cseg_plan if mv is not None)
+        chroma_ok = (cn > 0 and cconf >= 0.50 and cmatch >= 0.40)
+        is_rmx = bool(_is_remix_word and not is_quasi_original)
+
+        if chroma_ok and cuniq >= 0.12:
+            # メロディが一意に合う（別マスターでも素直に対応）→ そのまま採用（令和ver等）
+            print(f"  ✅ クロマで一致（スコア{cconf:.2f} / 一致率{cmatch*100:.0f}% / 一意性{cuniq:.2f}）→ メロディ基準で配置")
+            seg_plan = cseg_plan
+        elif chroma_ok and (_cap := content_align_plan(music_audio, video_audio, music_dur, vid_dur, 11025)):
+            # 音内容アライン（6/24 fix_mv_align 方式）。slope≈1 の連続ランだけ使うので
+            # 反復のドリフト・末尾巻き戻りが出ない。リミックスにも“原曲＋イントロ”なEditにも有効。
+            print(f"  ↪︎ 音内容アラインで配置（slope≈1ラン {len(_cap)}区間 / 連続前進）")
+            seg_plan = _cap
+            _content_align_used = True
+        else:
+            # クロマも安定ランも無い＝配置の根拠なし。
+            #   ・Remix → リップシンク(fail-closed一式フル装備)を試す
+            #   ・それも弱い/非Remix → 未証明の人物MVは流さず、口元なし映像で安全側に仕上げる
+            if is_rmx:
+                print(f"  ⚠️ クロマでも合わない（{cconf:.2f}）→ リップシンクに切替")
+                if (not remix_lipsync_attempted
+                        and _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur)):
+                    return
+                print(f"  → リップシンクも弱い → 口元なし映像だけで安全側に仕上げます")
+            else:
+                print(f"  ⚠️ クロマでも合わない（{cconf:.2f} / 一意性{cuniq:.2f}）→ 口元なし映像だけで安全側に仕上げます")
+            make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
+                               safe_no_mouth=True)
+            try:
+                mb = output_path.stat().st_size / 1024 / 1024
+                print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
+            except Exception:
+                pass
+            return
 
     # フルミックスNCCだけでは、伴奏が同じまま歌だけ抜けるEditを見抜けない。
     # Demucsのclean vocalで持続無声を確認し、その範囲は波形一致が高くても隠す。
