@@ -368,6 +368,12 @@ PERFORMANCE_RE = re.compile(r"\b(live|acoustic|unplugged|in concert|concert|tour
 MV_TIER_MIN = 0.6          # この一致以上の候補は「タイトル妥当」→その中で再生数最多を本物MVとする
 MV_MIN_TRUST_VIEWS = 50000 # 早期確定の再生数しきい値。これ未満は再アップ/偽公式疑い→他クエリも探す
 
+# 自動選択時、掴んだ候補が「本当にこの曲か」を波形で最終確認する。
+#   タイトル一致＋再生数だけだと別曲（例:「Ayo」→再生数の多い「Loyal」）を
+#   掴むことがあるため、候補音声をオンセット波形照合して一致しなければ次候補へ回す。
+#   複数候補がある自動選択時のみ作動。URL直接指定時は確認しない（ユーザー指定を尊重）。
+_AUTO_VERIFY_CANDIDATES = True
+
 def smart_search_mv(full_name, n=5, artist="", title=""):
     """
     複数の検索パターンを順に試し、タイトル一致率が最も高い結果を採用する。
@@ -1413,6 +1419,93 @@ def download_video(url, out_dir):
     return out
 
 
+def verify_candidate_by_waveform(music_path, video_path, music_dur=None,
+                                 sr=11025, probe_sec=30.0, min_score=0.55):
+    """自動選択で掴んだ候補MVが『本当にこの曲か』を波形で確認する。
+
+    タイトル一致＋再生数で選んだ候補には、別曲（例:「Ayo」を探して
+    再生数の多い「Loyal」を掴む）が紛れうる。曲の中盤から数十秒を切り出し、
+    候補MVの音声全体を生波形NCCで走査して最良一致を測る。同一音源なら
+    強いピークが立ち、別曲なら立たない。戻り値: (ok: bool, score: float)。
+
+    照合エンジン(waveform_track_plan)と同じ生波形NCC原理の軽量版。追加の
+    ダウンロードは不要（掴んだ候補の音声を使うだけ）で、数秒で判定できる。
+    """
+    try:
+        music = wav_to_array_path(music_path, sr=sr)
+        if music is None or len(music) < sr * 3:
+            return True, 0.0   # 判定不能時は従来どおり通す（安全側）
+        vid = wav_to_array_path(video_path, sr=sr, duration=360)
+        if vid is None or len(vid) < sr * 3:
+            return True, 0.0
+    except Exception:
+        return True, 0.0
+
+    # 曲の中盤付近から probe_sec 秒を「問い合わせ窓」に使う（イントロ無音を避ける）
+    n = len(music)
+    win = int(min(probe_sec, max(6.0, (n / sr) * 0.5)) * sr)
+    win = max(win, sr * 4)
+    start = max(0, (n - win) // 2)
+    q = music[start:start + win]
+    if len(q) < sr * 3:
+        return True, 0.0
+
+    # 音の大まかな時間エンベロープ（振幅の包絡）で照合する。
+    # 生サンプルの位相まで一致させる必要はなく、「どの時間にどれだけ鳴るか」の
+    # 形が一致すれば同一音源。包絡なら間引いても情報が壊れず、高速で頑健。
+    def envelope(x, hop):
+        m = (len(x) // hop) * hop
+        if m < hop:
+            return np.array([], dtype=np.float32)
+        return np.sqrt(np.mean((x[:m].reshape(-1, hop) ** 2), axis=1) + 1e-9)
+
+    hop = int(0.05 * sr)   # 50ms毎の包絡（20fps相当）
+    qe = envelope(q, hop)
+    ve = envelope(vid, hop)
+    if len(qe) < 20 or len(ve) < len(qe) + 5:
+        return True, 0.0
+
+    # 包絡の“変化量”（オンセット強度）で照合する。生の包絡だと、拍の平均的な
+    # 強さが似ているだけの別曲まで高く出る。差分を取ると「どの瞬間に音が立ち上がる
+    # か」という曲固有のリズム指紋になり、同一音源だけが高く一致する。
+    def onset(e):
+        d = np.diff(e)
+        d[d < 0] = 0.0            # 立ち上がりだけ（減衰は無視）
+        # 3タップの軽い平滑化。テンポやエンコード差でオンセット位置が
+        # 1フレーム前後ずれても一致するよう、少しだけ時間方向ににじませる。
+        if len(d) >= 3:
+            k = np.array([0.25, 0.5, 0.25], dtype=np.float32)
+            d = np.convolve(d, k, mode="same")
+        return d
+    qe = onset(qe)
+    ve = onset(ve)
+    if len(qe) < 20 or len(ve) < len(qe) + 5:
+        return True, 0.0
+
+    qe = qe - np.mean(qe)
+    qn2 = np.linalg.norm(qe)
+    if qn2 < 1e-6:
+        return True, 0.0
+    qe = qe / qn2
+
+    # 包絡どうしの正規化相互相関でMV全体を走査（1フレーム=50ms刻み）
+    L = len(qe)
+    best = -1.0
+    for off in range(0, len(ve) - L):
+        seg = ve[off:off + L]
+        seg = seg - np.mean(seg)
+        sn = np.linalg.norm(seg)
+        if sn < 1e-6:
+            continue
+        c = float(np.dot(qe, seg) / sn)
+        if c > best:
+            best = c
+            if best >= 0.97:
+                break
+    ok = best >= min_score
+    return ok, best
+
+
 def is_static_video(video_path, samples=6):
     """ダウンロードした動画が実質"静止画"（ジャケ画像/音声のみアップロード）かを判定。
     均等な時刻のフレームを抜き、フレーム間の平均差分が極小なら静止画とみなす。"""
@@ -1587,13 +1680,51 @@ def _safe_video_frame_count(duration, fps=30.0):
 
 
 def _decoded_video_frame_count(path):
-    """コンテナの申告値ではなく、最後までデコードできた映像枚数を返す。"""
+    """映像の実フレーム数を返す。速度優先で3段階にフォールバックする。
+
+    以前は常に -count_frames（全フレームをデコードして数える）を使っていたが、
+    これはセグメントごと・全体で何度も呼ばれ、動画を繰り返しフルデコードするため
+    非常に遅かった（波形一致で本編が数秒でも、ここで数十秒〜数分待たされる）。
+    パケット計数はデコード不要で桁違いに速く、CFR動画なら枚数はデコードと一致する。
+    """
+    p = str(path)
+    # ① パケット数（デコード不要・最速）。映像パケット=フレーム数（CFRなら厳密一致）。
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-of", "default=noprint_wrappers=1:nokey=1", p],
+            capture_output=True, text=True, errors="replace")
+        if r.returncode == 0:
+            v = (r.stdout or "").strip().splitlines()
+            if v and v[0] not in ("", "N/A"):
+                c = int(v[0])
+                if c > 0:
+                    return c
+    except (OSError, TypeError, ValueError, IndexError):
+        pass
+    # ② コンテナ申告の nb_frames（メタデータ読むだけ・速い）。
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_frames",
+             "-of", "default=noprint_wrappers=1:nokey=1", p],
+            capture_output=True, text=True, errors="replace")
+        if r.returncode == 0:
+            v = (r.stdout or "").strip().splitlines()
+            if v and v[0] not in ("", "N/A"):
+                c = int(v[0])
+                if c > 0:
+                    return c
+    except (OSError, TypeError, ValueError, IndexError):
+        pass
+    # ③ 最後の手段：全デコードして数える（確実だが最も遅い）。
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-count_frames",
              "-select_streams", "v:0",
              "-show_entries", "stream=nb_read_frames",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+             "-of", "default=noprint_wrappers=1:nokey=1", p],
             capture_output=True, text=True, errors="replace")
         if r.returncode != 0:
             return None
@@ -2493,6 +2624,19 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # urls は候補URLのリスト（後方互換で単一strも可）。静止画/短すぎ候補は飛ばす。
     if isinstance(urls, str):
         urls = [urls]
+    # ── 段階ごとの所要時間ログ ──
+    #   「波形で合わせるだけなのに遅い」時に、DL / 波形照合 / 合成のどこで
+    #   時間を使ったかを数字で見えるようにする（環境変数 DJVM_TIMING=1 で詳細表示）。
+    import time as _time
+    _t_start = _time.time()
+    _t_marks = {"start": _t_start}
+    def _stage(name):
+        now = _time.time()
+        prev = _t_marks.get("_last", _t_start)
+        _t_marks[name] = now
+        _t_marks["_last"] = now
+        if os.environ.get("DJVM_TIMING", "1") != "0":
+            print(f"     ⏱ {name}: {now - prev:.1f}秒")
     # 曲の長さ（候補が短すぎないかの判定に使う）
     try:
         _music_dur_pre = get_audio_duration_accurate(music_path)
@@ -2500,6 +2644,8 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         _music_dur_pre = 0
     video_path = None
     chosen_url = urls[0] if urls else ""
+    # 波形検証で全候補が閾値未満だった時の保険：最も一致した候補を覚えておく。
+    _best_verify = {"score": -1.0, "vp": None, "url": None}
     for i, u in enumerate(urls):
         cand_dir = tmp_dir / f"cand{i}"
         cand_dir.mkdir(parents=True, exist_ok=True)
@@ -2518,9 +2664,31 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             if _music_dur_pre and _vd and _vd < _music_dur_pre * 0.6:
                 print(f"  ⚠️ この候補はMVが短すぎ（{_vd:.0f}秒 < 曲{_music_dur_pre:.0f}秒の6割）= 短縮版/別物の可能性 → 次の候補を試します")
                 continue
+        # ★中身の一致確認：タイトル+再生数で選んだ候補が別曲のことがある
+        #   （例:「Ayo」を探して再生数の多い「Loyal」を掴む）。波形で本人確認し、
+        #   一致しなければ次の候補へ。自動選択モードで候補が複数ある時だけ実施。
+        #   最後の1本は代わりが無いので検証で落とさずそのまま使う。
+        if _AUTO_VERIFY_CANDIDATES and len(urls) > 1 and i < len(urls) - 1:
+            try:
+                _ok, _vscore = verify_candidate_by_waveform(
+                    music_path, vp, music_dur=_music_dur_pre)
+            except Exception:
+                _ok, _vscore = True, 0.0
+            if _vscore > _best_verify["score"]:
+                _best_verify = {"score": _vscore, "vp": vp, "url": u}
+            if not _ok:
+                print(f"  🔎 波形照合: この候補は別の曲の可能性（一致 {_vscore:.2f}）→ 次の候補を試します")
+                continue
+            print(f"  🔎 波形照合: この曲だと確認（一致 {_vscore:.2f}）→ 採用")
         video_path = vp
         chosen_url = u
         break
+    # 全候補が波形検証で落ちた時の保険：最も一致が高かった候補を採用（無音回避）。
+    if video_path is None and _best_verify["vp"] is not None:
+        print(f"  🔎 波形照合: 確証は得られませんでしたが、最も一致した候補"
+              f"（一致 {_best_verify['score']:.2f}）を使います")
+        video_path = _best_verify["vp"]
+        chosen_url = _best_verify["url"]
     if video_path is None:
         print("  ❌ 有効な映像が取得できませんでした")
         return
@@ -2550,6 +2718,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             else:
                 print("  ⚠️ 手動URLのダウンロードに失敗 → 元のMVのまま進めます")
 
+    _stage("MVダウンロード")
     vid_dur    = get_duration(video_path)
     music_dur  = get_audio_duration_accurate(music_path)
     if music_dur < 1.0:
@@ -2682,6 +2851,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         interpolate_single_gap=True)
     p80 = score["p80"]; strong_frac = score["strong_frac"]; match_ratio = score["match_ratio"]
     print(f"  📊 波形一致: 強一致率{strong_frac*100:.0f}% / p80={p80:.2f} / 一致区間{match_ratio*100:.0f}%")
+    _stage("波形照合")
     print(f"     （短いEdit/Hook/Introは“合う所が強ければ”同一音源。MV外の区間はフィラーに回します）")
 
     if not seg_plan:
@@ -2947,6 +3117,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             # 失敗扱いにする。安全背景も作れない環境で人物へ戻らない。
             raise RuntimeError(f"安全映像を生成できませんでした: {s:.3f}-{e:.3f}s")
 
+    _stage("同期プラン作成")
     print(f"\n🔗 結合・合成中...")
     combined = tmp_dir / "combined.mp4"
     if len(seg_files) == 1:
