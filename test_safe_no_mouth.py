@@ -81,6 +81,48 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertLess(src.index("if not STRICT_MASK_FOR_ESTIMATED_PLACEMENT:"),
                         src.index("伸縮して補正"))
 
+    def test_auto_candidate_waveform_verification_exists(self):
+        # 自動選択で別曲（例:「Ayo」→再生数の多い「Loyal」）を掴む問題への対策。
+        # 候補をオンセット波形照合し、一致しなければ次候補へ。全滅時は最良候補を採用。
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("def verify_candidate_by_waveform(", src)
+        self.assertTrue(CORE["_AUTO_VERIFY_CANDIDATES"])
+        # URL直接指定を尊重（候補が複数ある自動選択時のみ検証）
+        self.assertIn("len(urls) > 1 and i < len(urls) - 1", src)
+        # 全候補が落ちても無音にならない保険
+        self.assertIn("最も一致した候補", src)
+
+    def test_waveform_verifier_distinguishes_same_and_different_song(self):
+        import io, contextlib, wave, tempfile, os
+        import numpy as np
+        s = CORE_PATH.read_text(encoding="utf-8").split("# ─── メイン ───", 1)[0]
+        ns = {"__file__": str(CORE_PATH)}
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(s, str(CORE_PATH), "exec"), ns)
+        verify = ns["verify_candidate_by_waveform"]
+        sr = 11025
+        def wv(p, a):
+            a = (np.clip(a, -1, 1) * 32767).astype(np.int16)
+            with wave.open(p, "w") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+                w.writeframes(a.tobytes())
+        def song(dur, seed):
+            r = np.random.default_rng(seed); n = int(dur * sr)
+            x = np.zeros(n, dtype=np.float32)
+            for _ in range(int(dur * 4)):
+                pos = r.integers(0, n - 2000); ln = r.integers(500, 2000)
+                x[pos:pos + ln] += r.uniform(0.3, 0.9) * r.standard_normal(ln).astype(np.float32)
+            return x
+        d = tempfile.mkdtemp(); mv = song(240, 10)
+        edit = np.concatenate([mv[int(60*sr):int(110*sr)], mv[int(10*sr):int(45*sr)]])
+        other = song(200, 99)
+        wv(f"{d}/e.wav", edit); wv(f"{d}/m.wav", mv); wv(f"{d}/o.wav", other)
+        ok_same, s_same = verify(f"{d}/e.wav", f"{d}/m.wav")
+        ok_diff, s_diff = verify(f"{d}/e.wav", f"{d}/o.wav")
+        self.assertTrue(ok_same, f"本物を却下 (score={s_same:.2f})")
+        self.assertFalse(ok_diff, f"別曲を誤採用 (score={s_diff:.2f})")
+        self.assertGreater(s_same - s_diff, 0.2)
+
     def test_waveform_detection_uses_original_settings(self):
         # 回帰: fail-closed版は match_th 0.72 + 孤立窓補間OFF で一致区間を
         # 意図的に削っていた(実測 94%→84% / 7区間→16区間にフィラー断片)。
