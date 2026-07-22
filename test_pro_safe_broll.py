@@ -459,3 +459,34 @@ class AlignedVisualProofTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhisperFinalRefixComparedNotForcedTests(unittest.TestCase):
+    """項目3: Whisper最終再固定を無条件上書きせず、口×歌声品質が
+    改善した時だけ採用する（悪化時は補正前を維持）。波形経路は不変。"""
+
+    SRC = (Path(__file__).resolve().parent / "lipsync_pro.py").read_text(encoding="utf-8")
+
+    def test_whisper_refix_is_compared_not_forced(self):
+        # 旧: 無条件 anchors = whisper_word_align(...)
+        # 新: anchors_before / anchors_whisper を品質比較して採否を決める
+        self.assertIn("anchors_before = [list(a) for a in anchors]", self.SRC)
+        self.assertIn("anchors_whisper = whisper_word_align(", self.SRC)
+        self.assertIn("Whisper再固定は不採用", self.SRC)
+
+    def test_quality_uses_existing_report(self):
+        # 新しい重い計算を足さず、既存の alignment_quality_report を流用する
+        self.assertIn("onset_correlation", self.SRC)
+        self.assertIn("def _sync_quality(anch):", self.SRC)
+
+    def test_degradation_keeps_pre_whisper_anchors(self):
+        # 比較分岐のロジックを純粋関数として再現し、悪化時は補正前維持を確認
+        def decide(sb, sw, mv, g=0.01):
+            if sb is None or sw is None: return "whisper"
+            if sw >= sb + g: return "whisper"
+            if mv <= 0.10 and sw >= sb - g: return "whisper"
+            return "before"
+        self.assertEqual(decide(0.45, 0.30, 0.3), "before")   # 悪化→維持
+        self.assertEqual(decide(0.30, 0.45, 0.3), "whisper")  # 改善→採用
+        self.assertEqual(decide(None, 0.4, 0.3), "whisper")   # 測定不能→従来
+

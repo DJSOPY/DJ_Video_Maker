@@ -1,3 +1,4 @@
+from pathlib import Path
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """口マイクロ補正の合成テスト。
@@ -135,3 +136,22 @@ fixed, nfix = lp.apply_mouth_micro_lag(anchors, prof, rvoc.astype(np.float32), s
 shift = np.mean([f[1] - a[1] for f, a in zip(fixed, anchors)])
 print(f"  補正区間={nfix}, 平均シフト={shift*1000:+.0f}ms（期待≈+{true_lag*1000:.0f}ms）"
       + ("  OK" if nfix >= 1 and abs(shift - true_lag) < 0.05 else "  NG"))
+
+
+def test_success_region_guards_exist():
+    """成功区間を後段処理で壊さない3つのガード（Cake by the Ocean対策）。"""
+    src = (Path(__file__).resolve().parent / "lipsync_pro.py").read_text(encoding="utf-8")
+    # ① 口の粗補正は最大±0.35秒に制限
+    assert "MOUTH_LAG_MAX_SHIFT = 0.35" in src
+    assert "max_lag=MOUTH_LAG_MAX_SHIFT" in src
+    # ②' 既に合っている区間はロックして動かさない
+    assert "MOUTH_LAG_LOCK_CORR" in src
+    assert "成功区間ロック" in src
+    # ③ Whisper最終再固定は一致語が閾値未満なら採用しない
+    assert "WHISPER_MIN_MATCHED_WORDS = 8" in src
+    assert "len(snapped) < WHISPER_MIN_MATCHED_WORDS" in src
+    print("OK success-region guards")
+
+
+if __name__ == "__main__":
+    test_success_region_guards_exist()
