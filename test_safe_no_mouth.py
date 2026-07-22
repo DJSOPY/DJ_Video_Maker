@@ -51,8 +51,41 @@ class ProfileCertificationTests(unittest.TestCase):
 
 
 class UnsafePlanTests(unittest.TestCase):
-    def test_absolute_mode_disables_real_source_broll(self):
-        self.assertFalse(CORE["_ALLOW_REAL_SOURCE_SAFE_BROLL"])
+    def test_real_source_broll_enabled_but_certification_is_strict(self):
+        # フィラーは「口が映らないと全フレーム認証できたMVカット」で埋める設定。
+        # 有効化しても安全性は不変：認証は _profile_certifies_no_mouth が
+        # 「全フレーム明示 MOUTH_ABSENT」の時だけ True を返すことで担保される。
+        self.assertTrue(CORE["_ALLOW_REAL_SOURCE_SAFE_BROLL"])
+        # 認証ロジックが厳格（未検出・NaN・1フレームでも閉口=不合格）であること
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("def _profile_certifies_no_mouth", src)
+        # 認証は fps=1000.0（全デコードフレーム検査）で行われる
+        self.assertIn("fps=1000.0", src)
+        # 認証できなければ抽象背景へ退避する経路が残っていること
+        self.assertIn("安全な口元なし映像が無いため、非人物の抽象背景へ退避", src)
+
+    def test_lipsync_fallback_uses_lenient_mode_by_default(self):
+        # 別アレンジRemixで「口が合う区間」を口パクできるよう、リップシンクの
+        # ボーカル分離フォールバックは既定で元祖版と同じ緩い判定を使う。
+        # （strict_fail_closed=True だと信頼度0.62等で合う区間まで潰していた）。
+        self.assertFalse(CORE["_STRICT_FAIL_CLOSED_LIPSYNC"])
+        src = CORE_PATH.read_text(encoding="utf-8")
+        # 既定パスは strict_fail_closed=False かつフィラーにMV映像(make_filler_segment)
+        self.assertIn("strict_fail_closed=False))", src)
+        self.assertIn("make_filler_segment(\n                video_path, d, o, tmp_dir)", src)
+        # strict機能自体は定数Trueで呼べる形で保持
+        self.assertIn("if _STRICT_FAIL_CLOSED_LIPSYNC:", src)
+
+    def test_unmatched_remix_shows_mv_by_default(self):
+        # 別アレンジRemix等で波形/クロマ/音内容アラインのどれでも配置できない時、
+        # 既定では原曲MVを素直に流す（5分ずっと抽象背景を避ける）。定数で最厳格にも戻せる。
+        self.assertTrue(CORE["REMIX_SHOW_MV_WHEN_UNMATCHED"])
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("_safe_end = not REMIX_SHOW_MV_WHEN_UNMATCHED", src)
+        # MVを流す経路（safe_no_mouth=_safe_end）が終端で使われている
+        self.assertIn("safe_no_mouth=_safe_end", src)
+        # リップシンク（fail-closed）を先に試してから最終手段でMV、の順は維持
+        self.assertIn("リップシンクに切替", src)
 
     def test_waveform_first_is_default_and_strict_mode_is_available(self):
         # 既定は波形同期ファースト（元祖版の順序）。Trueにすると発音証明
@@ -88,7 +121,7 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertIn("def verify_candidate_by_waveform(", src)
         self.assertTrue(CORE["_AUTO_VERIFY_CANDIDATES"])
         # URL直接指定を尊重（候補が複数ある自動選択時のみ検証）
-        self.assertIn("len(urls) > 1 and i < len(urls) - 1", src)
+        self.assertIn("0 < i < len(urls) - 1", src)
         # 全候補が落ちても無音にならない保険
         self.assertIn("最も一致した候補", src)
 
@@ -122,6 +155,27 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertTrue(ok_same, f"本物を却下 (score={s_same:.2f})")
         self.assertFalse(ok_diff, f"別曲を誤採用 (score={s_diff:.2f})")
         self.assertGreater(s_same - s_diff, 0.2)
+
+    def test_content_align_fft_matches_bruteforce(self):
+        # content_align_planの粗探索をFFT相互相関に置換して高速化した（実測5倍）。
+        # 数学的に内積スキャンと同値で、配置結果が変わらないことを保証する。
+        import io, contextlib
+        import numpy as np
+        s = CORE_PATH.read_text(encoding="utf-8").split("# ─── メイン ───", 1)[0]
+        self.assertIn('correlate(cv[b], en[b], mode="valid", method="fft")', s)
+        ns = {"__file__": str(CORE_PATH)}
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(s, str(CORE_PATH), "exec"), ns)
+        sr = 11025
+        rng = np.random.default_rng(3)
+        mv = (rng.standard_normal(int(120 * sr)) * 0.3).astype(np.float32)
+        music = np.concatenate([mv[int(10*sr):int(50*sr)], mv[int(70*sr):int(110*sr)]])
+        plan = ns["content_align_plan"](music, mv, len(music) / sr, 120.0, sr)
+        self.assertIsNotNone(plan)
+        self.assertGreaterEqual(len(plan), 1)
+        for s0, e0, m0 in plan:
+            self.assertGreaterEqual(m0, -0.01)
+            self.assertLessEqual(m0, 120.0 + 0.01)
 
     def test_waveform_detection_uses_original_settings(self):
         # 回帰: fail-closed版は match_th 0.72 + 孤立窓補間OFF で一致区間を

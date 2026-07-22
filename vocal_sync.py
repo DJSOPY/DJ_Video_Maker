@@ -1412,6 +1412,9 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
     seg_fail = 0
     filler_fail = 0
     visual_hidden = 0
+    # 通常モードで判定不能区間にMVを推定配置するための状態。
+    last_valid_o_end = None   # 直近で有効だったMV対応の終端秒（次の推定の起点）
+    mv_estimated = 0          # 推定配置でMVを維持した区間数（ログ用）
     # 各2秒片を個別に丸めると、setptsの倍率次第で60枚/61枚が混在し、
     # 結合後の後半ほど映像が遅れる。全区間共通の時刻境界で枚数を割り当てる。
     frame_clock = _CumulativeFrameClock(OUTPUT_FPS)
@@ -1469,6 +1472,21 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                                         output_start_frame=output_start_frame,
                                         onset_times=strict_onset_times,
                                         onset_envelope=strict_onset_envelope))))
+                # ★通常モード（非strict）では「判定不能＝mapping無限」でも即フィラーに
+                #   しない。実写MVは横顔・ダンス・引きでMediaPipeが顔を取れないことが
+                #   多く、判定不能を全部フィラーにするとMVがほとんど残らない。
+                #   直前の有効な対応位置から等速でMVを推定配置し、MVを維持する。
+                #   （明確な口ズレはこの後段の rate/範囲チェックで弾かれる。）
+                if (not visually_proven and not strict_fail_closed
+                        and not mapping_finite and last_valid_o_end is not None):
+                    o_pos = max(0.0, min(last_valid_o_end, mv_dur - sub_dur - 0.05))
+                    o_end = o_pos + sub_dur
+                    local_src = sub_dur
+                    ratio_local = 1.0
+                    use_rate = False
+                    src_dur = min(sub_dur, max(0.05, mv_dur - o_pos - 0.02))
+                    visually_proven = True
+                    mv_estimated += 1
                 if not visually_proven:
                     visual_hidden += 1
                     made = _call_filler_exact(
@@ -1501,6 +1519,9 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
                 if (rr.returncode == 0
                         and _video_has_exact_frames(out, target_frames)):
                     seg_files.append(out)
+                    # 次の判定不能区間の推定起点として、今置いたMVの終端を覚える。
+                    if mapping_finite:
+                        last_valid_o_end = o_pos + src_dur
                 else:
                     seg_fail += 1
                     if verbose and seg_fail == 1:
@@ -1533,6 +1554,9 @@ def make_vocal_lipsync_remix(music_path, mv_path, output_path, tmp_dir, music_du
     if verbose and visual_hidden:
         print(f"     🛡️ 全frame視覚証明の不合格 {visual_hidden}片を"
               "安全背景へ退避")
+    if verbose and mv_estimated:
+        print(f"     🎬 判定不能な {mv_estimated}片は、直前の対応位置から"
+              "MVを推定配置（フィラーにせずMV維持）")
 
     if not seg_files:
         if verbose:

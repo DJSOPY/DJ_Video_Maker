@@ -154,5 +154,22 @@ class VocalFailClosedTests(unittest.TestCase):
                 vocal_active, 50.0, **phase))
 
 
+
+class UndecidableKeepsMvTests(unittest.TestCase):
+    """通常モードで判定不能(mapping無限)区間をフィラーにせずMV維持する（項目4）。"""
+
+    SRC = (Path(__file__).resolve().parent / "vocal_sync.py").read_text(encoding="utf-8")
+
+    def test_undecidable_estimates_mv_in_normal_mode(self):
+        # 直前の有効対応位置から等速でMVを推定配置する分岐が存在する
+        self.assertIn("last_valid_o_end", self.SRC)
+        self.assertIn("mv_estimated", self.SRC)
+        self.assertIn("not strict_fail_closed", self.SRC)
+        self.assertIn("not mapping_finite", self.SRC)
+
+    def test_estimation_only_when_prior_valid(self):
+        # 直前の有効位置が無ければ推定しない（last_valid_o_end is not None が条件）
+        self.assertIn("last_valid_o_end is not None", self.SRC)
+
 if __name__ == "__main__":
     unittest.main()

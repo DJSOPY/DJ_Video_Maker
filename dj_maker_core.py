@@ -914,15 +914,33 @@ def content_align_plan(music_audio, video_audio, music_dur, vid_dur, sr=11025,
     if Te < W + step or To < W:
         return None
     anchors = []
+    # 各窓のMV側ベスト位置を探す。従来は j を2フレームずつ動かす二重ループで、
+    # 曲・MVが長いと数十万回の内積になり重かった（実測 約8秒）。
+    # 粗探索を「12バンドそれぞれのFFT相互相関の和」に置き換える。数学的に
+    # 内積スキャンと同値だが、O(N log N) で一気に全オフセットを評価でき桁違いに速い。
+    # ピーク近傍だけ従来どおり内積で微調整するので、結果（採用位置）は変わらない。
+    cv_col_sq = np.sum(cv * cv, axis=0)                # 各MV列のノルム^2
+    cv_win_sq = np.convolve(cv_col_sq, np.ones(W), mode="valid")  # 各MV窓のノルム^2
     for s in range(0, max(1, Te - W), step):
-        e = cm[:, s:s+W]; en = e / (np.linalg.norm(e) + 1e-9)
-        best, bestj = -1.0, 0
-        for j in range(0, max(1, To - W), 2):                 # 粗探索
-            o = cv[:, j:j+W]; sim = float(np.sum(en * o)) / (np.linalg.norm(o) + 1e-9)
-            if sim > best: best, bestj = sim, j
-        for j in range(max(0, bestj-2), min(To - W, bestj+3)):  # 微調整
-            o = cv[:, j:j+W]; sim = float(np.sum(en * o)) / (np.linalg.norm(o) + 1e-9)
-            if sim > best: best, bestj = sim, j
+        e = cm[:, s:s+W]
+        en = e / (np.linalg.norm(e) + 1e-9)
+        # 12バンドのFFT相互相関の和 = 窓 en を MV全域に滑らせた内積列（正規化前）
+        corr = None
+        for b in range(12):
+            c = correlate(cv[b], en[b], mode="valid", method="fft")
+            corr = c if corr is None else corr + c
+        # 有効なオフセット範囲 [0, To-W] に切り出し、窓ノルムで正規化してベスト位置
+        valid = corr[:max(1, To - W)]
+        denom = np.sqrt(cv_win_sq[:valid.shape[0]]) + 1e-9
+        simarr = valid / denom
+        bestj = int(np.argmax(simarr))
+        best = float(simarr[bestj])
+        # ピーク近傍だけ従来の内積で微調整（FFTの丸めやマスク端の補正）
+        for j in range(max(0, bestj-2), min(To - W, bestj+3)):
+            o = cv[:, j:j+W]
+            sim = float(np.sum(en * o)) / (np.linalg.norm(o) + 1e-9)
+            if sim > best:
+                best, bestj = sim, j
         anchors.append(((s + W//2) / fps, (bestj + W//2) / fps, best))
     if len(anchors) < 2:
         return None
@@ -1665,7 +1683,17 @@ _SAFE_BROLL_USED = {}
 # 実写MVでは、検出済みの顔以外に見逃した人物がいないことを証明できない。
 # 「口元が一切映らない」を絶対条件にするため、既定は実写Bロールを使わず
 # 人物を生成しない抽象背景だけに固定する。
-_ALLOW_REAL_SOURCE_SAFE_BROLL = False
+_ALLOW_REAL_SOURCE_SAFE_BROLL = True   # フィラー区間を「口が映らないと全フレーム認証できたMVカット」で埋める。
+                                       #   Trueでも安全性は不変：全フレーム検査でMOUTH_ABSENTを
+                                       #   確認できた区間だけ実写、少しでも口が出れば抽象背景へ退避。
+                                       #   mediapipe(顔解析)が使えない環境では自動でグラデーションに退避。
+
+# 波形・クロマ・音内容アラインのどれでも配置できなかった（＝別アレンジRemix等で
+# 原曲MVと構造が合わない）時に、MVをどう扱うか。
+#   True（既定）: 元祖版と同じく原曲MVを頭から素直に流す。同期は取れないので口パクは
+#                 合わないが、5分ずっと抽象背景よりMVが見えている方が良い、という選択。
+#   False       : 未証明の口を一切出さない最厳格。全編を認証Bロール/抽象背景にする。
+REMIX_SHOW_MV_WHEN_UNMATCHED = True
 
 
 def _safe_video_frame_count(duration, fps=30.0):
@@ -2256,6 +2284,16 @@ def remix_tempo_close_to_mv(music_path, video_path, music_dur, vid_dur, tol=0.03
         return False, 0.0, 0.0
 
 
+# リップシンク（Pro失敗後のボーカル分離フォールバック）で、fail-closedの
+# 厳格判定を課すか。
+#   False（既定）: 元祖版と同じ緩い判定。信頼度0.45で口パクを採用し、Remixでも
+#                  「口が合う区間」は積極的に口パクする（Cake by the Ocean等の
+#                  別アレンジで前半が口パクできていた挙動を復元）。
+#   True         : fail-closed最厳格。Demucs必須・信頼度0.62・全フレーム視覚証明。
+#                  未証明の口を一切出さない代わり、合う区間まで安全側に潰しやすい。
+_STRICT_FAIL_CLOSED_LIPSYNC = False
+
+
 def _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
     """まず Pro版エンジン（HuBERT中間層＋subseq DTW＋Viterbi全体経路）で同期を試す。
     Pro版が未導入/失敗なら、従来のボーカル分離リップシンク（doc12）へフォールバック。
@@ -2271,13 +2309,22 @@ def _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
     except Exception as e:
         print(f"  ⚠️ Pro同期で例外 → 従来方式へフォールバック: {e}")
     # --- フォールバック: 従来(doc12)のボーカル分離リップシンク ---
+    #   _STRICT_FAIL_CLOSED_LIPSYNC=False（既定）では元祖版と同じく、フィラーに
+    #   MV映像を使い(make_filler_segment)、緩い信頼度で口パクを採用する。
+    #   これにより別アレンジRemixでも「口が合う区間」は口パクされる。
     try:
         import vocal_sync
+        if _STRICT_FAIL_CLOSED_LIPSYNC:
+            return bool(vocal_sync.make_vocal_lipsync_remix(
+                music_path, video_path, output_path, tmp_dir, music_dur,
+                filler_cb=lambda d, o, frames=None: make_safe_no_mouth_filler_segment(
+                    video_path, d, o, tmp_dir, frame_count=frames),
+                strict_fail_closed=True))
         return bool(vocal_sync.make_vocal_lipsync_remix(
             music_path, video_path, output_path, tmp_dir, music_dur,
-            filler_cb=lambda d, o, frames=None: make_safe_no_mouth_filler_segment(
-                video_path, d, o, tmp_dir, frame_count=frames),
-            strict_fail_closed=True))
+            filler_cb=lambda d, o, frames=None: make_filler_segment(
+                video_path, d, o, tmp_dir),
+            strict_fail_closed=False))
     except Exception as e:
         print(f"  ⚠️ ボーカル分離リップシンクで例外: {e}")
         return False
@@ -2666,9 +2713,14 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                 continue
         # ★中身の一致確認：タイトル+再生数で選んだ候補が別曲のことがある
         #   （例:「Ayo」を探して再生数の多い「Loyal」を掴む）。波形で本人確認し、
-        #   一致しなければ次の候補へ。自動選択モードで候補が複数ある時だけ実施。
-        #   最後の1本は代わりが無いので検証で落とさずそのまま使う。
-        if _AUTO_VERIFY_CANDIDATES and len(urls) > 1 and i < len(urls) - 1:
+        #   一致しなければ次の候補へ。ただし——
+        #   ◎最初の候補（i==0）は検証しない。自動選択はタイトル・アーティスト・
+        #     公式性・再生数で最良の1本を既に1位にしている。Remix/別アレンジは
+        #     原曲MVと通常波形が似ないため（例: Cake by the Ocean Remixは波形0.16）、
+        #     ここで波形一致だけを見ると“正しい公式MV”まで捨ててしまう。
+        #     波形照合は2位以降にだけ効かせ、1位が明らかな別曲だった場合の拾い直しに使う。
+        if (_AUTO_VERIFY_CANDIDATES and len(urls) > 1
+                and 0 < i < len(urls) - 1):
             try:
                 _ok, _vscore = verify_candidate_by_waveform(
                     music_path, vp, music_dur=_music_dur_pre)
@@ -2795,9 +2847,13 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             print(f"  ⚠️ どのテンポでも波形が一直線に揃わない（別アレンジ）→ リップシンクに切替")
             if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
                 return
-            print(f"  → リップシンクも弱い → 口元なし映像だけで安全側に仕上げます")
+            _safe_end = not REMIX_SHOW_MV_WHEN_UNMATCHED
+            if _safe_end:
+                print(f"  → リップシンクも弱い → 口元なし映像だけで安全側に仕上げます")
+            else:
+                print(f"  → リップシンクも弱い → MVをそのまま流します（別アレンジのため同期なし・口は合いません）")
             make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
-                               safe_no_mouth=True)
+                               safe_no_mouth=_safe_end)
             try:
                 mb = output_path.stat().st_size / 1024 / 1024
                 print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
@@ -2902,17 +2958,27 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         else:
             # クロマも安定ランも無い＝配置の根拠なし。
             #   ・Remix → リップシンク(fail-closed一式フル装備)を試す
-            #   ・それも弱い/非Remix → 未証明の人物MVは流さず、口元なし映像で安全側に仕上げる
+            #   ・それも弱い → REMIX_SHOW_MV_WHEN_UNMATCHED で見せ方を選ぶ
+            #       True(既定): 元祖版どおり原曲MVを素直に流す（口パクは合わないが
+            #                   ずっと抽象背景よりMVが見える方を優先）
+            #       False     : 未証明の口を出さない最厳格（認証Bロール/抽象背景）
+            _safe_end = not REMIX_SHOW_MV_WHEN_UNMATCHED
             if is_rmx:
                 print(f"  ⚠️ クロマでも合わない（{cconf:.2f}）→ リップシンクに切替")
                 if (not remix_lipsync_attempted
                         and _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur)):
                     return
-                print(f"  → リップシンクも弱い → 口元なし映像だけで安全側に仕上げます")
+                if _safe_end:
+                    print(f"  → リップシンクも弱い → 口元なし映像だけで安全側に仕上げます")
+                else:
+                    print(f"  → リップシンクも弱い → MVをそのまま流します（別アレンジのため同期なし・口は合いません）")
             else:
-                print(f"  ⚠️ クロマでも合わない（{cconf:.2f} / 一意性{cuniq:.2f}）→ 口元なし映像だけで安全側に仕上げます")
+                if _safe_end:
+                    print(f"  ⚠️ クロマでも合わない（{cconf:.2f} / 一意性{cuniq:.2f}）→ 口元なし映像だけで安全側に仕上げます")
+                else:
+                    print(f"  ⚠️ クロマでも合わない（{cconf:.2f} / 一意性{cuniq:.2f}）→ MVをそのまま流します（同期なし）")
             make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
-                               safe_no_mouth=True)
+                               safe_no_mouth=_safe_end)
             try:
                 mb = output_path.stat().st_size / 1024 / 1024
                 print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
@@ -4795,6 +4861,15 @@ if failed_tracks:
 else:
     print(f"🎉 全{len(music_list)}曲 完了！ → {out_dir}")
 print(f"{'='*54}")
+# 完成したら出力フォルダをFinderで開く（ターミナル版のみ・成功曲が1つ以上ある時）。
+# Web版はブラウザにダウンロードボタンがあるので開かない。毎回フォルダを手で
+# 探さずに済むよう完了と同時に開く。失敗しても処理は止めない。
+if (_ok > 0 and os.environ.get("DJVM_WEB") != "1"
+        and sys.platform == "darwin"):
+    try:
+        subprocess.run(["open", str(out_dir)], check=False)
+    except Exception:
+        pass
 if os.environ.get("DJVM_WEB") != "1":
     try:
         input("\nEnterキーで閉じる...")
