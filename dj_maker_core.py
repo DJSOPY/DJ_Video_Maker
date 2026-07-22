@@ -459,7 +459,18 @@ def smart_search_mv(full_name, n=5, artist="", title=""):
             return exact, cand_score(exact[0]["title"])
         # 2) タイトルが十分妥当な候補の中で「再生回数が最多」＝本物の公式MV
         #    （詐称タイトルの低再生アップを、ここで再生数によって弾く）
+        #    ★ただし曲名がタイトルに入っていることを必須にする。これが無いと
+        #      「Ayo」を探して、同じアーティストで再生数が桁違いに多い別曲
+        #      「Loyal」を再生数だけで掴んでしまう（実際に起きた）。
+        #      曲名(_cs)が3文字以上あるなら、タイトルに曲名を含む候補だけを
+        #      再生数勝負に参加させる。含む候補が無ければ従来どおり全候補で妥協。
+        def _has_song_name(r):
+            return bool(_cs and len(_cs) >= 3 and _cs in _compact(r["title"]))
         plausible = [r for r in cands if cand_score(r["title"]) >= MV_TIER_MIN]
+        if _cs and len(_cs) >= 3:
+            named = [r for r in plausible if _has_song_name(r)]
+            if named:
+                plausible = named   # 曲名を含む候補があるなら、それだけで選ぶ
         if plausible:
             plausible.sort(key=lambda r: (r.get("views", 0), cand_score(r["title"])), reverse=True)
             return plausible, cand_score(plausible[0]["title"])
