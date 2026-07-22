@@ -65,21 +65,21 @@ VENV="$HOME/.dj_video_maker_env"
 PYTHON_CMD="$VENV/bin/python3"
 # venvを作り直す（壊れている可能性があるので一度消す）
 rm -rf "$VENV" 2>/dev/null
-python3 -m venv "$VENV" 2>/dev/null || /usr/bin/python3 -m venv "$VENV"
-"$PYTHON_CMD" -m pip install --quiet --no-input --upgrade pip
-"$PYTHON_CMD" -m pip install --no-input numpy scipy mutagen Pillow librosa fastdtw
-# 任意（重い）: リップシンク・口解析。失敗しても本体は動く
-"$PYTHON_CMD" -m pip install --no-input demucs 2>/dev/null \
-  || echo "   （demucsは入りませんでした → 従来方式で動きます）"
-"$PYTHON_CMD" -m pip install --no-input transformers torchaudio 2>/dev/null \
-  || echo "   （HuBERT用は入りませんでした → MFCC方式で動きます）"
-# torchaudio 2.9以降は音声の書き出しに torchcodec が必須（無いとDemucsが保存段で落ちる）
-"$PYTHON_CMD" -m pip install --no-input torchcodec 2>/dev/null \
-  || echo "   （torchcodecは入りませんでした → 保存経路を使わない方式で動きます）"
-"$PYTHON_CMD" -m pip install --no-input faster-whisper 2>/dev/null \
-  || echo "   （Whisper単語アライメントは入りませんでした → その段はスキップ）"
-"$PYTHON_CMD" -m pip install --no-input mediapipe opencv-python 2>/dev/null \
-  || echo "   （口の動き解析は入りませんでした → その機能はスキップ）"
+# venvの作成・pip更新・全ライブラリ導入は setup_common.sh に一本化する。
+# ★ライブラリの導入は setup_common.sh の検証済みロジックに一本化する。
+#   （numpy/scipy/mediapipe/transformers のバージョン固定・jax回避・衝突対策は
+#     すべてそこに集約。ここに個別 pip を書くと設定がズレて過去のバグが再発する。）
+SETUP_SH="$(dirname "$0")/setup_common.sh"
+if [ -f "$SETUP_SH" ]; then
+    export PYTHON_CMD
+    # shellcheck disable=SC1090
+    . "$SETUP_SH"
+    djvm_setup_python full
+else
+    echo "❌ setup_common.sh が見つかりません（フォルダの中身が欠けています）。"
+    echo "   install.sh からダウンロードし直してください。"
+    read -p "Enterで閉じる..."; exit 1
+fi
 
 # ---- ⑤ 動作検証 ----
 echo "🔍 [5/5] 正しく入ったか確認しています..."

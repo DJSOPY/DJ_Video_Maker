@@ -156,8 +156,8 @@ fi
 # 次回また不整合→再インストール…と、波形一致の曲でも起動が重くなる。
 # tokenizers を transformers 側の要求域にピン留めしておく（faster-whisper と両立）。
 if ! "$PYTHON_CMD" -c "import transformers, torchaudio" &>/dev/null; then
-    "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
-      || "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
+    "$PYTHON_CMD" -m pip install --no-input "numpy<2" "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
+      || "$PYTHON_CMD" -m pip install --no-input "numpy<2" "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
       || echo "   （HuBERT用ライブラリは入りませんでした → MFCC/従来方式で動きます）"
 fi
 # ---- torchcodec（torchaudio 2.9以降は音声の書き出しにこれが必須。無いとDemucsが保存で落ちる）----

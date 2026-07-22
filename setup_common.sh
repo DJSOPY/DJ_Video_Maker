@@ -419,9 +419,14 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
               "llvmlite==0.44.0" "numba==0.61.2" 2>/tmp/djvm_pip.log \
           || "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input "numba<0.62" 2>>/tmp/djvm_pip.log
         # 【グループA】重いC拡張ライブラリ＝完成品(wheel)のみ許可（ビルド地獄を防ぐ）。
-        #   これらは両アーキ×cp310〜cp313で完成品があることを確認済み。
+        #   ★numpy/scipyはバージョン固定が必須。無指定だと scipy 最新(1.18+)が
+        #     numpy>=2.0 を要求して入るが、後段の mediapipe(0.10.21)が numpy<2 を
+        #     要求して numpy を 1.26 に落とすため、scipyが壊れて import 不能になる。
+        #     → 最初から numpy<2 と両立する numpy 1.26.4 / scipy 1.17.1 に固定して、
+        #       mediapipe導入後も衝突しない状態を作る（Intel/Silicon共通）。
+        #   scipy 1.17.1 は numpy>=1.26.4,<2.7 を要求 → 1.26.4 とちょうど両立。
         "$PYTHON_CMD" -m pip install --only-binary=:all: --no-input \
-              numpy scipy librosa 2>>/tmp/djvm_pip.log
+              "numpy==1.26.4" "scipy==1.17.1" librosa 2>>/tmp/djvm_pip.log
         # 【グループB】軽い/純Python寄り＝完成品が無くてもソースでOK（コンパイラ不要か軽微）。
         #   fastdtwは全アーキで新しめの完成品が無いが、ソースで問題なく入る（確認済み）。
         "$PYTHON_CMD" -m pip install --no-input \
@@ -457,9 +462,12 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
         # ★transformers/torchaudio はバージョン固定。固定しないと transformers が
         # 起動のたびに tokenizers を別版へ入れ替え、次回また不整合→再インストール…と
         # 波形一致の曲でも毎回の起動が重くなる。既に入っていれば触らない。
+        # ★"numpy<2" も必ず併記する。これが無いと transformers の依存解決が
+        #   numpy>=1.17 を最新(2.x)で満たそうとし、mediapipe/numba が要求する
+        #   numpy<2 を壊す（実機で numpy 2.5 に飛んで mediapipe が動かなくなった）。
         if ! "$PYTHON_CMD" -c "import transformers, torchaudio" &>/dev/null; then
-            "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
-              || "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
+            "$PYTHON_CMD" -m pip install --no-input "numpy<2" "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
+              || "$PYTHON_CMD" -m pip install --no-input "numpy<2" "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
               || echo "   （HuBERT用ライブラリは入りませんでした → MFCC/従来方式で動きます）"
         fi
         if ! "$PYTHON_CMD" -c "import faster_whisper" &>/dev/null; then
