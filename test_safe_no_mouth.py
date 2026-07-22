@@ -67,6 +67,20 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertIn('if "_pro_context" in Path(out_path).name:', pro_src)
         self.assertIn("Pro区間クリップ生成", pro_src)
 
+    def test_estimated_placement_is_not_masked_by_default(self):
+        # 回帰: 音内容アライン/クロマで配置が確定したプランに clean vocal マスクを
+        # 掛けると、連続配置が細切れになり(実測 6区間→12区間)、末尾ズレの内部伸縮
+        # 補正まで無効化されて元祖版より品質が落ちる。既定では掛けない。
+        self.assertFalse(CORE["STRICT_MASK_FOR_ESTIMATED_PLACEMENT"])
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("if not STRICT_MASK_FOR_ESTIMATED_PLACEMENT:", src)
+        # 根拠が取れない場合の退避(リップシンク→口元なし)は残っていること
+        self.assertIn("クロマでも合わない（{cconf:.2f}）→ リップシンクに切替", src)
+        self.assertIn("safe_no_mouth=True", src)
+        # マスク節より後に末尾ズレ伸縮補正がある(補正が生きる)
+        self.assertLess(src.index("if not STRICT_MASK_FOR_ESTIMATED_PLACEMENT:"),
+                        src.index("伸縮して補正"))
+
     def test_waveform_detection_uses_original_settings(self):
         # 回帰: fail-closed版は match_th 0.72 + 孤立窓補間OFF で一致区間を
         # 意図的に削っていた(実測 94%→84% / 7区間→16区間にフィラー断片)。
@@ -85,8 +99,8 @@ class UnsafePlanTests(unittest.TestCase):
         src = CORE_PATH.read_text(encoding="utf-8")
         self.assertIn("_strict_remix_show = not same_source", src)
         self.assertIn("波形で同一音源と確定 → 波形プランだけで完成させます", src)
-        # 同一音源では Demucs 検証を走らせない(vocal_silence_ranges は None のまま)
-        i_flag = src.index("if same_source:\n        # 同一音源は波形だけで完結")
+        # 既定では Demucs 検証を走らせない(vocal_silence_ranges は None のまま)
+        i_flag = src.index("if not STRICT_MASK_FOR_ESTIMATED_PLACEMENT:")
         i_call = src.index("vocal_sync.clean_vocal_silence_ranges", i_flag)
         i_else = src.index("    else:", i_flag)
         self.assertLess(i_else, i_call)

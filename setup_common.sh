@@ -454,9 +454,12 @@ djvm_setup_python(){    # 引数: full=重いAIライブラリも入れる / lit
               || "$PYTHON_CMD" -m pip install --no-input demucs \
               || echo "   （高精度ライブラリは入りませんでした → 従来方式で動きます）"
         fi
+        # ★transformers/torchaudio はバージョン固定。固定しないと transformers が
+        # 起動のたびに tokenizers を別版へ入れ替え、次回また不整合→再インストール…と
+        # 波形一致の曲でも毎回の起動が重くなる。既に入っていれば触らない。
         if ! "$PYTHON_CMD" -c "import transformers, torchaudio" &>/dev/null; then
-            "$PYTHON_CMD" -m pip install --no-input transformers torchaudio \
-              || "$PYTHON_CMD" -m pip install --no-input transformers torchaudio \
+            "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
+              || "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
               || echo "   （HuBERT用ライブラリは入りませんでした → MFCC/従来方式で動きます）"
         fi
         if ! "$PYTHON_CMD" -c "import faster_whisper" &>/dev/null; then

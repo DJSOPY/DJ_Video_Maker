@@ -151,9 +151,13 @@ if ! "$PYTHON_CMD" -c "import torch, demucs" &>/dev/null; then
       || "$PYTHON_CMD" -m pip install --no-input demucs \
       || echo "   （高精度ライブラリは入りませんでした → 従来方式で動きます）"
 fi
+# HuBERT用（transformers / torchaudio）。★バージョン固定＝毎回の再取得を防ぐ。
+# 固定しないと transformers が起動のたびに tokenizers を別版へ入れ替え、
+# 次回また不整合→再インストール…と、波形一致の曲でも起動が重くなる。
+# tokenizers を transformers 側の要求域にピン留めしておく（faster-whisper と両立）。
 if ! "$PYTHON_CMD" -c "import transformers, torchaudio" &>/dev/null; then
-    "$PYTHON_CMD" -m pip install --no-input transformers torchaudio \
-      || "$PYTHON_CMD" -m pip install --no-input transformers torchaudio \
+    "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
+      || "$PYTHON_CMD" -m pip install --no-input "transformers==4.44.2" "tokenizers>=0.19,<0.20" torchaudio \
       || echo "   （HuBERT用ライブラリは入りませんでした → MFCC/従来方式で動きます）"
 fi
 # ---- torchcodec（torchaudio 2.9以降は音声の書き出しにこれが必須。無いとDemucsが保存で落ちる）----
