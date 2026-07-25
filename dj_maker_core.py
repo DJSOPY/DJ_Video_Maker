@@ -368,6 +368,14 @@ PERFORMANCE_RE = re.compile(r"\b(live|acoustic|unplugged|in concert|concert|tour
 MV_TIER_MIN = 0.6          # この一致以上の候補は「タイトル妥当」→その中で再生数最多を本物MVとする
 MV_MIN_TRUST_VIEWS = 50000 # 早期確定の再生数しきい値。これ未満は再アップ/偽公式疑い→他クエリも探す
 
+# リップシンク前にMVをテンポ補正する最低条件（一直線度）。
+#   「等倍より明確に良い倍率」だけでは、無関係な別曲でもたまたま
+#   等倍0%・別倍率14%のような差が出て、誤った倍率で伸縮してしまう。
+#   最低限これだけは一直線に並んでいること、を条件に加える。
+#   （構成を並べ替えたRemixは7〜8%程度、実際にテンポ違いの同一曲は
+#     28%以上出るので、その間に線を引く）
+TEMPO_ADJUST_MIN_LOCK = 0.20
+
 # 自動選択時、掴んだ候補が「本当にこの曲か」を波形で最終確認する。
 #   タイトル一致＋再生数だけだと別曲（例:「Ayo」→再生数の多い「Loyal」）を
 #   掴むことがあるため、候補音声をオンセット波形照合して一致しなければ次候補へ回す。
@@ -1101,6 +1109,21 @@ def find_best_mv_tempo(video_audio, music_audio, sr=11025, window_sec=SEG_WINDOW
     try:
         ov, cv0, fps = compute_features(video_audio, sr)
         om, cm, _    = compute_features(music_audio, sr)
+        # ★キー（調）のズレを先に打ち消す。
+        #   DJのRemixはキーを上げ下げすることが普通にあり、キーがずれると
+        #   クロマ（メロディの指紋）が回転して同じ曲でも全く一致しなくなる。
+        #   （実測: 1半音ずれるだけで一直線度100%→15%、テンポまで誤検出する）
+        #   ここでMVのクロマを推定ぶん回しておけば、キー違いのRemixでも
+        #   本来のテンポ・対応位置が見つかる。回転は12次元の巡回シフトだけなので
+        #   コストはほぼゼロ。ズレが無ければ0回転＝従来と同じ動作。
+        _k_shift = 0
+        try:
+            _k, _kconf = estimate_semitone_shift(video_audio, music_audio, sr)
+            if _k and _kconf >= 0.05:
+                _k_shift = int(_k)
+                cv0 = np.roll(cv0, _k_shift, axis=0)
+        except Exception:
+            _k_shift = 0
         win = max(8, int(window_sec * fps))
         n_win = max(1, int(cm.shape[1] // win))
         UNIFORM = 1.0 / np.sqrt(12)
@@ -3011,7 +3034,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             #   ここでMVを合わせずに渡すと、19%もテンポが違う映像のままDTWに投げることに
             #   なり、伸縮を吸収しきれず失敗する（実例: Dj Dark Remix ×1.20 を等倍のまま
             #   渡して一致0.46で不採用）。補正してからリップシンクへ渡す。
-            if (abs(best_rate - 1.0) > 0.005 and (lock - lock_1p0) >= 0.10):
+            if (abs(best_rate - 1.0) > 0.005 and (lock - lock_1p0) >= 0.10 and lock >= TEMPO_ADJUST_MIN_LOCK):
                 print(f"  🎚 テンポ差 ×{best_rate:.3f} は明確（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）"
                       f" → MVを補正してからリップシンクします")
                 # 「レコードを速く回した」編集か自動判定（音程も一緒に動いたか）
@@ -3045,7 +3068,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         # lock 0.45〜0.80 は揃いが中途半端＝当て込み不可（後段でリップシンクへ回す）。
         remix_aligned = (lock >= 0.80)
         if (remix_aligned and abs(best_rate - 1.0) > 0.003
-                and (lock - lock_1p0) >= 0.10):
+                and (lock - lock_1p0) >= 0.10 and lock >= TEMPO_ADJUST_MIN_LOCK):
             print(f"  🎚 MVを ×{best_rate:.3f} にテンポ補正して波形を合わせます...")
             # 「レコードを速く回した」編集か自動判定（音程も一緒に動いたか）
             _vs, _sh, _cf = looks_like_varispeed(
@@ -3060,7 +3083,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                 vid_dur = get_duration(video_path) or (vid_dur / best_rate)
                 video_audio = wav_to_array_path(video_path, duration=min(vid_dur, 360))
         elif (not remix_aligned and abs(best_rate - 1.0) > 0.005
-                and (lock - lock_1p0) >= 0.10):
+                and (lock - lock_1p0) >= 0.10 and lock >= TEMPO_ADJUST_MIN_LOCK):
             # 一致率は中間的でも「等倍よりこの倍率の方が明確に揃う」なら、テンポ差は本物。
             # ここでMVを合わせておかないと、19%もテンポが違う映像のまま
             # リップシンクに渡すことになり、DTWが巨大な伸縮を吸収しきれず失敗する

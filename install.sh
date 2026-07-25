@@ -38,6 +38,7 @@ FILES=(
   "これをダブルクリック！.command" "DJ_Video_Maker.command"
   "DJ_Video_Maker_URL.command" "修復_初回からやり直し.command"
   "最初にこれを実行.command" "コマンド集.txt" "かんたん説明書.pdf"
+  "最新版にアップデート.command" "利用ログ設定手順.txt"
 )
 
 echo "📥 ダウンロード中 → $DEST"

@@ -131,6 +131,13 @@ VISUAL_PROOF_MIN_FACE = 0.30
 #     （実測: 0.02秒だと113.9秒隠れるが、1.0秒なら本当の非歌唱66.5秒だけになる）
 #   同じ目的の処理が dj_maker_core 側では 0.8〜1.6秒を使っており、そちらと揃える。
 VOCAL_SILENCE_MIN_SEC = 1.0
+
+# Bロール（口なしカット）の使い回し制限。
+#   直近に使ったカットから最低これだけ離れた位置を選ぶ。
+#   以前は4秒しか離しておらず、避けるリストも8件だけだったため、
+#   隠す区間が多い曲では同じワイドショットが何度も出てループに見えた。
+BROLL_MIN_GAP_SEC = 25.0
+BROLL_AVOID_HISTORY = 40
 SYNC_FIRST = True    # 歌ってる区間は同期最優先（その区間だけ多様化を弱める）
 FORCE_BROLL = True   # 無声区間で歌唱カットしか候補に無い時、非歌唱カットを強制的に当てる
 
@@ -2308,16 +2315,33 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
         max_cost = 1.10 if is_hubert else 1.25
         # 連続する弱一致ブロックの最長尺。無声でblock idが飛ぶと
         # 連続はリセットされる。
+        # ★単発（2秒だけ）の弱一致は測定のブレであることが多い。そこまで隠すと
+        #   映像が細切れになり、口なしカットの使い回しが増えて同じ絵がループする。
+        #   本当に合っていない所は連続して弱くなるので、2ブロック(4秒)以上
+        #   続いた時だけ隠す。単発は音側の判定に委ねる。
+        #   （longest_bad_seconds＝採用判定に使う指標は従来どおり全ブロックで計算）
         longest = 0; cur = 0; prev_bid = None
         block_pairs = report.pop("_block_pairs", [])
+        _bad_run = []          # 連続している弱ブロックのid
         for bid, val in block_pairs:
             if val < min_block:
                 cur = (cur + 1) if (prev_bid is not None and bid == prev_bid + 1) else 1
                 longest = max(longest, cur)
-                report["unsafe_ranges"].append(
-                    (float(bid) * 2.0, (float(bid) + 1.0) * 2.0))
+                if cur == 1:
+                    _bad_run = [bid]
+                else:
+                    _bad_run.append(bid)
+                if len(_bad_run) == 2:
+                    # 2ブロック連続が確定した時点で、さかのぼって両方隠す
+                    for _b in _bad_run:
+                        report["unsafe_ranges"].append(
+                            (float(_b) * 2.0, (float(_b) + 1.0) * 2.0))
+                elif len(_bad_run) > 2:
+                    report["unsafe_ranges"].append(
+                        (float(bid) * 2.0, (float(bid) + 1.0) * 2.0))
             else:
                 cur = 0
+                _bad_run = []
             prev_bid = bid
         report["longest_bad_seconds"] = float(longest * 2.0)
 
@@ -2593,7 +2617,8 @@ def _pick_verified_no_mouth_time(mouth_module, profile, want_dur, mv_dur,
     if not callable(picker):
         return None
     try:
-        value = picker(profile, want_dur, mv_dur, avoid=avoid)
+        value = picker(profile, want_dur, mv_dur, avoid=avoid,
+                       avoid_win=BROLL_MIN_GAP_SEC)
         if value is None:
             return None
         value = float(value)
@@ -3020,8 +3045,9 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
         except Exception:
             _ms = None
     _swap_avoid = []          # 直前に差し替えた先（チカチカ回避）
-    _n_swap = 0
-    _n_safe_background = 0
+    _n_swap = 0            # 口が映らないと認証できたMVカット
+    _n_alt_mv = 0          # 認証できず、MVの別位置で代替した区間
+    _n_safe_background = 0 # 非人物背景（MVが使えない時だけ）
     # 通常の固定間隔に加え、アンカーが別のMV位置へ飛ぶ時刻を
     # 必ずカット境界にする。これが無いと、例えば53.7sのサビ戻りを
     # 52-54sの旧映像で流し、最大2秒遅れて切り替えていた。
@@ -3130,7 +3156,7 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
             if visual_plan == "no_mouth_mv":
                 o_pos = safe_mv_time
                 _swap_avoid.append(safe_mv_time)
-                if len(_swap_avoid) > 8:
+                if len(_swap_avoid) > BROLL_AVOID_HISTORY:
                     _swap_avoid.pop(0)
                 _n_swap += 1
                 _swapped = True
@@ -3142,7 +3168,8 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
                     try:
                         aligned_pos = float(o_pos)
                         span = max(0.1, mv_dur - dur - 0.05)
-                        step = max(3.0, dur * 1.7)
+                        # 近い位置が続くと同じ絵に見えるので、大きめの歩幅で回す
+                        step = max(BROLL_MIN_GAP_SEC, dur * 1.7)
                         t_alt = float((len(_swap_avoid) * step) % span)
                         # ★同期を証明できなかった「その位置そのもの」は出さない。
                         #   （出すと、合っていない口パクを同期のように見せてしまう）
@@ -3152,9 +3179,11 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
                             t_alt = float((t_alt + step) % span)
                         o_pos = t_alt
                         _swap_avoid.append(t_alt)
-                        if len(_swap_avoid) > 8:
+                        if len(_swap_avoid) > BROLL_AVOID_HISTORY:
                             _swap_avoid.pop(0)
-                        _n_swap += 1
+                        # ★これは「口が映らないと認証できたカット」ではない。
+                        #   認証済みと同じ数に混ぜると、ログが実態より安全に見える。
+                        _n_alt_mv += 1
                         _swapped = True
                         _alt_ok = True
                     except (TypeError, ValueError, OverflowError, ZeroDivisionError):
@@ -3213,9 +3242,10 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
     if planned_frames != expected_total_frames:
         print(f"  ❌ 映像フレーム予算が不一致: {planned_frames}/{expected_total_frames}")
         return False
-    if _n_swap > 0 or _n_safe_background > 0:
-        print(f"     👄 口元非表示：全frame認証MV {_n_swap}区間 / "
-              f"安全背景 {_n_safe_background}区間")
+    if _n_swap > 0 or _n_alt_mv > 0 or _n_safe_background > 0:
+        print(f"     👄 口元非表示の内訳：口なし認証カット {_n_swap}区間 / "
+              f"未認証のMV別位置 {_n_alt_mv}区間 / "
+              f"非人物背景 {_n_safe_background}区間")
     with open(listf, "w") as f:
         for s in seg_files:
             f.write(f"file '{s.as_posix()}'\n")

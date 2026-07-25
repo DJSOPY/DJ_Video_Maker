@@ -18,6 +18,55 @@ WORK = CONFIG_DIR / "web_jobs"
 WORK.mkdir(parents=True, exist_ok=True)
 PORT = int(os.environ.get("DJVM_PORT", "8765"))
 
+
+# ============================================================
+#  終了時に作業データ(web_jobs)を自動削除する
+#    完成した動画は各自ミュージック等へ移して管理する運用のため、
+#    ここに置きっぱなしの100MB級ファイルが延々と溜まるのを防ぐ。
+#    ターミナルのタブを閉じる(SIGHUP)、Ctrl+C(SIGINT)、kill(SIGTERM)、
+#    通常終了のいずれでも消えるようにする。
+#    ※残したい場合は ~/.dj_video_maker/keep_web_jobs という空ファイルを置く。
+# ============================================================
+import atexit, shutil, signal
+
+_KEEP_FLAG = CONFIG_DIR / "keep_web_jobs"
+_cleaned = False
+
+
+def _cleanup_web_jobs():
+    """web_jobs配下のジョブフォルダを削除する（何度呼ばれても安全）。"""
+    global _cleaned
+    if _cleaned:
+        return
+    _cleaned = True
+    if _KEEP_FLAG.exists():
+        return
+    try:
+        for p in WORK.iterdir():
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except (OSError, Exception):
+        pass
+
+
+def _cleanup_and_exit(signum, frame):
+    _cleanup_web_jobs()
+    # 既定の終了コードで抜ける（atexitも走るが二重実行は防止済み）
+    os._exit(0)
+
+
+atexit.register(_cleanup_web_jobs)
+for _sig in ("SIGHUP", "SIGTERM", "SIGINT"):
+    try:
+        signal.signal(getattr(signal, _sig), _cleanup_and_exit)
+    except (AttributeError, ValueError, OSError):
+        pass
+
 # Cookie設定を事前に用意（無いと起動時に「どのブラウザ？」で止まるため）
 def normalize_youtube_url(url):
     """YouTube URLから動画IDだけを抽出しクリーンな単一動画URLにする。再生リスト等を除去。"""
@@ -331,6 +380,9 @@ def main():
     with httpd:
         print(f"✅ DJ Video Maker Web はこちら → http://127.0.0.1:{PORT}")
         print("   （このウィンドウは開いたままにしてください。閉じると終了します）")
+        print("   ⚠️ 終了すると、作った動画の一時保存先(out)は自動で削除されます。")
+        print("      残したい動画は、完成後に「保存先フォルダを開く」から")
+        print("      ミュージック等へ移してから閉じてください。")
         try: httpd.serve_forever()
         except KeyboardInterrupt: pass
 

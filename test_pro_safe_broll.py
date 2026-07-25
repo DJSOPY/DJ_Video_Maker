@@ -603,6 +603,20 @@ class LowFaceRateVisualProofTests(unittest.TestCase):
                         {"face_rate": "x"}):
             self.assertTrue(lipsync_pro._visual_proof_applicable(profile), profile)
 
+    def test_isolated_weak_block_is_not_hidden(self):
+        """単発（2秒だけ）の弱一致は隠さない。
+
+        測定のブレで1ブロックだけ弱くなることは多く、そこまで隠すと映像が
+        細切れになり、口なしカットの使い回しが増えて同じ絵がループする。
+        本当に合っていない所は連続して弱くなるので、2ブロック(4秒)以上
+        続いた時だけ隠す。
+        """
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        self.assertIn("if len(_bad_run) == 2:", src)
+        self.assertIn("elif len(_bad_run) > 2:", src)
+        # 採用判定に使う longest_bad_seconds は従来どおり全ブロックで計算
+        self.assertIn('report["longest_bad_seconds"] = float(longest * 2.0)', src)
+
     def test_conflict_gate_applied_to_unsafe_ranges(self):
         """顔が取れないMVでは「口の矛盾」判定自体をスキップすること。
 

@@ -113,7 +113,7 @@ find "$DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
 #   ・止めたい人は、同じフォルダに「.no_usagelog」を置けば送信しない
 # ★DJVM_LOG_URL に、Google Apps Script で発行した「ウェブアプリのURL」を貼ってください。
 #   （手順は同梱の「利用ログ設定手順.txt」を参照。空のままなら送信機能はオフ。）
-DJVM_LOG_URL=""
+DJVM_LOG_URL="https://script.google.com/macros/s/AKfycbx_AEyDq4eAabliKv15_cVsKis7CzgpS3SSR8SO4rm2N_qcsTMi4SOFBWbad23mEWM4/exec"
 if [ -n "$DJVM_LOG_URL" ] && [ ! -f "$DIR/.no_usagelog" ]; then
     _u="$(id -un 2>/dev/null)"
     _host="$(scutil --get ComputerName 2>/dev/null || hostname 2>/dev/null)"

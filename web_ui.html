@@ -745,6 +745,12 @@ go.addEventListener('click',async()=>{
           try{ await fetch('/reveal?job='+job); }catch(e){}
         });
         doneEl.appendChild(rev);
+        // 終了時に自動削除されるので、残すなら移動してもらう
+        const note=document.createElement('div');
+        note.className='failtip';
+        note.textContent='※ ターミナルのウィンドウを閉じると、ここの動画は削除されます。'
+          +'残すものはミュージック等へ移してから閉じてください。';
+        doneEl.appendChild(note);
       }else{
         const d=document.createElement('div'); d.className='dl'; d.style.borderLeftColor='var(--hot)';
         d.innerHTML='<span>完成ファイルが見つかりませんでした。ログを確認してください。</span>';

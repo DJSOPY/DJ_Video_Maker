@@ -1,0 +1,152 @@
+============================================================
+ DJ Video Maker — 利用ログ（誰がいつ使ったか）設定手順
+============================================================
+
+これは「配った仲間が、最後にいつ・何回 DJ Video Maker を使ったか」を
+あなた（DJ SOPY）が Google スプレッドシートで見られるようにする設定です。
+
+やることは大きく3ステップ：
+  1. スプレッドシートを作る
+  2. 受信スクリプト（Apps Script）を貼って「ウェブアプリ」として公開する
+  3. 発行されたURLを「これをダブルクリック！.command」に貼る
+
+所要 10分ほど。プログラミングの知識は要りません。指示どおり貼るだけです。
+
+------------------------------------------------------------
+ ステップ1：スプレッドシートを作る
+------------------------------------------------------------
+1) https://sheets.google.com を開く（自分のGoogleアカウントで）
+2) 「空白のスプレッドシート」を新規作成
+3) 名前を「DJ Video Maker 利用ログ」などに変更（何でもよい）
+   → このシートはあなただけが見られます。仲間には共有しません。
+
+------------------------------------------------------------
+ ステップ2：受信スクリプトを貼って公開する
+------------------------------------------------------------
+1) スプレッドシートのメニュー「拡張機能」→「Apps Script」を開く
+2) 最初から入っているコード（function myFunction… ）を全部消す
+3) 下の「==== ここから ====」〜「==== ここまで ====」の中身を
+   まるごとコピーして貼り付ける
+4) 上部の「💾 保存」（フロッピーのアイコン）を押す
+5) 右上の「デプロイ」→「新しいデプロイ」を押す
+6) 歯車⚙「種類の選択」→「ウェブアプリ」を選ぶ
+7) 設定を次のようにする：
+     ・説明：任意（例「DJVM log」）
+     ・次のユーザーとして実行：自分
+     ・アクセスできるユーザー：「全員」
+       ※ここを「全員」にしないと、仲間のMacから記録を送れません。
+         送られてくるのは名前・日時・バージョンだけで、
+         あなたのシートは誰にも見られません（書き込み専用の入口です）。
+8) 「デプロイ」を押す
+9) 初回は「アクセスを承認」を求められる：
+     承認 → 自分のGoogleアカウントを選ぶ →
+     「このアプリは確認されていません」と出たら
+     「詳細」→「（プロジェクト名）に移動」→「許可」
+     ※これは自分で作ったスクリプトなので安全です。
+10) 完了すると「ウェブアプリ」のURLが表示される：
+      https://script.google.com/macros/s/........./exec
+    この URL をコピー（これがログの送信先）。
+
+------------------------------------------------------------
+ ステップ3：URLを「これをダブルクリック！.command」に貼る
+------------------------------------------------------------
+1) 「これをダブルクリック！.command」をテキストエディタで開く
+   （フォルダ内のファイルを右クリック →「このアプリケーションで開く」→
+     「テキストエディット」）
+2) 下の行を探す（上のほう、300行目あたり）：
+
+       DJVM_LOG_URL=""
+
+3) ダブルクオートの中に、さっきコピーしたURLを貼る：
+
+       DJVM_LOG_URL="https://script.google.com/macros/s/......../exec"
+
+4) 保存して閉じる。
+5) この「これをダブルクリック！.command」を GitHub に上げれば、
+   以降このバージョンを使う全員の起動が、あなたのシートに記録されます。
+
+これで完成です。誰かが起動するたび、シートに1行ずつ
+「日時・ユーザー名・端末名・OS・バージョン」が追記され、
+2枚目のシート「集計」に「人ごとの最終利用・累計回数」が自動でまとまります。
+
+
+============================================================
+ ↓↓↓ Apps Script に貼るコード（ここから） ↓↓↓
+============================================================
+function doGet(e) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    // 生ログ（1起動＝1行）
+    var raw = ss.getSheetByName('log');
+    if (!raw) {
+      raw = ss.insertSheet('log');
+      raw.appendRow(['日時', 'ユーザー名', '端末名', 'OS', 'バージョン']);
+    }
+    var p = (e && e.parameter) ? e.parameter : {};
+    var ts   = p.ts   || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+    var user = p.user || '(unknown)';
+    var host = p.host || '';
+    var os   = p.os   || '';
+    var ver  = p.ver  || '';
+    raw.appendRow([ts, user, host, os, ver]);
+
+    // 集計（人ごとに最終利用・累計回数・最新バージョン）
+    rebuildSummary(ss);
+
+    return ContentService.createTextOutput('ok');
+  } catch (err) {
+    return ContentService.createTextOutput('err');
+  }
+}
+
+function rebuildSummary(ss) {
+  var raw = ss.getSheetByName('log');
+  if (!raw) return;
+  var data = raw.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  var byUser = {};  // user -> {last, count, ver, host}
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var ts = row[0], user = row[1], host = row[2], os = row[3], ver = row[4];
+    if (!user) continue;
+    if (!byUser[user]) byUser[user] = { last: ts, count: 0, ver: ver, host: host };
+    byUser[user].count += 1;
+    if (String(ts) >= String(byUser[user].last)) {  // 文字列日時は yyyy-MM-dd で比較可
+      byUser[user].last = ts;
+      byUser[user].ver  = ver;
+      byUser[user].host = host;
+    }
+  }
+
+  var sum = ss.getSheetByName('集計');
+  if (!sum) sum = ss.insertSheet('集計');
+  sum.clear();
+  sum.appendRow(['ユーザー名', '端末名', '最終利用', '累計回数', 'バージョン']);
+  var users = Object.keys(byUser).sort(function (a, b) {
+    return String(byUser[b].last).localeCompare(String(byUser[a].last)); // 最近使った人が上
+  });
+  users.forEach(function (u) {
+    var r = byUser[u];
+    sum.appendRow([u, r.host, r.last, r.count, r.ver]);
+  });
+}
+============================================================
+ ↑↑↑ Apps Script に貼るコード（ここまで） ↑↑↑
+============================================================
+
+
+------------------------------------------------------------
+ 補足
+------------------------------------------------------------
+・送られる情報は「ユーザー名・端末名・OS・バージョン・日時」だけ。
+  作った曲や音源、YouTubeのURLなどは一切送りません。
+・仲間には「使用状況（最終利用と回数）が僕に届くようにしてある」と
+  一言伝えておくのが安全＆フェアです（隠すとトラブルの元）。
+・送信を止めたい人は、フォルダに空ファイル「.no_usagelog」を
+  置けばオフになります。
+・「バージョン」は本体コードの行数を目安に使っています。更新のたびに
+  数字が変わるので「この人は古い版のまま」がひと目で分かります。
+・後からURLを変えたい／集計を作り直したい場合は、Apps Scriptの
+  デプロイをやり直せばOKです。
