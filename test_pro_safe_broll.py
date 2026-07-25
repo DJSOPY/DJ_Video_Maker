@@ -638,3 +638,49 @@ class LowFaceRateVisualProofTests(unittest.TestCase):
         src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
         self.assertIn("max(silent_conflicts, singing_conflicts) >= 2", src)
 
+    def test_alt_mv_position_never_saturates_into_one_spot(self):
+        """代替MV位置の数え上げに、頭打ちする履歴の長さを使わないこと。
+
+        実例: 代替位置は `t_alt = (len(_swap_avoid) * step) % span` で決めていたが、
+        _swap_avoid は BROLL_AVOID_HISTORY(40) を超えると先頭を捨てる履歴なので
+        長さが40で頭打ちになる。結果、41区間目以降は毎回まったく同じ値になり、
+        I Just Might（顔検出13%・代替90区間）では50区間が MV122.8s の一点に集中して
+        同じ2秒カットが50回繰り返され、映像がループして見えた。
+        """
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        # 頭打ちする履歴長をカウンターに使っていないこと
+        self.assertNotIn("(len(_swap_avoid) * step)", src)
+        # 独立した通し番号を持ち、選ぶたびに進めていること
+        self.assertIn("_alt_seq = 0", src)
+        self.assertIn("_alt_seq += 1", src)
+        self.assertGreaterEqual(src.count("_alt_seq += 1"), 2)  # 初回＋再試行
+
+    def test_alt_mv_positions_stay_spread_over_the_whole_mv(self):
+        """代替位置が周期を作らず、MV全体へ散ること（実際に列を生成して検証）。"""
+        phi = lipsync_pro._ALT_MV_PHI
+        span, dur, aligned_pos = 175.45, 2.0, 60.0
+        near = min(lipsync_pro.BROLL_MIN_GAP_SEC, span / 3.0)
+        avoid, picks, seq = [], [], 0
+        for _ in range(90):
+            seq += 1
+            t = (seq * phi % 1.0) * span
+            for _ in range(8):
+                if (abs(t - aligned_pos) >= max(1.0, dur)
+                        and all(abs(t - p) >= near for p in avoid[-3:])):
+                    break
+                seq += 1
+                t = (seq * phi % 1.0) * span
+            picks.append(t)
+            avoid.append(t)
+            if len(avoid) > lipsync_pro.BROLL_AVOID_HISTORY:
+                avoid.pop(0)
+
+        # 同じ位置（0.5秒以内）が何度も使い回されないこと
+        worst = max(sum(1 for q in picks if abs(p - q) < 0.5) for p in picks)
+        self.assertLessEqual(worst, 2, f"同じ位置が{worst}回使われている")
+        # MV全体に散っていること（前半・後半どちらにも十分な数が入る）
+        self.assertGreater(sum(1 for p in picks if p < span / 2), 20)
+        self.assertGreater(sum(1 for p in picks if p >= span / 2), 20)
+        # 同期位置そのものは出さない（合っていない口パクを同期に見せないため）
+        self.assertTrue(all(abs(p - aligned_pos) >= max(1.0, dur) for p in picks))
+

@@ -213,8 +213,22 @@ class UnsafePlanTests(unittest.TestCase):
         i_call = src.index("vocal_sync.clean_vocal_silence_ranges", i_flag)
         i_else = src.index("    else:", i_flag)
         self.assertLess(i_else, i_call)
-        # その結果、局所Proにも回らない(is_rmx_for_hybrid が False になる)
-        self.assertIn("is_rmx_for_hybrid = (vocal_silence_ranges is not None)", src)
+        # ★以前はここで「is_rmx_for_hybrid が vocal_silence_ranges 由来＝常にFalse」
+        #   であることを固定していた。しかしそれは STRICT_MASK を既定Falseにした
+        #   副作用で局所Pro経路が死んでいただけで、意図した仕様ではない
+        #   （STRICT_MASKを切った理由は「clean vocalマスクが配置を細切れにするから」で、
+        #     局所Proとは無関係。局所Pro側のコメントは同一音源Remixでの発動を明示している）。
+        #   守るべき本来の性質は「原曲/Editは波形だけで完成する」なので、そちらを検証する。
+        self.assertIn("is_rmx_for_hybrid = is_rmx_measured", src)
+        # Remixでない曲は、same_sourceでも局所Proに回らないこと
+        self.assertFalse(CORE["_should_use_pro_for_weak_segment"](
+            10.0, 60.0, 200.0, is_remix=False, same_source=True))
+        # Remixかつsame_sourceで、後半の長い弱区間だけが対象になること
+        self.assertTrue(CORE["_should_use_pro_for_weak_segment"](
+            100.0, 140.0, 200.0, is_remix=True, same_source=True))
+        # 短い弱区間（無声/つなぎ）は従来どおりフィラーのまま
+        self.assertFalse(CORE["_should_use_pro_for_weak_segment"](
+            100.0, 103.0, 200.0, is_remix=True, same_source=True))
 
     def test_identity_plan_masks_only_sustained_vocal_silence(self):
         # 回帰: min_silence=0.02 は息継ぎ(0.2〜0.5秒)を全部隠して波形プランを

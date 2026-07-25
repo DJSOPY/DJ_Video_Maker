@@ -138,6 +138,8 @@ VOCAL_SILENCE_MIN_SEC = 1.0
 #   隠す区間が多い曲では同じワイドショットが何度も出てループに見えた。
 BROLL_MIN_GAP_SEC = 25.0
 BROLL_AVOID_HISTORY = 40
+# 代替MV位置を散らすための黄金比（低食い違い列＝どこまで進めても周期が出ない）
+_ALT_MV_PHI = 0.6180339887498949
 SYNC_FIRST = True    # 歌ってる区間は同期最優先（その区間だけ多様化を弱める）
 FORCE_BROLL = True   # 無声区間で歌唱カットしか候補に無い時、非歌唱カットを強制的に当てる
 
@@ -3047,6 +3049,7 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
     _swap_avoid = []          # 直前に差し替えた先（チカチカ回避）
     _n_swap = 0            # 口が映らないと認証できたMVカット
     _n_alt_mv = 0          # 認証できず、MVの別位置で代替した区間
+    _alt_seq = 0           # 代替位置の通し番号（履歴長と違い頭打ちしない）
     _n_safe_background = 0 # 非人物背景（MVが使えない時だけ）
     # 通常の固定間隔に加え、アンカーが別のMV位置へ飛ぶ時刻を
     # 必ずカット境界にする。これが無いと、例えば53.7sのサビ戻りを
@@ -3168,15 +3171,28 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
                     try:
                         aligned_pos = float(o_pos)
                         span = max(0.1, mv_dur - dur - 0.05)
-                        # 近い位置が続くと同じ絵に見えるので、大きめの歩幅で回す
-                        step = max(BROLL_MIN_GAP_SEC, dur * 1.7)
-                        t_alt = float((len(_swap_avoid) * step) % span)
+                        # ★len(_swap_avoid) を数え上げに使ってはいけない。
+                        #   _swap_avoid は BROLL_AVOID_HISTORY(40) で先頭を捨てる
+                        #   履歴なので長さが40で頭打ちになり、41区間目以降は毎回
+                        #   まったく同じ位置が選ばれていた。
+                        #   実測（I Just Might / 顔検出13%・代替90区間）:
+                        #     41〜90区間の50区間が全て MV122.8s の一点に集中し、
+                        #     同じ2秒カットが50回繰り返されてループに見えていた。
+                        #   頭打ちしない通し番号＋黄金比の低食い違い列にして、
+                        #   MV全体へ均等に散らす（周期が生じない）。
+                        _alt_seq += 1
+                        t_alt = float((_alt_seq * _ALT_MV_PHI % 1.0) * span)
                         # ★同期を証明できなかった「その位置そのもの」は出さない。
                         #   （出すと、合っていない口パクを同期のように見せてしまう）
-                        for _ in range(4):
-                            if abs(t_alt - aligned_pos) >= max(1.0, dur):
+                        # 直近で使った位置に近すぎる場合も避ける（同じ絵の連続防止）。
+                        _near = min(BROLL_MIN_GAP_SEC, span / 3.0)
+                        for _ in range(8):
+                            if (abs(t_alt - aligned_pos) >= max(1.0, dur)
+                                    and all(abs(t_alt - p) >= _near
+                                            for p in _swap_avoid[-3:])):
                                 break
-                            t_alt = float((t_alt + step) % span)
+                            _alt_seq += 1
+                            t_alt = float((_alt_seq * _ALT_MV_PHI % 1.0) * span)
                         o_pos = t_alt
                         _swap_avoid.append(t_alt)
                         if len(_swap_avoid) > BROLL_AVOID_HISTORY:

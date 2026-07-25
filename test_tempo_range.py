@@ -138,6 +138,61 @@ class TempoSearchRangeTests(unittest.TestCase):
         self.assertIn("asetrate=44100*", src)
         self.assertIn("varispeed=_vs", src)
 
+    def test_tempo_search_runs_for_every_track(self):
+        """テンポ探索をファイル名で門前払いしないこと。
+
+        以前は `if _is_remix_word and not is_quasi_original:` がテンポ探索
+        そのものを囲っていたため、Club Mix / Extended Mix / Sped Up /
+        Nightcore / Slowed / 表記なしRemix が丸ごと対象外だった。
+        テンポ差が最大になる種類（Sped Up・Nightcore・Slowed）がまさに
+        ここに入るので、取りこぼしの実害が大きい。
+        """
+        src = CORE_PATH.read_text(encoding="utf-8")
+        # 名前でテンポ探索を囲っていないこと
+        self.assertNotIn(
+            "if _is_remix_word and not is_quasi_original:\n"
+            "        best_rate, lock, lock_1p0 = find_best_mv_tempo", src)
+        # 探索は無条件（インデント4＝関数直下）で走ること
+        self.assertIn(
+            "\n    best_rate, lock, lock_1p0 = find_best_mv_tempo("
+            "video_audio, music_audio)", src)
+        # 名前はヒント、判断の主は実測であること
+        self.assertIn("_name_says_remix", src)
+        self.assertIn("_tempo_evidence", src)
+        self.assertIn("is_rmx_measured = bool(_name_says_remix or _tempo_evidence)", src)
+
+    def test_name_is_only_a_hint_not_a_gate(self):
+        """名前に表記が無くても実測でテンポ差があればRemixとして扱うこと。"""
+        def decide(name_says_remix, rate, lock, lock_1p0):
+            ev = (abs(rate - 1.0) > 0.005
+                  and (lock - lock_1p0) >= 0.10
+                  and lock >= 0.20)
+            return bool(name_says_remix or ev)
+
+        # 名前に表記なし＋実測でテンポ差 → 拾えるようになった（以前は取りこぼし）
+        self.assertTrue(decide(False, 1.25, 0.80, 0.13))   # Sped Up
+        self.assertTrue(decide(False, 0.85, 1.00, 0.13))   # Slowed
+        # 同一音源は等倍と差が出ないので、従来どおり通常経路のまま
+        self.assertFalse(decide(False, 1.000, 1.00, 1.00))  # 原曲
+        self.assertFalse(decide(False, 1.000, 0.67, 0.67))  # キーのみ変更
+        # 既存の成功例は経路が変わらないこと（実ログの数値）
+        self.assertTrue(decide(True, 1.050, 0.09, 0.03))   # Cake by the Ocean
+        self.assertTrue(decide(True, 1.200, 0.28, 0.00))   # I Just Might
+
+    def test_hybrid_pro_is_not_gated_by_a_dead_proxy(self):
+        """局所Pro同期の発動条件に、既定で常にNoneの値を使わないこと。
+
+        以前は `is_rmx_for_hybrid = (vocal_silence_ranges is not None)` だった。
+        vocal_silence_ranges は STRICT_MASK_FOR_ESTIMATED_PLACEMENT(既定False)
+        の時しか埋まらないため常にNone＝この経路は既定設定で一度も動かない
+        死にコードだった。
+        """
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("is_rmx_for_hybrid = (vocal_silence_ranges is not None)", src)
+        self.assertIn("is_rmx_for_hybrid = is_rmx_measured", src)
+        # 前提（既定False）が変わったらこのテストごと見直すため、値を固定で確認
+        self.assertIn("STRICT_MASK_FOR_ESTIMATED_PLACEMENT = False", src)
+
 
 if __name__ == "__main__":
     unittest.main()

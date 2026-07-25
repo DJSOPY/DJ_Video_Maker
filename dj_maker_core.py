@@ -3023,9 +3023,24 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # 波形を色々な倍率で試して「一番一直線に揃う倍率」を探し、合えばMVを補正して等速で乗せる。
     remix_aligned = False  # リミックスで拍が一直線に揃った（＝MV全体を当てて流せる）
     remix_lipsync_attempted = False
-    if _is_remix_word and not is_quasi_original:
-        best_rate, lock, lock_1p0 = find_best_mv_tempo(video_audio, music_audio)
-        print(f"  🎚 テンポ探索: 最良 ×{best_rate:.3f}（一直線度 {lock*100:.0f}% / 等倍は {lock_1p0*100:.0f}%）")
+    # ★テンポ探索はファイル名に関係なく全曲で走らせる。
+    #   以前は名前に remix/bootleg/rmx 等がある時だけ探索しており、
+    #   Club Mix / Extended Mix / Sped Up / Nightcore / Slowed / 表記なしRemix を
+    #   丸ごと取りこぼしていた（テンポ差が最も大きい種類がまさにここ）。
+    #   名前は「ヒント」に格下げし、実測を判断の主にする。
+    #   同一音源なら best_rate≈1.000 で等倍と同じ一直線度になり、
+    #   「等倍より0.10以上良い」条件を満たさないので原曲/Editの挙動は変わらない。
+    _name_says_remix = bool(_is_remix_word and not is_quasi_original)
+    best_rate, lock, lock_1p0 = find_best_mv_tempo(video_audio, music_audio)
+    print(f"  🎚 テンポ探索: 最良 ×{best_rate:.3f}（一直線度 {lock*100:.0f}% / 等倍は {lock_1p0*100:.0f}%）")
+    _tempo_evidence = bool(abs(best_rate - 1.0) > 0.005
+                           and (lock - lock_1p0) >= 0.10
+                           and lock >= TEMPO_ADJUST_MIN_LOCK)
+    if _tempo_evidence and not _name_says_remix:
+        print(f"  🔎 名前に表記はありませんが、テンポ差 ×{best_rate:.3f} を実測"
+              f"（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）→ 別テンポ音源として扱います")
+    is_rmx_measured = bool(_name_says_remix or _tempo_evidence)
+    if is_rmx_measured:
         if lock < 0.45:
             print(f"  ⚠️ どのテンポでも波形が一直線に揃わない（別アレンジ）→ リップシンクに切替")
             # ★波形が一直線に揃わなくても、テンポ比そのものは信用できることが多い。
@@ -3173,7 +3188,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         cmatch = (sum(e - s for s, e, mv in cseg_plan if mv is not None) / music_dur) if music_dur > 0 else 0.0
         cn = sum(1 for s, e, mv in cseg_plan if mv is not None)
         chroma_ok = (cn > 0 and cconf >= 0.50 and cmatch >= 0.40)
-        is_rmx = bool(_is_remix_word and not is_quasi_original)
+        is_rmx = is_rmx_measured
 
         if chroma_ok and cuniq >= 0.12:
             # メロディが一意に合う（別マスターでも素直に対応）→ そのまま採用（令和ver等）
@@ -3283,7 +3298,11 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
 
     # 「前半の強一致だけでsame_source=True」の場合でも、Noneを
     # 一律にMVループへ逃がさない。Remix後半の長い弱区間だけ局所Pro候補にする。
-    is_rmx_for_hybrid = (vocal_silence_ranges is not None)
+    # ★以前はここで「vocal_silence_ranges が None でないか」を代理に使っていた。
+    #   この値は STRICT_MASK_FOR_ESTIMATED_PLACEMENT(既定False) の時しか
+    #   埋まらないので既定では常にNone＝この経路は一度も動かない死にコードだった。
+    #   Remix判定の代理としても意味を持たない値なので、実測ベースの判定を渡す。
+    is_rmx_for_hybrid = is_rmx_measured
     hybrid_pro_segments = {
         i for i, (s, e, mv) in enumerate(seg_plan)
         if mv is None and _should_use_pro_for_weak_segment(
