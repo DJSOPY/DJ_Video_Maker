@@ -2114,7 +2114,8 @@ def _sustained_inactive_ranges(rmx_act, lo, hi, min_silence=0.02,
 
 def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
                              rvoc=None, ovoc=None, sr=SR, rmx_act=None,
-                             feature_kind="hubert", mouth_profile=None):
+                             feature_kind="hubert", mouth_profile=None,
+                             eval_window=None):
     """最終アンカーが「強い一致」を持つかを絶対値で検査。
 
     Viterbi内部の0..1正規化は、全候補が悪い別曲でも必ず
@@ -2149,6 +2150,28 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
         range_tol = max(0.10, 2.0 * float(np.median(np.diff(ot))))
         all_valid = ((all_mapped >= float(ot[0]) - range_tol)
                      & (all_mapped <= float(ot[-1]) + range_tol))
+        # ★評価区間(eval_window)が指定されていれば、その範囲だけでカバー率を測る。
+        #   Extended版（曲がMVより長い）は、足したイントロ/アウトロに対応するMVが
+        #   そもそも存在しないため、曲全体では98%カバーが原理的に達成できず、
+        #   中盤の口パクがどれだけ良くても必ず不採用になっていた。
+        #   「前後の余りは重複でよい・中盤が合っていることが大事」という実運用に
+        #   合わせ、MVと対応し得る中盤区間だけを判定対象にする。
+        _eval_mask = None
+        if eval_window is not None:
+            try:
+                _ws, _we = float(eval_window[0]), float(eval_window[1])
+                if np.isfinite(_ws) and np.isfinite(_we) and _we > _ws:
+                    _times_all = rt[all_ridx]
+                    _m = (_times_all >= _ws - 1e-9) & (_times_all <= _we + 1e-9)
+                    # 中盤が極端に短い（曲の2割未満）場合は全体で評価（誤緩和の防止）
+                    if np.any(_m) and float(np.mean(_m)) >= 0.20:
+                        _eval_mask = _m
+            except (TypeError, ValueError, IndexError, OverflowError):
+                _eval_mask = None
+        if _eval_mask is not None:
+            all_ridx = all_ridx[_eval_mask]
+            all_mapped = all_mapped[_eval_mask]
+            all_valid = all_valid[_eval_mask]
         report["coverage"] = float(np.mean(all_valid)) if len(all_valid) else 0.0
 
         if len(all_ridx):
@@ -3539,9 +3562,24 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
             print(f"     🎯 ズレ補正 {manual_offset_ms:+d}ms を最終的に全体適用")
 
         # --- 最終採用ゲート：「全候補が悪い中の相対ベスト」を成功扱いしない ---
+        # Extended等でMVが足りず3分割した場合は、MVと対応し得る中盤区間だけで
+        # カバー率を評価する（足したイントロ/アウトロは対応MVが存在しないため、
+        # 曲全体では98%カバーが原理的に不可能で、中盤が良くても必ず落ちていた）。
+        _eval_win = None
+        try:
+            if split:
+                _ie, _os = float(split[0]), float(split[1])
+                if _os > _ie:
+                    _eval_win = (_ie, _os)
+        except (TypeError, ValueError, IndexError):
+            _eval_win = None
         q = alignment_quality_report(
             anchors, windows, rfeat, rt, ofeat, ot, rvoc=rvoc, ovoc=ovoc, sr=SR,
-            rmx_act=rmx_act, feature_kind=fn, mouth_profile=mouth_profile)
+            rmx_act=rmx_act, feature_kind=fn, mouth_profile=mouth_profile,
+            eval_window=_eval_win)
+        if _eval_win:
+            print(f"     ℹ️ MV不足のため、中盤 {_eval_win[0]:.0f}〜{_eval_win[1]:.0f}秒"
+                  f"（MVと対応し得る範囲）で品質を判定します")
         print("     📊 Pro同期品質: "
               f"カバー{q['coverage']*100:.0f}% (末尾{q['tail_coverage']*100:.0f}%/"
               f"連続範囲外{q['longest_invalid_seconds']:.1f}s) / "

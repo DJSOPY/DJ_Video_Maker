@@ -525,3 +525,39 @@ class WhisperFinalRefixComparedNotForcedTests(unittest.TestCase):
         self.assertEqual(decide(0.30, 0.45, 0.3), "whisper")  # 改善→採用
         self.assertEqual(decide(None, 0.4, 0.3), "whisper")   # 測定不能→従来
 
+
+class ExtendedCoverageWindowTests(unittest.TestCase):
+    """Extended版（曲がMVより長い）でも中盤の口パクを採用できること。
+
+    足したイントロ/アウトロには対応するMVが存在しないため、曲全体では
+    カバー98%が原理的に達成できず、中盤がどれだけ合っていても不採用に
+    なっていた。MVと対応し得る中盤区間だけで判定するようにした。
+    """
+
+    @staticmethod
+    def _report(eval_window):
+        sr = 50.0
+        rt = np.arange(0, 216.5, 1 / sr)      # 曲216.5秒
+        ot = np.arange(0, 177.5, 1 / sr)      # MV177.5秒（テンポ補正後）
+        rfeat = np.zeros((len(rt), 8), dtype=np.float32)
+        ofeat = np.zeros((len(ot), 8), dtype=np.float32)
+        # 中盤31〜184秒だけMVに対応（前後は範囲外へ写像される）
+        anchors = [[31.0, 0.0, 1.0], [184.0, 153.0, 1.0]]
+        return lipsync_pro.alignment_quality_report(
+            anchors, [], rfeat, rt, ofeat, ot, eval_window=eval_window)
+
+    def test_middle_window_reaches_full_coverage(self):
+        q = self._report((31.0, 184.0))
+        self.assertGreaterEqual(q["coverage"], 0.98)
+        self.assertGreaterEqual(q["tail_coverage"], 0.98)
+
+    def test_whole_song_would_fail_without_window(self):
+        # 修正前の挙動（全体評価）ではカバーが足りず落ちていたこと
+        q = self._report(None)
+        self.assertLess(q["coverage"], 0.98)
+
+    def test_window_ignored_when_too_short(self):
+        # 中盤が極端に短い指定は無視して全体評価（判定の誤緩和を防ぐ）
+        q = self._report((100.0, 110.0))
+        self.assertLess(q["coverage"], 0.98)
+
