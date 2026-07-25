@@ -294,7 +294,7 @@ class WaveformFirstOrderTests(unittest.TestCase):
     def test_stage2_fine_adjustments_are_inside_waveform_path(self):
         # 微調整: テンポ補正MV・波形オフセット精密化・末尾ズレの内部伸縮
         i_wf = self._idx("波形ファースト：edit / Remix / 原曲すべて、まず波形でMVに合わせる")
-        i_tempo_adj = self._idx("make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)")
+        i_tempo_adj = self._idx("make_tempo_adjusted_mv(video_path, best_rate, tmp_dir,")
         i_stretch = self._idx("内部で×{r:.3f} 伸縮して補正")
         self.assertLess(i_wf, i_tempo_adj)
         self.assertLess(i_wf, i_stretch)

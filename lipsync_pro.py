@@ -115,6 +115,13 @@ VOC_HOP = 0.05       # 声エネルギー包絡の時間解像度（秒）
 #   両方Falseにすると、従来どおり必ず非人物背景（紫）へ送る最厳格モードに戻る。
 ALLOW_REAL_MV_SAFE_BROLL = True
 SAFE_BG_USE_MV_INSTEAD = True
+
+# 口元の視覚証明を必須にする下限の顔検出率。
+#   これ未満のMV（暗い/横顔/引き/ブラーが多く mediapipe が顔を拾えない）は、
+#   「証明できない」＝「ズレている」ではなく「判定不能」として扱い、
+#   音側(HuBERT/DTW/発音類似)の品質ゲートの判断に委ねて人物を表示する。
+#   明確な矛盾（歌ってないのに口が動く等）は conflicts 判定で引き続き弾く。
+VISUAL_PROOF_MIN_FACE = 0.30
 SYNC_FIRST = True    # 歌ってる区間は同期最優先（その区間だけ多様化を弱める）
 FORCE_BROLL = True   # 無声区間で歌唱カットしか候補に無い時、非歌唱カットを強制的に当てる
 
@@ -2866,6 +2873,32 @@ def _equal_timeline_mapping(anchors, cut_times, music_dur, mv_dur):
     return remix_times, source_times
 
 
+def _visual_proof_applicable(profile):
+    """口元の視覚証明を「要求してよい」素材かを判定する。
+
+    True  : 顔が十分に検出できている＝証明できるはずなので、証明を必須にする。
+    False : 顔がほとんど検出できない＝判定不能。証明を必須にすると全編で
+            口元が消えるため、音側の品質ゲートの判断に委ねる。
+
+    ★プロファイル自体が無い（解析器が動かなかった/落ちた）場合は True を返し、
+      従来どおり厳格に扱う。検出器が動いていないのに緩めるのは危険なため。
+    """
+    if not profile:
+        return True
+    try:
+        # face_rate が「無い」場合は判断材料が無い＝緩めない（厳格のまま）。
+        # 明示的に low と分かっている時だけ「判定不能」として見送る。
+        if "face_rate" not in profile:
+            return True
+        _raw = profile.get("face_rate")
+        if _raw is None:
+            return True          # 値が無い＝判断できない → 緩めない
+        rate = float(_raw)
+    except (TypeError, ValueError, AttributeError):
+        return True
+    return bool(rate >= VISUAL_PROOF_MIN_FACE)
+
+
 def _safe_visual_plan(requires_safe_visual, certified_mv_time=None):
     """危険時に人物MVへ戻る経路を作らない純粋な描画元選択。"""
     if not requires_safe_visual:
@@ -2983,6 +3016,23 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
             anchors, cut_times, music_dur, mv_dur)
         visual_phase_proof_ranges = _visual_phase_proven_ranges_from_mapping(
             phase_rt, phase_st, safe_mouth_profile, rvoc, vocal_sr)
+        # ★顔がほとんど検出できないMVでは、視覚証明を必須にしない。
+        #   暗いカット・横顔・引き・モーションブラーが多いMVでは mediapipe が
+        #   顔をほぼ拾えず（実例: 顔検出率13%）、「証明できる区間ゼロ」→全編で
+        #   口元を隠す、という結果になっていた。しかし「検出できない」は
+        #   「口がズレている」ではない。音側(HuBERT/DTW/発音類似)の品質ゲートは
+        #   既に通っているので、ここは判定不能として音の判断に委ねる。
+        #   ※明確な矛盾（歌ってないのに口が動く等）は後段の conflicts 判定で
+        #     引き続き検出し、その区間だけ差し替える。安全性の要はそちら。
+        if not visual_phase_proof_ranges and safe_mouth_profile:
+            try:
+                _fr = float(safe_mouth_profile.get("face_rate", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                _fr = 0.0
+            if _fr < VISUAL_PROOF_MIN_FACE:
+                visual_phase_proof_ranges = [(0.0, float(music_dur))]
+                print(f"     ℹ️ 顔検出率{_fr*100:.0f}%（低すぎて口元を検証できない）"
+                      f" → 判定不能として音側の判定に任せます")
     else:
         visual_phase_proof_ranges = _merge_time_ranges(
             visual_phase_proof_ranges, lo=0.0, hi=music_dur)
@@ -3043,8 +3093,16 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
             need_swap = need_swap or max(silent_conflicts, singing_conflicts) >= 2
         # 音響ゲートが高信頼でも、実際に表示する全frameの
         # 口運動が認証できなければ人物を表示しない。
-        need_swap = need_swap or not _mapped_frames_have_verified_lipsync_visual(
-            safe_mouth_profile, remix_frame_times, source_frame_times, rmx_act)
+        # ★ただし顔がほとんど検出できないMV（VISUAL_PROOF_MIN_FACE未満）では、
+        #   この認証は原理的に通らない。「検出できない」を「ズレている」と
+        #   同じ扱いにすると全編で口元が消えるため、判定不能として見送る。
+        #   直前の conflicts 判定（歌ってないのに口が動く等の明確な矛盾）は
+        #   そのまま有効なので、危険な区間は引き続き差し替わる。
+        if not _visual_proof_applicable(safe_mouth_profile):
+            pass
+        else:
+            need_swap = need_swap or not _mapped_frames_have_verified_lipsync_visual(
+                safe_mouth_profile, remix_frame_times, source_frame_times, rmx_act)
         if need_swap:
             alt = None
             if ALLOW_REAL_MV_SAFE_BROLL:

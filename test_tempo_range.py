@@ -29,14 +29,19 @@ def _load_core():
     return ns
 
 
-def _make_song(note_dur, n_notes=44, seed=7):
-    """音程が変わる音列（クロマで追える素材）。note_dur で速さを変える。"""
+def _make_song(note_dur, semitone_shift=0.0, n_notes=44, seed=7):
+    """音程が変わる音列（クロマで追える素材）。
+
+    note_dur で速さを、semitone_shift でキー全体のずれを作る。
+    「レコードを速く回した編集」は、テンポと一緒に音程も上がるので
+    その状況（速い＋キーも上がる）を合成データで再現できる。
+    """
     rng = np.random.RandomState(seed)
     semis = rng.randint(0, 12, size=n_notes)
     out = []
     for s in semis:
         t = np.arange(int(SR * note_dur)) / SR
-        f0 = 220.0 * (2 ** (s / 12.0))
+        f0 = 220.0 * (2 ** ((float(s) + float(semitone_shift)) / 12.0))
         y = (np.sin(2 * np.pi * f0 * t)
              + 0.5 * np.sin(2 * np.pi * 2 * f0 * t)
              + 0.3 * np.sin(2 * np.pi * 3 * f0 * t))
@@ -91,7 +96,7 @@ class TempoSearchRangeTests(unittest.TestCase):
         i_branch = src.index("if lock < 0.45:")
         i_lip = src.index("_try_vocal_lipsync", i_branch)
         seg = src[i_branch:i_lip]
-        self.assertIn("make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)", seg)
+        self.assertIn("make_tempo_adjusted_mv(video_path, best_rate, tmp_dir,", seg)
         self.assertIn("(lock - lock_1p0) >= 0.10", seg)
 
     def test_adjust_gate_ignores_weak_evidence(self):
@@ -99,6 +104,39 @@ class TempoSearchRangeTests(unittest.TestCase):
         for lock, lock_1p0, expect in ((0.28, 0.00, True), (0.09, 0.03, False),
                                        (0.10, 0.01, False)):
             self.assertEqual((lock - lock_1p0) >= 0.10, expect)
+
+    def test_varispeed_detection(self):
+        """「レコードを速く回した」編集を自動判別できること。
+
+        DJ Editはテンポと一緒に音程も上がることが多く（×1.20なら約+3.16半音）、
+        音程がずれたまま照合すると同じ曲でもクロマが一致しない
+        （実測: 3半音ずれるだけで一直線度100%→10%）。
+        """
+        mv = _make_song(2.38)
+        # 早回し（テンポ×1.20・キーも+3.16半音）→ varispeed と判定
+        music_vs = _make_song(2.38 / 1.20, 12 * np.log2(1.20))
+        vs, shift, _conf = self.ns["looks_like_varispeed"](mv, music_vs, 1.20, sr=SR)
+        self.assertTrue(vs)
+        self.assertAlmostEqual(shift, 3, delta=1)
+        # 音程維持のテンポ変更（キー同じ）→ varispeed ではない
+        music_at = _make_song(2.38 / 1.20, 0.0)
+        vs2, _s2, _c2 = self.ns["looks_like_varispeed"](mv, music_at, 1.20, sr=SR)
+        self.assertFalse(vs2)
+
+    def test_semitone_shift_estimation(self):
+        # キーのズレを正しく当てられること
+        mv = _make_song(2.38)
+        for true_shift in (0, 3, 5, 7):
+            k, conf = self.ns["estimate_semitone_shift"](
+                mv, _make_song(2.38, true_shift), sr=SR)
+            self.assertEqual(k, true_shift)
+            self.assertGreater(conf, 0.0)
+
+    def test_varispeed_uses_resampling_filter(self):
+        # varispeed時は音程ごと変わる補正（asetrate）を使うこと
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("asetrate=44100*", src)
+        self.assertIn("varispeed=_vs", src)
 
 
 if __name__ == "__main__":

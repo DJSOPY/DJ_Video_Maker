@@ -561,3 +561,35 @@ class ExtendedCoverageWindowTests(unittest.TestCase):
         q = self._report((100.0, 110.0))
         self.assertLess(q["coverage"], 0.98)
 
+
+class LowFaceRateVisualProofTests(unittest.TestCase):
+    """顔がほとんど検出できないMVでは、視覚証明を必須にしない。
+
+    暗い/横顔/引き/ブラーの多いMVでは mediapipe が顔をほぼ拾えず（実例:
+    顔検出率13%）、「証明できる区間ゼロ」→全編で口元を隠す、となっていた。
+    「検出できない」は「口がズレている」ではないため、判定不能として音側の
+    品質ゲートに委ねる。ただし判断材料が無い場合は緩めない（厳格のまま）。
+    """
+
+    def test_low_face_rate_is_treated_as_undecidable(self):
+        self.assertFalse(lipsync_pro._visual_proof_applicable({"face_rate": 0.13}))
+
+    def test_enough_face_still_requires_proof(self):
+        # Cake by the Ocean 相当（39%）は従来どおり証明を必須にする
+        self.assertTrue(lipsync_pro._visual_proof_applicable({"face_rate": 0.39}))
+        # 境界値ちょうどは厳格側
+        self.assertTrue(
+            lipsync_pro._visual_proof_applicable(
+                {"face_rate": lipsync_pro.VISUAL_PROOF_MIN_FACE}))
+
+    def test_missing_or_broken_rate_stays_strict(self):
+        # 判断材料が無い場合に緩めると危険なので、厳格のままであること
+        for profile in (None, {}, {"times": [1, 2]}, {"face_rate": None},
+                        {"face_rate": "x"}):
+            self.assertTrue(lipsync_pro._visual_proof_applicable(profile), profile)
+
+    def test_conflict_detection_is_kept(self):
+        # 明確な矛盾（歌ってないのに口が動く等）の判定は残っていること
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        self.assertIn("max(silent_conflicts, singing_conflicts) >= 2", src)
+

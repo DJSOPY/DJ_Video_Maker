@@ -1184,18 +1184,82 @@ def find_best_mv_tempo(video_audio, music_audio, sr=11025, window_sec=SEG_WINDOW
         return 1.0, 0.0, 0.0
 
 
-def make_tempo_adjusted_mv(video_path, rate, tmp_dir):
+def estimate_semitone_shift(video_audio, music_audio, sr=11025):
+    """MVに対して曲が何半音ずれているかを推定する。戻り: (半音0..11, 確信度0..1)
+
+    DJ Editは「レコードを速く回す」やり方で作られることが多く、その場合
+    テンポと一緒に音程も上がる（×1.20なら約+3.16半音）。音程がずれたまま
+    照合すると、同じ曲でもクロマ（メロディ）が一致せず「別アレンジ」と
+    誤判定される（実測: 3半音ずれるだけで一直線度100%→10%）。
+    ここでは曲全体の平均クロマ（キーの指紋）を12通り回して最も合う回転量を探す。
+    確信度は1位と2位の差＝はっきり1つに決まったかどうか。
+    """
+    try:
+        _ov, cv, _ = compute_features(video_audio, sr)
+        _om, cm, _ = compute_features(music_audio, sr)
+        pv = np.asarray(cv, dtype=np.float64).mean(axis=1)
+        pm = np.asarray(cm, dtype=np.float64).mean(axis=1)
+        if pv.shape[0] != 12 or pm.shape[0] != 12:
+            return 0, 0.0
+        pv = pv - pv.mean(); pm = pm - pm.mean()
+        nv = float(np.linalg.norm(pv)); nm = float(np.linalg.norm(pm))
+        if nv < 1e-9 or nm < 1e-9:
+            return 0, 0.0
+        pv /= nv; pm /= nm
+        scores = [float(np.dot(np.roll(pv, k), pm)) for k in range(12)]
+        best = int(np.argmax(scores))
+        ordered = sorted(scores, reverse=True)
+        conf = max(0.0, float(ordered[0] - ordered[1]))
+        return best, conf
+    except Exception:
+        return 0, 0.0
+
+
+def looks_like_varispeed(video_audio, music_audio, rate, sr=11025,
+                         min_conf=0.05, tol_semitone=0.7):
+    """このテンポ差が「レコードを速く回した」ものか（音程も一緒に動いたか）を判定。
+
+    速度比 rate に対して、音程は 12*log2(rate) 半音だけ上がるはず。
+    実測したキーのズレがそれと一致すれば varispeed（音程ごと変化）と判断する。
+    一致しなければ、音程を保ったままテンポだけ変えた編集（atempo系）とみなす。
+    """
+    try:
+        rate = float(rate)
+        if not np.isfinite(rate) or rate <= 0:
+            return False, 0, 0.0
+        shift, conf = estimate_semitone_shift(video_audio, music_audio, sr)
+        expected = (12.0 * np.log2(rate)) % 12.0
+        d = abs(float(shift) - expected)
+        d = min(d, 12.0 - d)           # 12半音で一周するので近い方を採る
+        return bool(conf >= min_conf and d <= tol_semitone), shift, conf
+    except Exception:
+        return False, 0, 0.0
+
+
+def make_tempo_adjusted_mv(video_path, rate, tmp_dir, varispeed=False):
     """MVを rate 倍のテンポに補正した動画を作る（rate>1=速く=短く / <1=遅く=長く）。
     曲BPM÷MV BPM をrateに渡すと、MVが曲のテンポに揃う。失敗時 None。
+
+    varispeed=True のときは「レコードを速く回す」補正にする。テンポと一緒に
+    音程も上がるので、そうやって作られたDJ Edit（原曲を丸ごと早回し）と
+    音程まで揃い、クロマ照合・HuBERT照合が本来の精度で働くようになる。
+    False のときは従来どおり音程を保ってテンポだけ変える（atempo）。
     """
     try:
         if rate <= 0:
             return None
-        out = Path(tmp_dir) / "mv_tempo_adj.mp4"
-        # 映像: setpts=PTS/rate（rate倍速）/ 音声: atempo=rate（0.5〜2.0対応・rateは0.67〜1.5で安全）
+        out = Path(tmp_dir) / ("mv_tempo_adj_vs.mp4" if varispeed
+                               else "mv_tempo_adj.mp4")
+        if varispeed:
+            # 一旦44.1kHzに揃えてから再生速度そのものを変える（音程も同じ比で動く）
+            af = (f"aresample=44100,asetrate=44100*{rate:.6f},"
+                  f"aresample=44100")
+        else:
+            af = f"atempo={rate:.6f}"
+        # 映像: setpts=PTS/rate（rate倍速）
         cmd = ["ffmpeg", "-y", "-i", str(video_path),
                "-filter:v", f"setpts=PTS/{rate:.6f}",
-               "-filter:a", f"atempo={rate:.6f}",
+               "-filter:a", af,
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                "-c:a", "aac", "-b:a", "192k", str(out)]
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
@@ -2950,7 +3014,14 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             if (abs(best_rate - 1.0) > 0.005 and (lock - lock_1p0) >= 0.10):
                 print(f"  🎚 テンポ差 ×{best_rate:.3f} は明確（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）"
                       f" → MVを補正してからリップシンクします")
-                adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)
+                # 「レコードを速く回した」編集か自動判定（音程も一緒に動いたか）
+                _vs, _sh, _cf = looks_like_varispeed(
+                    video_audio, music_audio, best_rate)
+                if _vs:
+                    print(f"     🎼 キーも{_sh}半音ずれ → レコードを速く回した編集と判断"
+                          f"（音程ごと合わせます）")
+                adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir,
+                                             varispeed=_vs)
                 if adj is not None:
                     video_path = adj
                     vid_dur = get_duration(video_path) or (vid_dur / best_rate)
@@ -2976,7 +3047,14 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         if (remix_aligned and abs(best_rate - 1.0) > 0.003
                 and (lock - lock_1p0) >= 0.10):
             print(f"  🎚 MVを ×{best_rate:.3f} にテンポ補正して波形を合わせます...")
-            adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)
+            # 「レコードを速く回した」編集か自動判定（音程も一緒に動いたか）
+            _vs, _sh, _cf = looks_like_varispeed(
+                video_audio, music_audio, best_rate)
+            if _vs:
+                print(f"     🎼 キーも{_sh}半音ずれ → レコードを速く回した編集と判断"
+                      f"（音程ごと合わせます）")
+            adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir,
+                                         varispeed=_vs)
             if adj is not None:
                 video_path = adj
                 vid_dur = get_duration(video_path) or (vid_dur / best_rate)
@@ -2988,7 +3066,14 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             # リップシンクに渡すことになり、DTWが巨大な伸縮を吸収しきれず失敗する
             # （実例: Dj Dark Remix x1.19 を等倍のまま渡して一致0.46で不採用）。
             print(f"  🎚 テンポ差 ×{best_rate:.3f} が明確 → MVを補正してからリップシンクします")
-            adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)
+            # 「レコードを速く回した」編集か自動判定（音程も一緒に動いたか）
+            _vs, _sh, _cf = looks_like_varispeed(
+                video_audio, music_audio, best_rate)
+            if _vs:
+                print(f"     🎼 キーも{_sh}半音ずれ → レコードを速く回した編集と判断"
+                      f"（音程ごと合わせます）")
+            adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir,
+                                         varispeed=_vs)
             if adj is not None:
                 video_path = adj
                 vid_dur = get_duration(video_path) or (vid_dur / best_rate)
