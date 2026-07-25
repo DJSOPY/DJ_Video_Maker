@@ -683,6 +683,55 @@ class LowFaceRateVisualProofTests(unittest.TestCase):
         self.assertAlmostEqual(f([(0, 10)], 2.0, 8.0), 6.0)
         self.assertAlmostEqual(f([]), 0.0)
 
+    def test_intersect_ranges(self):
+        f = lipsync_pro._intersect_ranges
+        self.assertEqual(f([(0, 10)], [(5, 15)]), [(5.0, 10.0)])
+        self.assertEqual(f([(0, 10)], [(20, 30)]), [])
+        self.assertEqual(f([(0, 10)], [(2, 4), (6, 8)]), [(2.0, 4.0), (6.0, 8.0)])
+        self.assertEqual(f([(0, 5), (10, 15)], [(3, 12)]), [(3.0, 5.0), (10.0, 12.0)])
+        self.assertEqual(f([(0, 10)], []), [])
+        # 入力に重なりがあっても先に統合してから交差を取る
+        self.assertEqual(f([(0, 10), (5, 12)], [(0, 20)]), [(0.0, 12.0)])
+
+    def test_unsafe_split_is_exclusive_not_a_sum_of_causes(self):
+        """「歌唱中に確認できない秒数」を原因タグの足し引きで出さないこと。
+
+        原因タグ同士は重なるため、単純に合計すると二重に数えられる。さらに
+        非歌唱区間の内側にある弱一致まで「歌唱中」に混ざってしまう。
+        正しくは、最終的なunsafe範囲を非歌唱マスクで二分する
+        （非歌唱中 = final ∩ 非歌唱 / 歌唱中 = final − それ）。
+        こうすれば2つは排他的で、合計が必ず総量に一致する。
+        """
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        # 旧実装（原因タグの引き算）が復活していないこと
+        self.assertNotIn('if c != "曲が歌っていない")', src)
+        self.assertIn("_intersect_ranges(report[\"unsafe_ranges\"], _mute_ranges)", src)
+        self.assertIn('report["unsafe_split_seconds"]', src)
+        self.assertIn('report["singing_seconds"]', src)
+
+        # 実際に二分して、排他性（合計＝総量）を確認する
+        mute = [(0.0, 31.0), (100.0, 120.0), (184.0, 216.5)]
+        raw = mute + [(60.0, 66.0), (110.0, 118.0), (150.0, 152.0)]
+        final = lipsync_pro._prepare_unsafe_ranges(raw, 0.0, 216.5)
+        total = lipsync_pro._merged_seconds(final, 0.0, 216.5)
+        in_mute = lipsync_pro._merged_seconds(
+            lipsync_pro._intersect_ranges(final, mute), 0.0, 216.5)
+        in_sing = total - in_mute
+        self.assertAlmostEqual(in_mute + in_sing, total)
+        self.assertGreater(in_sing, 0.0)
+        # 非歌唱の内側にある弱一致(110-118s)は「歌唱中」に数えない
+        self.assertLess(in_sing, 20.0)
+
+    def test_singing_denominator_excludes_mute(self):
+        """歌唱中unsafe率の分母は、全体ではなく歌唱時間であること。"""
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        self.assertIn('report["singing_seconds"] = max(0.0, '
+                      '(unsafe_hi - unsafe_lo) - _mute_sec)', src)
+        self.assertIn("歌唱中unsafe率", src)
+        # 非歌唱中は「失敗ではない」と断定せず、未確認であることを明示する
+        self.assertNotIn("同期の失敗ではありません", src)
+        self.assertIn("音響同期の評価対象外", src)
+
     def test_alt_mv_position_never_saturates_into_one_spot(self):
         """代替MV位置の数え上げに、頭打ちする履歴の長さを使わないこと。
 

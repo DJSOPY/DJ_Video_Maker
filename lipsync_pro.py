@@ -2085,6 +2085,48 @@ def _mark_unsafe(report, cause, ranges):
         report.setdefault("_unsafe_by_cause", {}).setdefault(cause, []).extend(usable)
 
 
+def _norm_ranges(ranges):
+    """区間リストを昇順に整え、重なりを統合する。"""
+    clean = []
+    for item in (ranges or []):
+        try:
+            a, b = float(item[0]), float(item[1])
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue
+        if np.isfinite(a) and np.isfinite(b) and b > a:
+            clean.append((a, b))
+    clean.sort()
+    out = []
+    for a, b in clean:
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _intersect_ranges(a_ranges, b_ranges):
+    """2つの区間リストの共通部分を返す。
+
+    「口元非表示のうち、非歌唱区間に重なっている分」を正確に取り出すために使う。
+    原因タグごとの秒数を足し引きすると、タグ同士の重なりを二重に数えたうえ、
+    非歌唱区間と重なった弱一致まで「歌唱中」に混ざってしまう。
+    """
+    A, B = _norm_ranges(a_ranges), _norm_ranges(b_ranges)
+    res = []
+    i = j = 0
+    while i < len(A) and j < len(B):
+        lo = max(A[i][0], B[j][0])
+        hi = min(A[i][1], B[j][1])
+        if hi > lo:
+            res.append((lo, hi))
+        if A[i][1] < B[j][1]:
+            i += 1
+        else:
+            j += 1
+    return res
+
+
 def _merged_seconds(ranges, lo=None, hi=None):
     """重なりを潰した合計秒数（内訳表示用）。"""
     clean = []
@@ -2475,6 +2517,21 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
         report["unsafe_ranges"] = _prepare_unsafe_ranges(
             report["unsafe_ranges"], unsafe_lo, unsafe_hi,
             pad=0.25, min_safe=0.75)
+        # ★原因タグの足し引きでは「歌唱中に確認できない秒数」は出せない。
+        #   タグ同士が重なって二重に数えられるうえ、非歌唱区間の中にある
+        #   弱一致まで「歌唱中」に混ざるため。最終的なunsafe範囲を
+        #   非歌唱マスクで二分すれば、2つは排他的で合計が必ず総量に一致する。
+        _mute_ranges = _by_cause.get("曲が歌っていない", [])
+        _mute_sec = _merged_seconds(_mute_ranges, unsafe_lo, unsafe_hi)
+        report["mute_seconds"] = _mute_sec
+        report["singing_seconds"] = max(0.0, (unsafe_hi - unsafe_lo) - _mute_sec)
+        _unsafe_all = _merged_seconds(report["unsafe_ranges"], unsafe_lo, unsafe_hi)
+        _unsafe_mute = _merged_seconds(
+            _intersect_ranges(report["unsafe_ranges"], _mute_ranges),
+            unsafe_lo, unsafe_hi)
+        report["unsafe_split_seconds"] = {
+            "mute": _unsafe_mute,
+            "sing": max(0.0, _unsafe_all - _unsafe_mute)}
         content_ok = (
             (report["feature_similarity"] >= min_sim and report["feature_lift"] >= 0.015)
             or report["onset_correlation"] >= 0.12
@@ -3783,21 +3840,28 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
             unsafe_seconds = sum(max(0.0, b - a) for a, b in q["unsafe_ranges"])
             print(f"     🛡️ 口元非表示対象: {len(q['unsafe_ranges'])}区間 / "
                   f"計{unsafe_seconds:.1f}s（認証不能時は安全背景）")
-            # ★原因の内訳。「曲が歌っていない」区間は口パクを主張していないので
-            #   同期の失敗ではない。合算した1つの数字だと実態より悪く見えるため、
-            #   何がどれだけ効いているかを出す（重なりがあるので合計は一致しない）。
+            # ★原因タグ同士は重なるので、足し引きでは歌唱中の量を出せない。
+            #   最終範囲を非歌唱マスクで二分した排他的な内訳を先に出し、
+            #   原因タグは「重複ありのシグナル」として補助的に添える。
+            _split = q.get("unsafe_split_seconds") or {}
+            if _split:
+                print(f"       ↳ 最終内訳（排他的）: "
+                      f"非歌唱中 {_split.get('mute', 0.0):.1f}s / "
+                      f"歌唱中 {_split.get('sing', 0.0):.1f}s")
             _causes = q.get("unsafe_cause_seconds") or {}
             if _causes:
                 _items = sorted(_causes.items(), key=lambda kv: -kv[1])
                 _txt = " / ".join(f"{c} {s:.0f}s" for c, s in _items if s >= 0.05)
                 if _txt:
-                    print(f"       ↳ 内訳（重複あり）: {_txt}")
-                _sing = sum(s for c, s in _items if c != "曲が歌っていない")
-                _mute = _causes.get("曲が歌っていない", 0.0)
-                if _mute >= 0.05:
-                    print(f"       ↳ うち「歌っていない区間」{_mute:.0f}s は"
-                          f"同期の失敗ではありません"
-                          f"（歌唱中に確認できないのは {_sing:.0f}s）")
+                    print(f"       ↳ 原因シグナル（重複あり）: {_txt}")
+            _sing_total = q.get("singing_seconds") or 0.0
+            if _split and _sing_total > 0.05:
+                _rate = _split.get("sing", 0.0) / _sing_total
+                print(f"       ↳ 歌唱中unsafe率: {_split.get('sing', 0.0):.1f}s / "
+                      f"歌唱{_sing_total:.1f}s = {_rate*100:.1f}%")
+            if _split:
+                print("       ※非歌唱中は音響同期の評価対象外"
+                      "（口運動は未確認のためDJ用Bロールとして表示）")
         if not q["accepted"]:
             # ★どの条件で落ちたかを明示する。「信頼度が不足」だけでは、
             #   6つある判定のどれが原因か分からず改善のしようがなかった。
