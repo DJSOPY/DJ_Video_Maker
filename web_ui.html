@@ -733,8 +733,9 @@ go.addEventListener('click',async()=>{
       if(s.outputs && s.outputs.length){
         s.outputs.forEach(name=>{
           const d=document.createElement('div'); d.className='dl';
-          d.innerHTML=`<span class="bar" style="color:var(--live)">✔</span><span>${name}</span>
-            <a href="/download?job=${job}&name=${encodeURIComponent(name)}" download>ダウンロード</a>`;
+          // 完成ファイルは名前だけ表示する。取り出しは下の「保存先フォルダを開く」に
+          // 一本化（同じMac上で動くので、Finderで開いてドラッグする方が速い）。
+          d.innerHTML=`<span class="bar" style="color:var(--live)">✔</span><span>${name}</span>`;
           doneEl.appendChild(d);
         });
         // 完成フォルダをFinderで開くボタン（同じMac上なので開ける）
