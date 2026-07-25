@@ -1153,13 +1153,31 @@ def find_best_mv_tempo(video_audio, music_audio, sr=11025, window_sec=SEG_WINDOW
             plateau = [r for (r, lk) in scored if lk >= bl - 0.03]
             return (float(np.median(plateau)) if plateau else 1.0), bl
 
-        # テンポ探索（±2%刻み・許容±1s）。最良lock付近のプラトー中央を採用。
-        coarse_rates = [0.86,0.88,0.90,0.92,0.94,0.96,0.98,1.0,1.02,1.04,1.06,1.08,1.10,1.12,1.14]
+        # テンポ探索：粗く広く → 当たり付近を細かく、の2段構え。
+        # ★範囲が命：DJ Edit/Remixは原曲(例105BPM)をハウス基準(125BPM前後)へ
+        #   上げることが多く、+20%前後の倍率は普通に起こる。以前は上限1.14までしか
+        #   探しておらず、正解が範囲外の曲（実例: x1.19のDj Dark Remix）を
+        #   「どのテンポでも揃わない＝別アレンジ」と誤判定して同期を諦めていた。
+        #   粗4%刻みで 0.76〜1.40 を覆い、最良付近だけ1%刻みで詰めることで、
+        #   探索点数をほぼ増やさずに守備範囲を大きく広げる。
+        coarse_rates = [round(0.76 + 0.04 * i, 3) for i in range(17)]   # 0.76〜1.40
         coarse_scored = [(r, lock_of(stretched_cv(r), 1.0)) for r in coarse_rates]
         lock_1p0 = next((lk for (r, lk) in coarse_scored if abs(r - 1.0) < 1e-6), 0.0)
-        best_lock = max(lk for _, lk in coarse_scored)
-        plateau = [r for (r, lk) in coarse_scored if lk >= best_lock - 0.03]
-        best_rate = float(np.median(plateau)) if plateau else 1.0
+        c_best = max(lk for _, lk in coarse_scored)
+        c_plateau = [r for (r, lk) in coarse_scored if lk >= c_best - 0.03]
+        center = float(np.median(c_plateau)) if c_plateau else 1.0
+        # 粗探索の刻み(4%)を±で覆うように、中心付近を1%刻みで詰める
+        fine_rates = [round(center + 0.01 * k, 3) for k in range(-4, 5)]
+        fine_rates = [r for r in fine_rates if 0.70 <= r <= 1.50]
+        fine_scored = [(r, lock_of(stretched_cv(r), 1.0)) for r in fine_rates]
+
+        scored = coarse_scored + fine_scored
+        best_lock = max(lk for _, lk in scored)
+        best_r_arg = max(scored, key=lambda t: t[1])[0]
+        # プラトー中央を採る（ノイズに強い）。ただし遠く離れた別ピークは混ぜない。
+        plateau = [r for (r, lk) in scored
+                   if lk >= best_lock - 0.03 and abs(r - best_r_arg) <= 0.06]
+        best_rate = float(np.median(plateau)) if plateau else float(best_r_arg)
         return best_rate, best_lock, lock_1p0
     except Exception as e:
         print(f"  (テンポ探索失敗: {e})")
@@ -1706,6 +1724,14 @@ _ALLOW_REAL_SOURCE_SAFE_BROLL = True   # フィラー区間を「口が映らな
 #   False       : 未証明の口を一切出さない最厳格。全編を認証Bロール/抽象背景にする。
 REMIX_SHOW_MV_WHEN_UNMATCHED = True
 
+# フィラー区間（MVに対応が無い＝Extendedで足したイントロ/アウトロ等）で、
+# 「口が映らないカット」をMVから認証できなかった時の最終手段。
+#   True（既定）: 抽象背景(紫)ではなくMV映像を出す。映像が重複してもよいので
+#                 紫の画面を減らしたい、という方針。対応が無い区間なので
+#                 そもそも同期を主張しておらず、口が映っても“ズレ”ではない。
+#   False       : 従来どおり紫の抽象背景へ退避（未証明の口を一切出さない最厳格）。
+FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT = True
+
 
 def _safe_video_frame_count(duration, fps=30.0):
     """durationをCFRの整数フレーム数へ変換する。"""
@@ -1885,6 +1911,28 @@ def _render_safe_broll_candidate(source, start, frame_count, out_path):
     return bool(r.returncode == 0 and _video_has_exact_frames(out_path, frames))
 
 
+def _render_mv_loop_fill(source, out_path, frame_count, start=0.0):
+    """MVをループ再生して、指定フレーム数ぴったりの映像を作る。
+
+    MVが必要な長さより短くても抽象背景(紫)へ落とさず、MV映像だけで埋めるため。
+    最後のフレームで静止させる tpad と違い、頭から繰り返すので動きが止まらない。
+    """
+    out_path = Path(out_path)
+    out_path.unlink(missing_ok=True)
+    frames = max(1, int(frame_count))
+    vf = f"{VF_NORM},trim=end_frame={frames},setpts=PTS-STARTPTS"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-stream_loop", "-1",
+             "-ss", f"{max(0.0, float(start)):.6f}", "-i", str(source),
+             "-vf", vf, "-frames:v", str(frames),
+             *ENC_ARGS, "-an", str(out_path)],
+            capture_output=True, text=True, errors="replace")
+    except (Exception, SystemExit):
+        return False
+    return bool(r.returncode == 0 and _video_has_exact_frames(out_path, frames))
+
+
 def make_safe_no_mouth_filler_segment(loop_path, duration, out_path, tmp_dir=None,
                                       frame_count=None):
     """口元が一切見えないと全フレームで証明できた映像だけを採用する。
@@ -1966,7 +2014,44 @@ def make_safe_no_mouth_filler_segment(loop_path, duration, out_path, tmp_dir=Non
     except (Exception, SystemExit) as e:
         print(f"     ⚠️ 口元なしBロールを認証できません: {str(e)[:100]}")
 
-    print("     🛡️ 安全な口元なし映像が無いため、非人物の抽象背景へ退避")
+    # ★最終手段：認証できる「口元なしカット」がMVに無い場合の見せ方。
+    #   FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT=True（既定）なら、抽象背景(紫)ではなく
+    #   MV映像そのものを出す。方針：「MVに対応が無い区間（Extendedで足した
+    #   イントロ/アウトロ等）は、映像が重複してもいいのでMVを見せたい」。
+    #   口が映る可能性はあるが、そこは元々MVと対応が無い＝同期の主張をしない区間。
+    #   Falseにすると従来どおり紫の抽象背景へ退避する（未証明の口を一切出さない）。
+    if FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT and vids:
+        for source in vids:
+            try:
+                source_dur = get_duration(source) or 0.0
+                span = max(0.1, source_dur - exact_dur - 0.05)
+                # 毎回同じ絵にならないよう、使用済み記録の数で位置をずらす
+                used = len(_SAFE_BROLL_USED.get(str(source.resolve()), []))
+                start = float((used * max(3.0, exact_dur * 1.7)) % span)
+                if _render_safe_broll_candidate(source, start, frames, out_path):
+                    if _video_has_exact_frames(out_path, frames):
+                        print(f"     🎬 認証できる口元なしカットが無いため、"
+                              f"MV映像で埋めます（{source.name} {start:.2f}秒〜）")
+                        return True
+                    out_path.unlink(missing_ok=True)
+            except (Exception, SystemExit):
+                continue
+
+    # ★MVが必要な長さより短い等で上の候補に入らなかった場合も、抽象背景には
+    #   落とさずMVをループさせて埋める（映像はMVの中からしか出さない方針）。
+    if FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT:
+        for value in (raw_vids or []):
+            try:
+                source = Path(value)
+                if not source.exists():
+                    continue
+                if _render_mv_loop_fill(source, out_path, frames):
+                    print(f"     🎬 MVをループさせて埋めます（{source.name}）")
+                    return True
+            except (Exception, SystemExit):
+                continue
+
+    print("     🛡️ 使えるMV映像が無いため、非人物の抽象背景へ退避")
     return make_abstract_no_mouth_segment(exact_dur, out_path, frame_count=frames)
 
 def ensure_video_length(video_path, required_dur, loop_path, tmp_dir,
@@ -2882,8 +2967,20 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                 video_path = adj
                 vid_dur = get_duration(video_path) or (vid_dur / best_rate)
                 video_audio = wav_to_array_path(video_path, duration=min(vid_dur, 360))
+        elif (not remix_aligned and abs(best_rate - 1.0) > 0.005
+                and (lock - lock_1p0) >= 0.10):
+            # 一致率は中間的でも「等倍よりこの倍率の方が明確に揃う」なら、テンポ差は本物。
+            # ここでMVを合わせておかないと、19%もテンポが違う映像のまま
+            # リップシンクに渡すことになり、DTWが巨大な伸縮を吸収しきれず失敗する
+            # （実例: Dj Dark Remix x1.19 を等倍のまま渡して一致0.46で不採用）。
+            print(f"  🎚 テンポ差 ×{best_rate:.3f} が明確 → MVを補正してからリップシンクします")
+            adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)
+            if adj is not None:
+                video_path = adj
+                vid_dur = get_duration(video_path) or (vid_dur / best_rate)
+                video_audio = wav_to_array_path(video_path, duration=min(vid_dur, 360))
         elif not remix_aligned and abs(best_rate - 1.0) > 0.003:
-            print(f"  ℹ️ 一致率が中間的なため、推定テンポでMVを先に変形せず原版を保持")
+            print(f"  ℹ️ 一致率が中間的で根拠も弱いため、MVを変形せず原版を保持")
         else:
             print(f"  ℹ️ 等倍と大差なし → テンポ補正せず等倍で配置")
 
@@ -3181,12 +3278,22 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                     run(["ffmpeg","-y","-f","concat","-safe","0",
                          "-i",str(lst),"-c","copy",str(out_seg)])
         # どの映像生成失敗も区間削除にしない。削除すると後続の人物映像が
-        # 音声より前詰めされるため、同じ整数枚数の安全背景で置き換える。
+        # 音声より前詰めされるため、同じ整数枚数の映像で置き換える。
+        # 映像はMVの中からしか出さない方針なので、まずMVをループさせて埋め、
+        # それも無理な時だけ最後の砦として非人物背景にする。
         if not _video_has_exact_frames(out_seg, target_frames):
             out_seg.unlink(missing_ok=True)
-            make_abstract_no_mouth_segment(
-                target_frames / HYBRID_PRO_OUTPUT_FPS, out_seg,
-                frame_count=target_frames)
+            _filled = False
+            if FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT:
+                try:
+                    _filled = _render_mv_loop_fill(
+                        video_path, out_seg, target_frames)
+                except (Exception, SystemExit):
+                    _filled = False
+            if not _filled:
+                make_abstract_no_mouth_segment(
+                    target_frames / HYBRID_PRO_OUTPUT_FPS, out_seg,
+                    frame_count=target_frames)
         if _video_has_exact_frames(out_seg, target_frames):
             seg_files.append(out_seg)
         else:

@@ -61,8 +61,9 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertIn("def _profile_certifies_no_mouth", src)
         # 認証は fps=1000.0（全デコードフレーム検査）で行われる
         self.assertIn("fps=1000.0", src)
-        # 認証できなければ抽象背景へ退避する経路が残っていること
-        self.assertIn("安全な口元なし映像が無いため、非人物の抽象背景へ退避", src)
+        # 認証できなければMVで埋める→それも無理なら抽象背景、という順の経路が残っていること
+        self.assertIn("MVをループさせて埋めます", src)
+        self.assertIn("使えるMV映像が無いため、非人物の抽象背景へ退避", src)
 
     def test_lipsync_fallback_uses_lenient_mode_by_default(self):
         # 別アレンジRemixで「口が合う区間」を口パクできるよう、リップシンクの
@@ -75,6 +76,18 @@ class UnsafePlanTests(unittest.TestCase):
         self.assertIn("make_filler_segment(\n                video_path, d, o, tmp_dir)", src)
         # strict機能自体は定数Trueで呼べる形で保持
         self.assertIn("if _STRICT_FAIL_CLOSED_LIPSYNC:", src)
+
+    def test_filler_falls_back_to_mv_not_gradient(self):
+        # フィラー区間で「口なしカット」を認証できなかった時、既定では
+        # 紫の抽象背景ではなくMV映像で埋める（対応が無い区間＝同期を主張しない）。
+        self.assertTrue(CORE["FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT"])
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("if FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT and vids:", src)
+        self.assertIn("MV映像で埋めます", src)
+        # 正確なフレーム数で描画し、一致しなければ採用しない（結合ズレ防止）
+        self.assertIn("_render_safe_broll_candidate(source, start, frames, out_path)", src)
+        # 最厳格に戻せる経路（抽象背景）も残っていること
+        self.assertIn("非人物の抽象背景へ退避", src)
 
     def test_unmatched_remix_shows_mv_by_default(self):
         # 別アレンジRemix等で波形/クロマ/音内容アラインのどれでも配置できない時、

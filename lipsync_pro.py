@@ -107,9 +107,14 @@ FEAT_COARSE_MIN_PROM = 4.0   # ＋ピーク突出度（δスイープ内でど�
 VOC_GATE = True      # ON: Remix無声区間は、MVも歌ってないカット（Bロール等）を優先
 SILENCE_PEN = 3.0    # Remix無声なのにMVが歌ってる候補への罰則（強め）
 VOC_HOP = 0.05       # 声エネルギー包絡の時間解像度（秒）
-# 検出済み顔以外の見逃しを実写MVで完全否定できないため、絶対安全モード
-# では別MVカットをBロール認証せず、危険区間を必ず非人物背景へ送る。
-ALLOW_REAL_MV_SAFE_BROLL = False
+# 危険区間（口の同期を証明できない区間）の見せ方。
+#   ALLOW_REAL_MV_SAFE_BROLL=True: まずMV内の「口が映らないと認証できたカット」を当てる。
+#   SAFE_BG_USE_MV_INSTEAD=True  : それも見つからない場合、抽象背景(紫)ではなく
+#                                  MVの別位置の映像を当てる。方針は「紫の画面を出さない」。
+#                                  同期は主張しない区間なので、口が映っても“ズレ”ではない。
+#   両方Falseにすると、従来どおり必ず非人物背景（紫）へ送る最厳格モードに戻る。
+ALLOW_REAL_MV_SAFE_BROLL = True
+SAFE_BG_USE_MV_INSTEAD = True
 SYNC_FIRST = True    # 歌ってる区間は同期最優先（その区間だけ多様化を弱める）
 FORCE_BROLL = True   # 無声区間で歌唱カットしか候補に無い時、非歌唱カットを強制的に当てる
 
@@ -2898,6 +2903,23 @@ def _safe_background_ffmpeg_command(output_path, nframes, width=OUT_W,
     ]
 
 
+def _fill_segment_command(mv_path, output_path, nframes):
+    """区間を埋めるコマンド。既定ではMVをループさせて埋め、紫背景は出さない。
+
+    「映像はMVの中からしか出さない」方針。MVが無い/使えない環境でだけ、
+    従来の非人物背景（抽象グラデーション）へ退避する。
+    """
+    if SAFE_BG_USE_MV_INSTEAD and mv_path:
+        vf = (f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
+              f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS},"
+              f"trim=end_frame={int(nframes)},setpts=PTS-STARTPTS")
+        return ["ffmpeg", "-v", "error", "-y", "-stream_loop", "-1",
+                "-i", str(mv_path), "-an", "-vf", vf,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-frames:v", str(int(nframes)), str(output_path)]
+    return _safe_background_ffmpeg_command(output_path, nframes)
+
+
 def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp_dir,
                   subseg=2.0, rmx_act=None, mouth_profile=None,
                   safe_mouth_profile=None, unsafe_ranges=None,
@@ -3014,14 +3036,39 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
                 _n_swap += 1
                 _swapped = True
             else:
-                _safe_background = True
-                _n_safe_background += 1
+                # 認証できる口元なしカットが無い場合でも、紫の抽象背景は出さず
+                # MVの別位置を当てる（既存の差し替え機構をそのまま利用）。
+                _alt_ok = False
+                if SAFE_BG_USE_MV_INSTEAD and mv_dur > dur + 0.05:
+                    try:
+                        aligned_pos = float(o_pos)
+                        span = max(0.1, mv_dur - dur - 0.05)
+                        step = max(3.0, dur * 1.7)
+                        t_alt = float((len(_swap_avoid) * step) % span)
+                        # ★同期を証明できなかった「その位置そのもの」は出さない。
+                        #   （出すと、合っていない口パクを同期のように見せてしまう）
+                        for _ in range(4):
+                            if abs(t_alt - aligned_pos) >= max(1.0, dur):
+                                break
+                            t_alt = float((t_alt + step) % span)
+                        o_pos = t_alt
+                        _swap_avoid.append(t_alt)
+                        if len(_swap_avoid) > 8:
+                            _swap_avoid.pop(0)
+                        _n_swap += 1
+                        _swapped = True
+                        _alt_ok = True
+                    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                        _alt_ok = False
+                if not _alt_ok:
+                    _safe_background = True
+                    _n_safe_background += 1
 
         seg = tmp_dir / f"seg_{idx:04d}.mp4"
         idx += 1
         seg.unlink(missing_ok=True)
         if _safe_background:
-            rr = run(_safe_background_ffmpeg_command(seg, nframes))
+            rr = run(_fill_segment_command(mv_path, seg, nframes))
             if (getattr(rr, "returncode", 1) == 0
                     and _video_has_exact_frames(seg, nframes)):
                 seg_files.append(seg)
@@ -3140,9 +3187,29 @@ def warp_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp_
                      or _segment_requires_safe_visual(r0, dur, unsafe_ranges))
         need_safe = need_safe or not _mapped_frames_have_verified_lipsync_visual(
             safe_mouth_profile, remix_frame_times, source_frame_times, rmx_act)
-        if need_safe:
+        # 証明できない区間の見せ方。既定では紫の抽象背景を出さず、
+        # MVの「別位置」を当てる（合っていない“その位置”は必ず避ける）。
+        _use_mv = not need_safe
+        if need_safe and SAFE_BG_USE_MV_INSTEAD and mv_dur > dur + 0.05:
+            try:
+                aligned_pos = float(o0)
+                span = max(0.1, mv_dur - dur - 0.05)
+                step = max(3.0, dur * 1.7)
+                t_alt = float((safe_background_count * step) % span)
+                for _ in range(4):
+                    if abs(t_alt - aligned_pos) >= max(1.0, dur):
+                        break
+                    t_alt = float((t_alt + step) % span)
+                o0 = t_alt
+                src_dur = min(dur, max(0.05, mv_dur - o0))
+                pts = dur / src_dur
+                safe_background_count += 1
+                _use_mv = True
+            except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                _use_mv = False
+        if not _use_mv:
             safe_background_count += 1
-            r = run(_safe_background_ffmpeg_command(seg, nframes))
+            r = run(_fill_segment_command(mv_path, seg, nframes))
         else:
             vf = (f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
                   f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,"

@@ -203,8 +203,14 @@ class CertifiedNoMouthTests(unittest.TestCase):
 
 
 class SafeBackgroundCommandTests(unittest.TestCase):
-    def test_absolute_safety_mode_never_uses_real_mv_broll(self):
-        self.assertFalse(lipsync_pro.ALLOW_REAL_MV_SAFE_BROLL)
+    def test_no_purple_policy_defaults_but_strict_mode_available(self):
+        # 既定は「紫を出さない」：口元なし認証カット→無ければMVの別位置
+        self.assertTrue(lipsync_pro.ALLOW_REAL_MV_SAFE_BROLL)
+        self.assertTrue(lipsync_pro.SAFE_BG_USE_MV_INSTEAD)
+        # 最厳格（必ず非人物背景）へ戻せる分岐自体は保持されている
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        self.assertIn("if not _use_mv:", src)
+        self.assertIn("_safe_background = True", src)
 
     def test_visual_plan_preserves_good_sync_and_fails_closed(self):
         self.assertEqual(lipsync_pro._safe_visual_plan(False, None),
@@ -340,15 +346,40 @@ class AlignedVisualProofTests(unittest.TestCase):
         return next(command for command in commands
                     if any("seg_0000.mp4" in part for part in command))
 
-    def test_equal_detector_failure_uses_only_safe_background(self):
+    @staticmethod
+    def _ss_of(command):
+        """ffmpegコマンドの -ss（MVのどの位置を切り出したか）を取り出す。"""
+        return float(command[command.index("-ss") + 1])
+
+    def _assert_not_aligned_position(self, command, aligned_ss, msg=""):
+        """証明できない区間の見せ方を検証する。
+
+        方針変更：紫の抽象背景は既定で出さず、MVの『別位置』を当てる。
+        ただし本質的な安全性として『合っていない“その位置”そのもの』は
+        絶対に出さない（出すと未同期の口パクを同期のように見せてしまう）。
+        紫背景でもMV別位置でも、どちらでもこの条件を満たせば合格とする。
+        """
+        if "lavfi" in command:
+            self.assertNotIn("PERSON_MV.mp4", command, msg)
+            return
+        self.assertIn("PERSON_MV.mp4", command, msg)
+        got = self._ss_of(command)
+        self.assertTrue(np.isfinite(got), msg)
+        self.assertNotAlmostEqual(got, aligned_ss, places=3, msg=msg)
+
+    def _aligned_ss(self, renderer="equal"):
+        _ok, cmds = self._render_with_mock(renderer, _active_lipsync_profile())
+        return self._ss_of(self._visual_segment_command(cmds))
+
+    def test_equal_detector_failure_never_shows_aligned_position(self):
+        aligned = self._aligned_ss("equal")
         ok, commands = self._render_with_mock("equal", None)
         command = self._visual_segment_command(commands)
         self.assertTrue(ok)
-        self.assertIn("-f", command)
-        self.assertIn("lavfi", command)
-        self.assertNotIn("PERSON_MV.mp4", command)
+        self._assert_not_aligned_position(command, aligned)
 
     def test_equal_one_uncertain_or_closed_frame_fails_closed(self):
+        aligned = self._aligned_ss("equal")
         for field, value in (("mouth_state", 0), ("activity", 0.0)):
             profile = _active_lipsync_profile()
             i = int(np.argmin(np.abs(profile["times"] - 1.0)))
@@ -356,8 +387,7 @@ class AlignedVisualProofTests(unittest.TestCase):
             ok, commands = self._render_with_mock("equal", profile)
             command = self._visual_segment_command(commands)
             self.assertTrue(ok, field)
-            self.assertIn("lavfi", command, field)
-            self.assertNotIn("PERSON_MV.mp4", command, field)
+            self._assert_not_aligned_position(command, aligned, field)
 
     def test_equal_complete_active_profile_can_use_aligned_mv(self):
         ok, commands = self._render_with_mock(
@@ -390,17 +420,21 @@ class AlignedVisualProofTests(unittest.TestCase):
                     unsafe_ranges=[], visual_phase_proof_ranges=[])
         command = self._visual_segment_command(commands)
         self.assertTrue(ok)
-        self.assertIn("lavfi", command)
-        self.assertNotIn("PERSON_MV.mp4", command)
+        # このケースのアンカーは 0.0 から始まる＝合っていない“その位置”は 0.0
+        self._assert_not_aligned_position(command, 0.0)
 
     def test_warp_cannot_bypass_visual_proof(self):
-        for profile, expect_mv in ((None, False),
-                                   (_active_lipsync_profile(), True)):
-            ok, commands = self._render_with_mock("warp", profile)
-            command = self._visual_segment_command(commands)
-            self.assertTrue(ok)
-            self.assertEqual("PERSON_MV.mp4" in command, expect_mv)
-            self.assertEqual("lavfi" in command, not expect_mv)
+        aligned = self._aligned_ss("warp")
+        # 証明あり＝そのままMVを当てる／証明なし＝その位置は出さない
+        ok, commands = self._render_with_mock("warp", _active_lipsync_profile())
+        command = self._visual_segment_command(commands)
+        self.assertTrue(ok)
+        self.assertIn("PERSON_MV.mp4", command)
+        self.assertNotIn("lavfi", command)
+        ok, commands = self._render_with_mock("warp", None)
+        command = self._visual_segment_command(commands)
+        self.assertTrue(ok)
+        self._assert_not_aligned_position(command, aligned)
 
     def test_output_frame_must_not_round_past_a_silent_vocal_bin(self):
         # t=.033sの30fps frameは0.00-0.05s binと0.05-0.10s binを跨ぐ。
@@ -424,8 +458,9 @@ class AlignedVisualProofTests(unittest.TestCase):
                 renderer, profile, anchors=nan_anchors)
             command = self._visual_segment_command(commands)
             self.assertTrue(ok, renderer)
-            self.assertIn("lavfi", command, renderer)
-            self.assertNotIn("PERSON_MV.mp4", command, renderer)
+            # NaNのマッピングがそのままffmpegへ渡らないこと（有限な位置になる）
+            if "lavfi" not in command:
+                self.assertTrue(np.isfinite(self._ss_of(command)), renderer)
 
     def test_source_mapping_always_starts_at_actual_ffmpeg_seek(self):
         remix, source = lipsync_pro._rendered_frame_mapping(
