@@ -82,6 +82,24 @@ class TempoSearchRangeTests(unittest.TestCase):
         self.assertIn("テンポ差 ×", src)
         self.assertIn("MVを補正してからリップシンクします", src)
 
+    def test_tempo_adjust_before_lipsync_even_when_not_locked(self):
+        """波形が一直線に揃わなくても、等倍より明確に良い倍率ならMVを補正してから
+        リップシンクへ渡す（実例: Dj Dark Remix ×1.20 / 一直線度28% vs 等倍0%）。
+        補正せず渡すと19%ズレたままDTWに投げることになり一致0.46で失敗していた。"""
+        src = CORE_PATH.read_text(encoding="utf-8")
+        # lock<0.45 の分岐内で、リップシンク呼び出しの前に補正が入っていること
+        i_branch = src.index("if lock < 0.45:")
+        i_lip = src.index("_try_vocal_lipsync", i_branch)
+        seg = src[i_branch:i_lip]
+        self.assertIn("make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)", seg)
+        self.assertIn("(lock - lock_1p0) >= 0.10", seg)
+
+    def test_adjust_gate_ignores_weak_evidence(self):
+        # 等倍との差が小さい場合は補正しない（Cake by the Ocean等を巻き込まない）
+        for lock, lock_1p0, expect in ((0.28, 0.00, True), (0.09, 0.03, False),
+                                       (0.10, 0.01, False)):
+            self.assertEqual((lock - lock_1p0) >= 0.10, expect)
+
 
 if __name__ == "__main__":
     unittest.main()

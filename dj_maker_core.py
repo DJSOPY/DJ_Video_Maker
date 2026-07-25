@@ -2941,6 +2941,20 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         print(f"  🎚 テンポ探索: 最良 ×{best_rate:.3f}（一直線度 {lock*100:.0f}% / 等倍は {lock_1p0*100:.0f}%）")
         if lock < 0.45:
             print(f"  ⚠️ どのテンポでも波形が一直線に揃わない（別アレンジ）→ リップシンクに切替")
+            # ★波形が一直線に揃わなくても、テンポ比そのものは信用できることが多い。
+            #   Remixは構成を並べ替える（サビ始まり等）ので窓が一直線に並ばず一直線度は
+            #   下がるが、「等倍より明確に良い倍率」が出ているなら倍率は本物。
+            #   ここでMVを合わせずに渡すと、19%もテンポが違う映像のままDTWに投げることに
+            #   なり、伸縮を吸収しきれず失敗する（実例: Dj Dark Remix ×1.20 を等倍のまま
+            #   渡して一致0.46で不採用）。補正してからリップシンクへ渡す。
+            if (abs(best_rate - 1.0) > 0.005 and (lock - lock_1p0) >= 0.10):
+                print(f"  🎚 テンポ差 ×{best_rate:.3f} は明確（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）"
+                      f" → MVを補正してからリップシンクします")
+                adj = make_tempo_adjusted_mv(video_path, best_rate, tmp_dir)
+                if adj is not None:
+                    video_path = adj
+                    vid_dur = get_duration(video_path) or (vid_dur / best_rate)
+                    video_audio = wav_to_array_path(video_path, duration=min(vid_dur, 360))
             if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
                 return
             _safe_end = not REMIX_SHOW_MV_WHEN_UNMATCHED
