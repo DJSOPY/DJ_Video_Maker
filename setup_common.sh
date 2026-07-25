@@ -543,3 +543,86 @@ djvm_full_setup(){
     djvm_setup_python "${1:-full}"
     djvm_verify
 }
+
+
+# ============================================================
+#  ⑥ 起動ファイル(.command)の自動更新
+# ============================================================
+# なぜ別扱いが必要か:
+#   本体の自動更新(djvm_auto_update)は .py だけを更新し、.command は
+#   意図的に除外している。実行中のスクリプトを cp で上書きすると、bash が
+#   読み込み途中のバイト位置から新しい内容を読んでしまい、スクリプトが壊れるため。
+#   その結果、ランチャー側のバグ（例: 利用ログURLの欠落）は配布後に一切直せず、
+#   全員へ個別に「差し替えて」と頼むしかなかった。
+#
+# ここでの解決:
+#   ・実行中でない .command … 普通に cp で更新（安全）
+#   ・実行中の .command     … mv で差し替える。mv は inode を入れ替えるだけなので、
+#                            実行中の bash は開いたままの古い内容を最後まで
+#                            安全に読み続けられる。そのうえで exec し直し、
+#                            新しい版をその場から適用する。
+#   ・無限ループ防止に DJVM_SELF_UPDATED を使う（exec 後は再実行しない）
+#   ・失敗・オフライン・取得できない時は、何もせず静かに続行（起動は止めない）
+#
+# この関数自体は setup_common.sh にある＝自動更新の対象なので、
+# 将来この仕組みにバグが見つかっても自動で配れる。
+djvm_self_update(){
+    local DIR="${1:-$(cd "$(dirname "$0")" && pwd)}"
+    local BASE="https://raw.githubusercontent.com/DJSOPY/DJ_Video_Maker/main"
+
+    # exec で戻ってきた時は、もう更新済みなので何もしない
+    [ -n "$DJVM_SELF_UPDATED" ] && return 0
+    # 利用者が自動更新を止めている時は尊重する
+    [ -f "$DIR/.no_autoupdate" ] && return 0
+    # オフラインなら静かにスキップ
+    curl -m 8 -s -o /dev/null -I "https://raw.githubusercontent.com" 2>/dev/null || return 0
+
+    # 実行中のファイルを名前ではなく実体(inode)で判定する。
+    # macOSは同じ名前でも正規化(NFC/NFD)が違うことがあり、文字列比較だと外れる。
+    local SELF_PATH
+    SELF_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+
+    # 「URLエンコード名<TAB>ローカル名」。GitHubはNFD正規化で保存されている。
+    local PAIRS='%E3%81%93%E3%82%8C%E3%82%92%E3%82%BF%E3%82%99%E3%83%95%E3%82%99%E3%83%AB%E3%82%AF%E3%83%AA%E3%83%83%E3%82%AF%EF%BC%81.command	これをダブルクリック！.command
+DJ_Video_Maker.command	DJ_Video_Maker.command
+DJ_Video_Maker_URL.command	DJ_Video_Maker_URL.command
+%E4%BF%AE%E5%BE%A9_%E5%88%9D%E5%9B%9E%E3%81%8B%E3%82%89%E3%82%84%E3%82%8A%E7%9B%B4%E3%81%97.command	修復_初回からやり直し.command
+%E6%9C%80%E5%88%9D%E3%81%AB%E3%81%93%E3%82%8C%E3%82%92%E5%AE%9F%E8%A1%8C.command	最初にこれを実行.command
+%E6%9C%80%E6%96%B0%E7%89%88%E3%81%AB%E3%82%A2%E3%83%83%E3%83%95%E3%82%9A%E3%83%86%E3%82%99%E3%83%BC%E3%83%88.command	最新版にアップデート.command'
+
+    local TMP; TMP="$(mktemp -d 2>/dev/null)" || return 0
+    local self_new="" others=0 enc name
+
+    while IFS=$'\t' read -r enc name; do
+        [ -n "$enc" ] && [ -n "$name" ] || continue
+        # そのフォルダに無いランチャーは、勝手に増やさない（配布構成を変えない）
+        [ -f "$DIR/$name" ] || continue
+        curl -fsSL -m 30 "$BASE/$enc" -o "$TMP/dl" 2>/dev/null || continue
+        [ -s "$TMP/dl" ] || continue
+        cmp -s "$TMP/dl" "$DIR/$name" && continue   # 変更なし
+
+        if [ "$DIR/$name" -ef "$SELF_PATH" ]; then
+            # 実行中 → cp で上書きしてはいけない。最後に mv で差し替える。
+            mv "$TMP/dl" "$TMP/self_new" 2>/dev/null && self_new="$TMP/self_new"
+        else
+            cp "$TMP/dl" "$DIR/$name" 2>/dev/null && chmod +x "$DIR/$name" 2>/dev/null \
+                && others=$((others+1))
+        fi
+    done <<< "$PAIRS"
+
+    [ "$others" -gt 0 ] && echo "   ⬆️ 起動ファイル ${others}個を更新しました"
+
+    if [ -n "$self_new" ]; then
+        echo "   ⬆️ この起動ファイル自体が新しくなりました。開き直します..."
+        # mv は inode の差し替えなので、実行中のbashは古い内容を読み続けられる
+        if mv "$self_new" "$SELF_PATH" 2>/dev/null; then
+            chmod +x "$SELF_PATH" 2>/dev/null
+            rm -rf "$TMP" 2>/dev/null
+            export DJVM_SELF_UPDATED=1
+            exec bash "$SELF_PATH" "$@"
+        fi
+        echo "   （差し替えに失敗したので、今のバージョンのまま続行します）"
+    fi
+    rm -rf "$TMP" 2>/dev/null
+    return 0
+}

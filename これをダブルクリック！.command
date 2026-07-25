@@ -95,6 +95,14 @@ if [ ! -f "$DIR/setup_common.sh" ]; then
 fi
 source "$DIR/setup_common.sh"
 
+# ---- 起動ファイル(.command)自体も最新にする ----
+#   上の djvm_auto_update は .py だけを更新する（実行中の .command を
+#   cp で上書きすると bash が壊れるため、意図的に除外している）。
+#   djvm_self_update は mv + exec で安全に差し替えるので、ランチャー側の
+#   修正も配布後に届くようになる。中身は setup_common.sh にあり、
+#   そこ自体が自動更新されるので、この仕組み自体も後から直せる。
+djvm_self_update "$DIR"
+
 # ---- 診断 → ツール → Python → 検証（AIライブラリは静かに試すだけ）----
 djvm_full_setup lite
 
