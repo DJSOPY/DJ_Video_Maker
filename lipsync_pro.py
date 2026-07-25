@@ -3658,7 +3658,8 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
                   f"（MVと対応し得る範囲）で品質を判定します")
         print("     📊 Pro同期品質: "
               f"カバー{q['coverage']*100:.0f}% (末尾{q['tail_coverage']*100:.0f}%/"
-              f"連続範囲外{q['longest_invalid_seconds']:.1f}s) / "
+              f"連続範囲外{q['longest_invalid_seconds']:.1f}s"
+              f"/末尾外{q.get('ending_invalid_seconds', 0.0):.2f}s) / "
               f"発音類似{q['feature_similarity']:.2f} "
               f"(局所p20={q['block_similarity_p20']:.2f}/上積み{q['feature_lift']:+.2f}) / "
               f"onset{q['onset_correlation']:.2f} / DTW{q['median_dtw_cost']:.2f} "
@@ -3668,7 +3669,33 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
             print(f"     🛡️ 口元非表示対象: {len(q['unsafe_ranges'])}区間 / "
                   f"計{unsafe_seconds:.1f}s（認証不能時は安全背景）")
         if not q["accepted"]:
+            # ★どの条件で落ちたかを明示する。「信頼度が不足」だけでは、
+            #   6つある判定のどれが原因か分からず改善のしようがなかった。
+            is_hubert_now = "hubert" in str(fn).lower()
+            _ms_ = 0.08 if is_hubert_now else 0.04
+            _mb_ = 0.04 if is_hubert_now else 0.015
+            _mc_ = 1.10 if is_hubert_now else 1.25
+            reasons = []
+            if q["coverage"] < 0.98:
+                reasons.append(f"カバー{q['coverage']*100:.0f}%<98%")
+            if q["tail_coverage"] < 0.98:
+                reasons.append(f"末尾カバー{q['tail_coverage']*100:.0f}%<98%")
+            if q["longest_invalid_seconds"] > 0.75:
+                reasons.append(f"連続範囲外{q['longest_invalid_seconds']:.1f}s>0.75s")
+            if q.get("ending_invalid_seconds", 0.0) > 0.25:
+                reasons.append(
+                    f"末尾の範囲外{q['ending_invalid_seconds']:.2f}s>0.25s")
+            if q["median_dtw_cost"] > _mc_:
+                reasons.append(f"DTW{q['median_dtw_cost']:.2f}>{_mc_}")
+            if q["p75_dtw_cost"] > _mc_ + 0.20:
+                reasons.append(f"DTW p75={q['p75_dtw_cost']:.2f}>{_mc_ + 0.20:.2f}")
+            if q["block_similarity_p20"] < _mb_:
+                reasons.append(f"局所p20={q['block_similarity_p20']:.2f}<{_mb_}")
+            if q["longest_bad_seconds"] > 6.0:
+                reasons.append(f"弱一致が連続{q['longest_bad_seconds']:.1f}s>6.0s")
             print("     ⚠️ Pro同期の絶対信頼度が不足 → この映像を採用せず旧方式へ")
+            if reasons:
+                print(f"        ↳ 不足の内訳: {' / '.join(reasons)}")
             return False
 
         # --- 配置（既定=等速 See You Again式／warpは任意）---
