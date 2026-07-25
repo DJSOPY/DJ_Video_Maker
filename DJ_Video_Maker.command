@@ -208,6 +208,75 @@ echo "✅ 準備完了！ツールを起動します..."
 
 # ---- 必要ファイルの確認（全部入りには 3つの.py が同じフォルダに要る）----
 DIR="$(dirname "$0")"
+
+# ---- 本体の自動アップデート（1日1回・GitHubから最新の.py/.commandを取り直す）----
+# 目的：仲間に配ったあと、こちらがGitHubを更新するだけで全員のコードが最新になる。
+#   ・1日1回だけチェック（毎回DLは重い＆ネット必須になるため、スタンプで間引く）
+#   ・ネットが無い/GitHubが落ちていても、必ず手元のファイルで起動を続行（止めない）
+#   ・DLは一時フォルダに集め、全部そろって初めて本物と差し替える（途中失敗で壊さない）
+#   ・自動更新を止めたい人は、同じフォルダに「.no_autoupdate」を置けばスキップ
+DJVM_REPO="https://raw.githubusercontent.com/DJSOPY/DJ_Video_Maker/main"
+_upd_stamp="$HOME/.dj_video_maker/last_selfupdate"
+_today="$(date +%Y%m%d)"
+if [ -f "$DIR/.no_autoupdate" ]; then
+    :   # ユーザーが自動更新を無効化している→何もしない
+elif false; then
+    :   # （旧: 今日はもうチェック済みならスキップ。GitHub更新直後に反映されない
+        #   ため廃止し、起動のたびに毎回チェックするようにした）
+elif ! curl -m 8 -s -o /dev/null -I "$DJVM_REPO/dj_maker_core.py" 2>/dev/null; then
+    :   # ネット無し/GitHubに繋がらない→黙って手元のファイルで起動継続
+else
+    echo "🔄 最新版を確認中...（数秒／ネットが無ければ自動でスキップ）"
+    _tmp="$(mktemp -d 2>/dev/null)"
+    if [ -n "$_tmp" ] && [ -d "$_tmp" ]; then
+        # 更新対象：本体3〜4個の.py と、この.command自身、setup。UI/PDF等は install.sh 側。
+        _upd_files="dj_maker_core.py lipsync_pro.py vocal_sync.py mouth_sync.py setup_common.sh DJ_Video_Maker.command 修復_初回からやり直し.command"
+        _all_ok="1"
+        for f in $_upd_files; do
+            # 日本語ファイル名対策：NFD/NFC/非エンコードの順に試す（install.shと同じ）
+            _got=""
+            for variant in \
+                "$(python3 -c "import urllib.parse,unicodedata,sys;print(urllib.parse.quote(unicodedata.normalize('NFD',sys.argv[1])))" "$f" 2>/dev/null)" \
+                "$(python3 -c "import urllib.parse,unicodedata,sys;print(urllib.parse.quote(unicodedata.normalize('NFC',sys.argv[1])))" "$f" 2>/dev/null)" \
+                "$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$f" 2>/dev/null)"
+            do
+                [ -z "$variant" ] && continue
+                if curl -fsSL --retry 2 -m 30 -o "$_tmp/$f" "$DJVM_REPO/$variant" 2>/dev/null; then
+                    # 中身が空/エラーページでないか最低限チェック（先頭が想定の文字で始まるか）
+                    if [ -s "$_tmp/$f" ]; then _got="1"; break; fi
+                fi
+            done
+            # 手元に元々あるファイルだけ必須扱い（元々無い任意ファイルのDL失敗は無視）
+            if [ -z "$_got" ] && [ -f "$DIR/$f" ]; then _all_ok="0"; fi
+        done
+        if [ "$_all_ok" = "1" ]; then
+            # 全部そろった→手元へ反映（DLできたものだけ上書き）
+            _changed="0"
+            for f in $_upd_files; do
+                if [ -s "$_tmp/$f" ]; then
+                    if ! cmp -s "$_tmp/$f" "$DIR/$f" 2>/dev/null; then _changed="1"; fi
+                    cp "$_tmp/$f" "$DIR/$f" 2>/dev/null
+                fi
+            done
+            chmod +x "$DIR"/*.command "$DIR/setup_common.sh" 2>/dev/null
+            mkdir -p "$HOME/.dj_video_maker" 2>/dev/null
+            echo "$_today" > "$_upd_stamp" 2>/dev/null
+            if [ "$_changed" = "1" ]; then
+                echo "✅ 最新版に更新しました。反映のため一度だけ再起動します..."
+                rm -rf "$_tmp" 2>/dev/null
+                # 差し替えた自分自身を、新しい内容で確実に実行し直す
+                exec "$0"
+            else
+                echo "✅ すでに最新版です。"
+            fi
+        else
+            # 一部でも取れなかった→今回は反映せず手元のまま起動（安全側）。スタンプも書かない＝次回また試す
+            echo "ℹ️ 更新の取得に一部失敗したため、今回は現在のバージョンで起動します。"
+        fi
+        rm -rf "$_tmp" 2>/dev/null
+    fi
+fi
+
 [ -f "$DIR/dj_maker_core.py" ] || { echo "❌ dj_maker_core.py が見つかりません（この.commandと同じフォルダに置いてください）"; read -p "Enterで閉じる..."; exit 1; }
 if [ ! -f "$DIR/vocal_sync.py" ] || [ ! -f "$DIR/lipsync_pro.py" ]; then
     echo "⚠️ 同じフォルダに lipsync_pro.py / vocal_sync.py が揃っていません。"

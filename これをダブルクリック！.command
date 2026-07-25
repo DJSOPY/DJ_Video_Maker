@@ -23,14 +23,13 @@ djvm_auto_update() {
     local STAMP="$HOME/.dj_video_maker/last_update_check"
     mkdir -p "$HOME/.dj_video_maker" 2>/dev/null
 
-    # 1日1回だけ：前回チェックから24時間(86400秒)未満なら何もしない
-    if [ -f "$STAMP" ]; then
-        local last now
-        last=$(cat "$STAMP" 2>/dev/null || echo 0)
-        now=$(date +%s)
-        if [ $((now - last)) -lt 86400 ]; then
-            return 0
-        fi
+    # ★起動のたびに毎回チェックする。
+    #   以前は「24時間に1回」だったため、GitHubを更新してすぐ起動しても
+    #   その日はチェック済み扱いでスキップされ、古いコードのまま動いていた。
+    #   本体7ファイルは合計1MB未満で、確認と取得は数秒。確実さを優先する。
+    #   一時的に自動更新を止めたい時は、同じフォルダに「.no_autoupdate」を置く。
+    if [ -f "$DIR/.no_autoupdate" ]; then
+        return 0
     fi
 
     # オフラインなら静かにスキップ（起動は止めない）
@@ -104,6 +103,33 @@ for f in dj_maker_core.py web_server.py web_ui.html; do
     [ -f "$DIR/$f" ] || { echo "❌ $f が同じフォルダにありません"; read -p "Enterで閉じる..."; exit 1; }
 done
 find "$DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+
+# ---- 利用ログの送信（起動のたびに1回・誰がいつ使ったかを集計先へ）----
+# 目的：配った仲間の「最終利用・累計回数・バージョン」を把握する。
+#   ・送る内容は最小限：Macのユーザー名・端末名・OS・アプリ版数・日時のみ
+#     （曲名や音源など、作った中身は一切送らない）
+#   ・集計先URL（下の DJVM_LOG_URL）が空、またはネット無しなら何もしない＝起動に影響なし
+#   ・バックグラウンドで投げっぱなし（応答を待たない）ので起動は遅くならない
+#   ・止めたい人は、同じフォルダに「.no_usagelog」を置けば送信しない
+# ★DJVM_LOG_URL に、Google Apps Script で発行した「ウェブアプリのURL」を貼ってください。
+#   （手順は同梱の「利用ログ設定手順.txt」を参照。空のままなら送信機能はオフ。）
+DJVM_LOG_URL=""
+if [ -n "$DJVM_LOG_URL" ] && [ ! -f "$DIR/.no_usagelog" ]; then
+    _u="$(id -un 2>/dev/null)"
+    _host="$(scutil --get ComputerName 2>/dev/null || hostname 2>/dev/null)"
+    _osv="$(sw_vers -productVersion 2>/dev/null)"
+    _ver="$(wc -l < "$DIR/dj_maker_core.py" 2>/dev/null | tr -d ' ')"
+    _ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    (
+      curl -fsS -m 8 -G "$DJVM_LOG_URL" \
+        --data-urlencode "user=$_u" \
+        --data-urlencode "host=$_host" \
+        --data-urlencode "os=$_osv" \
+        --data-urlencode "ver=$_ver" \
+        --data-urlencode "ts=$_ts" \
+        -o /dev/null 2>/dev/null
+    ) &
+fi
 
 # ---- サーバー起動＋ブラウザを開く ----
 export DJVM_PYTHON="$PYTHON_CMD"
