@@ -105,20 +105,35 @@ class UnsafeRangeTests(unittest.TestCase):
         self.assertTrue(any(lo < 71.0 and hi > 99.0
                             for lo, hi in report["unsafe_ranges"]))
 
-    def test_even_subsecond_vocal_silence_is_hidden(self):
+    def test_sustained_silence_hidden_but_word_gaps_kept(self):
+        """歌の語間・息継ぎ（1秒未満）は隠さず、本当の非歌唱だけ隠す。
+
+        以前は 0.02秒（20ミリ秒）以上の無音をすべて「歌っていない」と判定し、
+        216秒の曲で170秒が非表示になっていた。その結果、数少ない口なしカットを
+        使い回して同じ映像がループして見えた（実測: 0.02秒だと113.9秒/256区間、
+        1.0秒なら本当の非歌唱66.5秒/2区間）。
+        """
         hop = 0.05
         active = np.ones(120, dtype=bool)
-        active[10:20] = False       # 0.50秒: 短くても人物を隠す
-        active[40:60] = False       # 1.00秒: 同期不能なので隠す
+        active[10:20] = False       # 0.50秒: 語間・息継ぎ → 隠さない
+        active[40:60] = False       # 1.00秒: 本当の非歌唱 → 隠す
         ranges = lipsync_pro._sustained_inactive_ranges(
             (hop, active), 0.0, 6.0)
-        self.assertEqual(ranges, [(0.5, 1.0), (2.0, 3.0)])
+        self.assertEqual(ranges, [(2.0, 3.0)])
 
-    def test_three_hundred_ms_dropout_is_hidden(self):
+    def test_three_hundred_ms_dropout_is_not_hidden(self):
+        # 0.3秒の途切れは息継ぎ相当。ここで隠すと口パクが細切れになる。
         active = np.ones(40, dtype=bool)
         active[10:16] = False
         self.assertEqual(lipsync_pro._sustained_inactive_ranges(
-            (0.05, active), 0.0, 2.0), [(0.5, 0.8)])
+            (0.05, active), 0.0, 2.0), [])
+
+    def test_long_instrumental_break_is_still_hidden(self):
+        # 数秒の間奏（本当に歌っていない）は従来どおり隠す
+        active = np.ones(200, dtype=bool)
+        active[40:120] = False      # 4.0秒
+        self.assertEqual(lipsync_pro._sustained_inactive_ranges(
+            (0.05, active), 0.0, 10.0), [(2.0, 6.0)])
 
 
 class CertifiedNoMouthTests(unittest.TestCase):

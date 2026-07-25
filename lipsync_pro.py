@@ -122,6 +122,15 @@ SAFE_BG_USE_MV_INSTEAD = True
 #   音側(HuBERT/DTW/発音類似)の品質ゲートの判断に委ねて人物を表示する。
 #   明確な矛盾（歌ってないのに口が動く等）は conflicts 判定で引き続き弾く。
 VISUAL_PROOF_MIN_FACE = 0.30
+
+# 「歌っていない区間」とみなす無音の最短の長さ（秒）。
+#   これ以上ボーカルが無い区間だけを『非歌唱』として口元を隠す。
+#   ★以前は 0.02秒（20ミリ秒）で、歌の語間・息継ぎ・子音前の一瞬の無音まで
+#     すべて「歌っていない」と判定していた。その結果216秒中170秒が非表示になり、
+#     数少ない口なしカットを延々と使い回して同じ映像がループして見えた。
+#     （実測: 0.02秒だと113.9秒隠れるが、1.0秒なら本当の非歌唱66.5秒だけになる）
+#   同じ目的の処理が dj_maker_core 側では 0.8〜1.6秒を使っており、そちらと揃える。
+VOCAL_SILENCE_MIN_SEC = 1.0
 SYNC_FIRST = True    # 歌ってる区間は同期最優先（その区間だけ多様化を弱める）
 FORCE_BROLL = True   # 無声区間で歌唱カットしか候補に無い時、非歌唱カットを強制的に当てる
 
@@ -2065,7 +2074,8 @@ def _prepare_unsafe_ranges(ranges, lo, hi, pad=0.25, min_safe=0.75):
     return closed
 
 
-def _sustained_inactive_ranges(rmx_act, lo, hi, min_silence=0.02,
+def _sustained_inactive_ranges(rmx_act, lo, hi,
+                               min_silence=VOCAL_SILENCE_MIN_SEC,
                                max_active_island=0.20):
     """歌声が無い全解析frame区間を返す。
 
@@ -2328,7 +2338,8 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
             else:
                 report["unsafe_ranges"].extend(_sustained_inactive_ranges(
                     rmx_act, silence_lo, silence_hi,
-                    min_silence=0.02, max_active_island=0.20))
+                    min_silence=VOCAL_SILENCE_MIN_SEC,
+                    max_active_island=0.20))
 
         # 音響一致が通っていても、歌声と口の動きが3点中2点で矛盾する
         # 2秒窓は口元を見せない。
