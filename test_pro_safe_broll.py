@@ -638,6 +638,51 @@ class LowFaceRateVisualProofTests(unittest.TestCase):
         src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
         self.assertIn("max(silent_conflicts, singing_conflicts) >= 2", src)
 
+    def test_unsafe_cause_breakdown_does_not_change_behaviour(self):
+        """口元非表示の原因内訳は表示専用で、判定に一切影響しないこと。
+
+        `_prepare_unsafe_ranges` は範囲を前後0.25秒広げてから統合するため、
+        幅ゼロの範囲でも0.5秒の非表示区間になる。内訳を取るために値を
+        선別すると挙動が変わってしまうので、判定用の unsafe_ranges には
+        受け取った範囲をそのまま渡す。
+        """
+        raw = [(0.0, 1.0), (9.0, 9.0), (3.0, "x"), (5.0, 6.0)]
+        before = lipsync_pro._prepare_unsafe_ranges(list(raw), 0.0, 20.0)
+        report = {"unsafe_ranges": []}
+        lipsync_pro._mark_unsafe(report, "テスト原因", raw)
+        after = lipsync_pro._prepare_unsafe_ranges(
+            report["unsafe_ranges"], 0.0, 20.0)
+        self.assertEqual(before, after)
+        # 内訳には秒数として意味のあるものだけが入る
+        self.assertEqual(report["_unsafe_by_cause"]["テスト原因"],
+                         [(0.0, 1.0), (5.0, 6.0)])
+
+    def test_unsafe_causes_are_tagged_separately(self):
+        """「曲が歌っていない」と「歌唱中に確認できない」を混ぜないこと。
+
+        実例: 111.7秒/216.5秒(51.6%)を1つの数字で出していたため、
+        Extendedで足したイントロ・アウトロ(口パクを主張していない区間)まで
+        同期失敗として数えられ、ログが実態より悪く見えていた。
+        """
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        for cause in ("MVに対応が無い", "音の一致が弱い", "MV位置のジャンプ境界",
+                      "ボーカル解析に失敗", "曲が歌っていない", "口と歌声が矛盾"):
+            self.assertIn(f'"{cause}"', src, cause)
+        # 生の append が残っていない（全て原因つきの記録を通る）
+        self.assertNotIn('report["unsafe_ranges"].append(', src)
+        # 集計は統合前に取る（統合後だと原因が分からなくなる）
+        i_cause = src.index('report["unsafe_cause_seconds"]')
+        i_prep = src.index('report["unsafe_ranges"] = _prepare_unsafe_ranges(')
+        self.assertLess(i_cause, i_prep)
+
+    def test_merged_seconds_removes_overlap(self):
+        f = lipsync_pro._merged_seconds
+        self.assertAlmostEqual(f([(0, 10), (5, 15)]), 15.0)
+        self.assertAlmostEqual(f([(0, 10), (20, 25)]), 15.0)
+        self.assertAlmostEqual(f([(0, 5), (5, 10)]), 10.0)
+        self.assertAlmostEqual(f([(0, 10)], 2.0, 8.0), 6.0)
+        self.assertAlmostEqual(f([]), 0.0)
+
     def test_alt_mv_position_never_saturates_into_one_spot(self):
         """代替MV位置の数え上げに、頭打ちする履歴の長さを使わないこと。
 

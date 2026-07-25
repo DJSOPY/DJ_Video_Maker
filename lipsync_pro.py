@@ -2050,6 +2050,66 @@ def _unsafe_mask_ranges(times, unsafe, sample_sec=None):
     return out
 
 
+def _mark_unsafe(report, cause, ranges):
+    """unsafe範囲を、原因の内訳つきで記録する。
+
+    表示のためだけの記録で、採用判定にはいっさい影響しない
+    （report["unsafe_ranges"] への追加内容は従来と同一）。
+
+    なぜ必要か: 「口元非表示 111.7秒 / 51.6%」という1つの数字に、
+    性質のまったく違うものが混ざっていた。
+      ・曲が歌っていない区間（Extendedで足したイントロ/アウトロ等）
+        …口パクを主張していないので、そもそも失敗ではない
+      ・歌っているのに口を確認できない区間
+        …これが本当のリスク
+    区別せず合算していたため、ログが実態より悪く見えていた。
+    """
+    items = list(ranges or [])
+    if not items:
+        return
+    # ★判定に使う unsafe_ranges には、一切加工せずそのまま渡す。
+    #   _prepare_unsafe_ranges は範囲を前後0.25秒広げてから統合するため、
+    #   幅ゼロの範囲でも0.5秒の非表示区間になる。ここで選別すると
+    #   「ログだけの変更」ではなくなるので、素通しにして挙動を固定する。
+    report["unsafe_ranges"].extend(items)
+    # 内訳の集計にだけ、秒数として意味のあるものを拾う。
+    usable = []
+    for item in items:
+        try:
+            a, b = float(item[0]), float(item[1])
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue
+        if np.isfinite(a) and np.isfinite(b) and b > a:
+            usable.append((a, b))
+    if usable:
+        report.setdefault("_unsafe_by_cause", {}).setdefault(cause, []).extend(usable)
+
+
+def _merged_seconds(ranges, lo=None, hi=None):
+    """重なりを潰した合計秒数（内訳表示用）。"""
+    clean = []
+    for a, b in (ranges or []):
+        if lo is not None:
+            a = max(a, lo)
+        if hi is not None:
+            b = min(b, hi)
+        if b > a:
+            clean.append((a, b))
+    if not clean:
+        return 0.0
+    clean.sort()
+    total = 0.0
+    cs, ce = clean[0]
+    for a, b in clean[1:]:
+        if a <= ce:
+            ce = max(ce, b)
+        else:
+            total += ce - cs
+            cs, ce = a, b
+    total += ce - cs
+    return float(total)
+
+
 def _prepare_unsafe_ranges(ranges, lo, hi, pad=0.25, min_safe=0.75):
     """危険区間を広げ、0.75秒未満の口元表示候補を危険側へ吸収する。"""
     try:
@@ -2222,8 +2282,8 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
                 ending += sample_sec
             report["longest_invalid_seconds"] = float(longest)
             report["ending_invalid_seconds"] = float(ending)
-            report["unsafe_ranges"].extend(
-                _unsafe_mask_ranges(all_times, ~all_valid, sample_sec))
+            _mark_unsafe(report, "MVに対応が無い",
+                         _unsafe_mask_ranges(all_times, ~all_valid, sample_sec))
 
         ridx = all_ridx
         if rmx_act is not None:
@@ -2336,11 +2396,11 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
                 if len(_bad_run) == 2:
                     # 2ブロック連続が確定した時点で、さかのぼって両方隠す
                     for _b in _bad_run:
-                        report["unsafe_ranges"].append(
-                            (float(_b) * 2.0, (float(_b) + 1.0) * 2.0))
+                        _mark_unsafe(report, "音の一致が弱い", [
+                            (float(_b) * 2.0, (float(_b) + 1.0) * 2.0)])
                 elif len(_bad_run) > 2:
-                    report["unsafe_ranges"].append(
-                        (float(bid) * 2.0, (float(bid) + 1.0) * 2.0))
+                    _mark_unsafe(report, "音の一致が弱い", [
+                        (float(bid) * 2.0, (float(bid) + 1.0) * 2.0)])
             else:
                 cur = 0
                 _bad_run = []
@@ -2351,7 +2411,8 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
         for i in range(1, len(anchors)):
             if _mapping_interval_is_jump(anchors[i - 1], anchors[i]):
                 boundary = float(anchors[i][0])
-                report["unsafe_ranges"].append((boundary - 0.10, boundary + 0.10))
+                _mark_unsafe(report, "MV位置のジャンプ境界",
+                             [(boundary - 0.10, boundary + 0.10)])
 
         # Remix側に歌声が無い持続区間は、音響写像が正しくても口形同期を
         # 証明できない。MVの歌う口を偶然表示しないよう常に非表示へ送る。
@@ -2360,12 +2421,14 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
             silence_hi = float(rt[min(len(rt), len(rfeat)) - 1])
             if rmx_act is None:
                 # ボーカル有無の解析自体が失敗した区間は人物表示へ進めない。
-                report["unsafe_ranges"].append((silence_lo, silence_hi))
+                _mark_unsafe(report, "ボーカル解析に失敗",
+                             [(silence_lo, silence_hi)])
             else:
-                report["unsafe_ranges"].extend(_sustained_inactive_ranges(
-                    rmx_act, silence_lo, silence_hi,
-                    min_silence=VOCAL_SILENCE_MIN_SEC,
-                    max_active_island=0.20))
+                _mark_unsafe(report, "曲が歌っていない",
+                             _sustained_inactive_ranges(
+                                 rmx_act, silence_lo, silence_hi,
+                                 min_silence=VOCAL_SILENCE_MIN_SEC,
+                                 max_active_island=0.20))
 
         # 音響一致が通っていても、歌声と口の動きが3点中2点で矛盾する
         # 2秒窓は口元を見せない。
@@ -2395,14 +2458,20 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
                             conflicts += int(_ms_quality.is_mv_singing(
                                 mouth_profile, mv_t))
                     if conflicts >= 2:
-                        report["unsafe_ranges"].append(
-                            (float(block_start), float(block_start + 2.0)))
+                        _mark_unsafe(report, "口と歌声が矛盾", [
+                            (float(block_start), float(block_start + 2.0))])
                     block_start += 2.0
             except Exception:
                 pass
 
         unsafe_lo = max(0.0, float(rt[0]))
         unsafe_hi = float(rt[min(len(rt), len(rfeat)) - 1]) + max(feat_hop, 0.1)
+        # 原因別の秒数を先に集計する（_prepare_unsafe_ranges は全部を1本に
+        # 統合してしまい、どの原因で隠れたのか分からなくなるため）。
+        _by_cause = report.pop("_unsafe_by_cause", {})
+        report["unsafe_cause_seconds"] = {
+            cause: _merged_seconds(rs, unsafe_lo, unsafe_hi)
+            for cause, rs in _by_cause.items()}
         report["unsafe_ranges"] = _prepare_unsafe_ranges(
             report["unsafe_ranges"], unsafe_lo, unsafe_hi,
             pad=0.25, min_safe=0.75)
@@ -3714,6 +3783,21 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
             unsafe_seconds = sum(max(0.0, b - a) for a, b in q["unsafe_ranges"])
             print(f"     🛡️ 口元非表示対象: {len(q['unsafe_ranges'])}区間 / "
                   f"計{unsafe_seconds:.1f}s（認証不能時は安全背景）")
+            # ★原因の内訳。「曲が歌っていない」区間は口パクを主張していないので
+            #   同期の失敗ではない。合算した1つの数字だと実態より悪く見えるため、
+            #   何がどれだけ効いているかを出す（重なりがあるので合計は一致しない）。
+            _causes = q.get("unsafe_cause_seconds") or {}
+            if _causes:
+                _items = sorted(_causes.items(), key=lambda kv: -kv[1])
+                _txt = " / ".join(f"{c} {s:.0f}s" for c, s in _items if s >= 0.05)
+                if _txt:
+                    print(f"       ↳ 内訳（重複あり）: {_txt}")
+                _sing = sum(s for c, s in _items if c != "曲が歌っていない")
+                _mute = _causes.get("曲が歌っていない", 0.0)
+                if _mute >= 0.05:
+                    print(f"       ↳ うち「歌っていない区間」{_mute:.0f}s は"
+                          f"同期の失敗ではありません"
+                          f"（歌唱中に確認できないのは {_sing:.0f}s）")
         if not q["accepted"]:
             # ★どの条件で落ちたかを明示する。「信頼度が不足」だけでは、
             #   6つある判定のどれが原因か分からず改善のしようがなかった。
