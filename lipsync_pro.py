@@ -2332,7 +2332,13 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
 
         # 音響一致が通っていても、歌声と口の動きが3点中2点で矛盾する
         # 2秒窓は口元を見せない。
-        if mouth_profile is not None and rmx_act is not None and len(all_ridx):
+        # ★ただし顔がほとんど検出できないMVでは、この矛盾判定自体が信用できない。
+        #   実例: 顔検出率13%のMVで「歌っているのに口が動いていない」と誤判定され、
+        #   216秒中170秒が危険扱い→その全部を『口が映らないMVカット』で埋めた結果、
+        #   数少ない口なしカットを延々と使い回して同じ映像がループして見えた。
+        #   検出できないことは矛盾の証拠にならないので、判定不能としてスキップする。
+        if (mouth_profile is not None and rmx_act is not None and len(all_ridx)
+                and _visual_proof_applicable(mouth_profile)):
             try:
                 import mouth_sync as _ms_quality
                 t0 = max(0.0, float(rt[0]))
@@ -3078,7 +3084,8 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
                      or not _visual_ranges_cover_segment(
                          r, dur, visual_phase_proof_ranges)
                      or _segment_requires_safe_visual(r, dur, unsafe_ranges))
-        if _ms is not None and mouth_profile is not None and rmx_act is not None:
+        if (_ms is not None and mouth_profile is not None and rmx_act is not None
+                and _visual_proof_applicable(mouth_profile)):
             # Remixは区間中央、MVは区間先頭という異なる時刻を比べて
             # いたため、2秒カットで約1秒分の誤判定があった。対応する
             # 3時点をペアで比べ、多数決でのみ差し替える。

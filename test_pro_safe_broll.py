@@ -588,6 +588,22 @@ class LowFaceRateVisualProofTests(unittest.TestCase):
                         {"face_rate": "x"}):
             self.assertTrue(lipsync_pro._visual_proof_applicable(profile), profile)
 
+    def test_conflict_gate_applied_to_unsafe_ranges(self):
+        """顔が取れないMVでは「口の矛盾」判定自体をスキップすること。
+
+        実例: 顔検出率13%のMVで誤判定が多発し、216秒中170秒が危険扱いになり、
+        その全部を『口が映らないMVカット』で埋めた結果、数少ない口なしカットを
+        使い回して同じ映像がループして見えた。
+        """
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        # 品質レポート側の矛盾判定にゲートが掛かっていること
+        self.assertIn(
+            "and _visual_proof_applicable(mouth_profile)):", src)
+        # 区間ごとの矛盾判定にもゲートが掛かっていること（2箇所以上）
+        self.assertGreaterEqual(src.count("_visual_proof_applicable"), 4)
+        # 矛盾判定のロジック自体は残っている（顔が取れるMVでは従来どおり働く）
+        self.assertIn("max(silent_conflicts, singing_conflicts) >= 2", src)
+
     def test_conflict_detection_is_kept(self):
         # 明確な矛盾（歌ってないのに口が動く等）の判定は残っていること
         src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
