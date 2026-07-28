@@ -234,12 +234,24 @@ def _send_full_log(job):
     except Exception:
         pass
 
-    lines = list(job.get("log") or [])
+    # ★この関数は run_job の finally から呼ばれる。finally の中で例外を出すと
+    #   ジョブ処理そのものを壊すので、入力が想定外でも絶対に投げない。
+    try:
+        lines = list((job or {}).get("log") or [])
+    except Exception:
+        return
     if not lines:
         return
     # ダウンロード進捗の行は中身が無く量だけ食うので、完了行以外は落とす
-    body = "\n".join(l for l in lines
-                      if not l.startswith("[download] ") or "100%" in l)
+    keep = []
+    for l in lines:
+        l = l if isinstance(l, str) else str(l)
+        if l.startswith("[download] ") and "100%" not in l:
+            continue
+        keep.append(l)
+    if not keep:
+        return
+    body = "\n".join(keep)
 
     def _post():
         try:
@@ -279,7 +291,10 @@ def run_job(job_id, items, out_dir, extend, py, audio_cap="320"):
                        urls=[u for (_,u) in manual], audio_cap=audio_cap)
     finally:
         job["done"] = True
-        _send_full_log(job)
+        try:
+            _send_full_log(job)
+        except Exception:
+            pass          # ログ送信の失敗で動画作成を巻き込まない
 
 PAGE = None  # 下でHTMLを読み込む
 
