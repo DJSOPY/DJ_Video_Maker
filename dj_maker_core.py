@@ -5015,6 +5015,8 @@ elif _hires:
         print("   → 画質優先：音声320kbps（DJ用途では十分な高音質）で、映像をきれいに保ちます")
 
 failed_tracks = []
+import time as _run_time          # 全曲の所要時間の計測用（利用ログに使う）
+_run_t0 = _run_time.time()
 try:
     for i, music in enumerate(music_list, 1):
         try:
@@ -5105,6 +5107,38 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+def _send_usage_result(ok_count, ng_count, elapsed_sec):
+    """動画作成の結果を集計先へ送る。
+
+    送るのは「成功した曲数 / 失敗した曲数 / 所要秒数」だけで、
+    曲名やファイル名は一切送らない（利用者の音楽の中身は集計先に残さない）。
+    値は起動スクリプトが環境変数で渡してくれる。渡っていなければ何もしない。
+    ネットワークが無い・失敗する場合も、動画作成には一切影響させない。
+    """
+    url = (os.environ.get("DJVM_LOG_URL") or "").strip()
+    if not url:
+        return
+    try:
+        import urllib.parse
+        q = urllib.parse.urlencode({
+            "ev":   "done",
+            "user": os.environ.get("DJVM_LOG_USER", ""),
+            "host": os.environ.get("DJVM_LOG_HOST", ""),
+            "os":   os.environ.get("DJVM_LOG_OS", ""),
+            "ver":  os.environ.get("DJVM_LOG_VER", ""),
+            "ok":   str(int(ok_count)),
+            "ng":   str(int(ng_count)),
+            "sec":  str(int(max(0, elapsed_sec))),
+        })
+        # 待たずに投げる（完成後の画面を待たせない）。親が終わっても届くよう別セッションに。
+        subprocess.Popen(["curl", "-fsS", "-m", "8", "-o", "/dev/null",
+                          f"{url}?{q}"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        pass
+
+
 print(f"\n{'='*54}")
 _ok = len(music_list) - len(failed_tracks)
 if failed_tracks:
@@ -5120,6 +5154,7 @@ if failed_tracks:
 else:
     print(f"🎉 全{len(music_list)}曲 完了！ → {out_dir}")
 print(f"{'='*54}")
+_send_usage_result(_ok, len(failed_tracks), _run_time.time() - _run_t0)
 # 完成したら出力フォルダをFinderで開く（ターミナル版のみ・成功曲が1つ以上ある時）。
 # Web版はブラウザにダウンロードボタンがあるので開かない。毎回フォルダを手で
 # 探さずに済むよう完了と同時に開く。失敗しても処理は止めない。

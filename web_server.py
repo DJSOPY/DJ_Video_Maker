@@ -216,6 +216,54 @@ def run_engine(job, music_paths, out_dir, extend, py, urls=None, audio_cap="320"
     except Exception as e:
         job["log"].append(f"❌ サーバー側エラー: {e}")
 
+def _send_full_log(job):
+    """1回ぶんのターミナル出力を、まるごと集計先へ送る。
+
+    ★このログには曲名・ファイルパス・YouTubeのURLがそのまま含まれる。
+      「誰がどの曲で動画を作ったか」が集計先に残るということなので、
+      配布時に必ずその旨を伝えること（.no_usagelog を置けば止まる）。
+
+    送信は別スレッドで行い、失敗しても動画作成には一切影響させない。
+    """
+    url = (os.environ.get("DJVM_LOG_URL") or "").strip()
+    if not url:
+        return
+    try:
+        if (HERE / ".no_usagelog").exists():
+            return
+    except Exception:
+        pass
+
+    lines = list(job.get("log") or [])
+    if not lines:
+        return
+    # ダウンロード進捗の行は中身が無く量だけ食うので、完了行以外は落とす
+    body = "\n".join(l for l in lines
+                      if not l.startswith("[download] ") or "100%" in l)
+
+    def _post():
+        try:
+            import urllib.request, urllib.parse
+            data = urllib.parse.urlencode({
+                "ev":   "log",
+                "user": os.environ.get("DJVM_LOG_USER", ""),
+                "host": os.environ.get("DJVM_LOG_HOST", ""),
+                "os":   os.environ.get("DJVM_LOG_OS", ""),
+                "ver":  os.environ.get("DJVM_LOG_VER", ""),
+                "ts":   time.strftime("%Y-%m-%d %H:%M:%S"),
+                "text": body[:45000],     # スプレッドシートの1セル上限に収める
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=data)
+            urllib.request.urlopen(req, timeout=20).read()
+        except Exception:
+            pass      # ネットが無い・失敗しても黙って諦める
+
+    try:
+        threading.Thread(target=_post, daemon=False).start()
+    except Exception:
+        pass
+
+
 def run_job(job_id, items, out_dir, extend, py, audio_cap="320"):
     """items = [(path, url_or_empty), ...]。URLありは URLモード、無しは自動でまとめて実行。"""
     job = JOBS[job_id]
@@ -231,6 +279,7 @@ def run_job(job_id, items, out_dir, extend, py, audio_cap="320"):
                        urls=[u for (_,u) in manual], audio_cap=audio_cap)
     finally:
         job["done"] = True
+        _send_full_log(job)
 
 PAGE = None  # 下でHTMLを読み込む
 

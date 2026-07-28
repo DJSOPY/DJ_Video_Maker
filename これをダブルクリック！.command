@@ -135,8 +135,15 @@ if [ -n "$DJVM_LOG_URL" ] && [ ! -f "$DIR/.no_usagelog" ]; then
         --data-urlencode "os=$_osv" \
         --data-urlencode "ver=$_ver" \
         --data-urlencode "ts=$_ts" \
+        --data-urlencode "ev=launch" \
         -o /dev/null 2>/dev/null
     ) &
+    # ★動画が完成した時にも Python 側から結果を送れるよう、値を環境変数で渡す。
+    #   ここで計算済みの値をそのまま渡すので、Python側で同じ処理を二重に書かず、
+    #   シートに入る「ユーザー名/端末名」も起動時のpingと必ず一致する。
+    export DJVM_LOG_URL
+    export DJVM_LOG_USER="$_u" DJVM_LOG_HOST="$_host"
+    export DJVM_LOG_OS="$_osv" DJVM_LOG_VER="$_ver"
 fi
 
 # ---- サーバー起動＋ブラウザを開く ----
