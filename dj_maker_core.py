@@ -68,6 +68,27 @@ def ytdlp_run(args, **kw):
       Cookieはボット判定回避のための「あれば良い」もので、必須ではないため、
       失敗したら黙ってCookie無しに落として続行する。
     """
+    r = _ytdlp_once(args, **kw)
+    if r.returncode == 0:
+        return r
+    # ★HTTP 403 は YouTube 側の一時的な拒否で、同じURLでも少し待つと
+    #   通ることが多い（実例: 2026-07-28 仲間の環境で1回目403→即再実行で成功）。
+    #   利用者に「もう一度作成して」と手を煩わせないため、1回だけ自動で待って
+    #   やり直す。403以外（404や無効URL等）は待っても直らないので再試行しない。
+    _err = ((getattr(r, "stderr", "") or "") +
+            (getattr(r, "stdout", "") or "")) if kw.get("capture_output") else ""
+    if "403" in _err or "Forbidden" in _err:
+        print("  ⏳ YouTubeに一時的に拒否されました(403) → 15秒待って自動でやり直します...")
+        _sleep_time.sleep(15)
+        r = _ytdlp_once(args, **kw)
+    return r
+
+
+import time as _sleep_time
+
+
+def _ytdlp_once(args, **kw):
+    """Cookie付き→失敗ならCookie無し、の1往復（従来のytdlp_runの中身）。"""
     global YTDLP_COOKIE_ARGS, _COOKIE_DISABLED
     r = subprocess.run(["yt-dlp", *YTDLP_COOKIE_ARGS, *args], **kw)
     if r.returncode == 0 or not YTDLP_COOKIE_ARGS:
@@ -3040,6 +3061,25 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         print(f"  🔎 名前に表記はありませんが、テンポ差 ×{best_rate:.3f} を実測"
               f"（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）→ 別テンポ音源として扱います")
     is_rmx_measured = bool(_name_says_remix or _tempo_evidence)
+    # ────────────────────────────────────────────────
+    # 【観測のみ】音源とMVの関係を1つの記述子にまとめてログへ出す。
+    #
+    #   将来的には「複数の音響仮説を同時採点して区間ごとに最適経路を選ぶ」
+    #   設計（RelationshipDescriptor）へ移す方向で合意しているが、
+    #   いきなり判定を任せると、今の波形→クロマ→音内容→Proというカスケードを
+    #   全部作り直すことになり、検証済みの経路を壊す。
+    #   そこで今は「判定には一切使わず、実際の値を記録するだけ」にする。
+    #   利用ログに貯まった実データを見てから、移行の是非と閾値を決める。
+    #   ★この値を条件分岐に使わないこと（使うなら移行の設計をしてから）。
+    try:
+        _key_shift, _key_conf = estimate_semitone_shift(video_audio, music_audio)
+    except Exception:
+        _key_shift, _key_conf = 0, 0.0
+    print(f"  🧬 関係推定[観測のみ]: tempo={best_rate:.3f} key={_key_shift}半音"
+          f"(確信{_key_conf:.2f}) 一直線度={lock:.2f} 等倍={lock_1p0:.2f} "
+          f"名前ヒント={'あり' if _name_says_remix else 'なし'} "
+          f"実測根拠={'あり' if _tempo_evidence else 'なし'} "
+          f"長さ比={music_dur / max(0.1, vid_dur):.3f}")
     if is_rmx_measured:
         if lock < 0.45:
             print(f"  ⚠️ どのテンポでも波形が一直線に揃わない（別アレンジ）→ リップシンクに切替")

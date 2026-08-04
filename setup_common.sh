@@ -535,6 +535,20 @@ djvm_verify(){
 #   djvm_full_setup full   … ターミナル版（AIライブラリも入れる）
 #   djvm_full_setup lite   … サーバー版（AIは静かに試すだけ）
 # ============================================================
+djvm_notice_intel(){
+    # ★Intel Mac には MPS（Apple Silicon の GPU 処理）が無いため、
+    #   Demucs のボーカル分離と HuBERT の特徴抽出が全てCPUで走る。
+    #   失敗はしないが体感で数倍遅くなるので、「固まった」と誤解される前に伝える。
+    #   ライブラリはIntel向けwheelが揃っていることを確認済み（動作自体は問題ない）。
+    if [ "$(uname -m 2>/dev/null)" = "x86_64" ]; then
+        echo ""
+        echo "  ℹ️ このMacはIntel製です。GPU処理（Apple Silicon専用）が使えないため、"
+        echo "     動画1本あたりの作成時間が長めになります（失敗ではありません）。"
+        echo "     途中で止まったように見えても、そのままお待ちください。"
+    fi
+}
+
+
 djvm_full_setup(){
     djvm_light_cleanup
     djvm_check_network
@@ -542,6 +556,7 @@ djvm_full_setup(){
     djvm_ensure_tools
     djvm_setup_python "${1:-full}"
     djvm_verify
+    djvm_notice_intel
 }
 
 

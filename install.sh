@@ -38,8 +38,10 @@ FILES=(
   "これをダブルクリック！.command" "DJ_Video_Maker.command"
   "DJ_Video_Maker_URL.command" "修復_初回からやり直し.command"
   "最初にこれを実行.command" "コマンド集.txt" "かんたん説明書.pdf"
-  "最新版にアップデート.command" "利用ログ設定手順.txt"
+  "最新版にアップデート.command"
 )
+# 「利用ログ設定手順.txt」は配布しない。あれは開発者（集計する側）向けの
+# Apps Script設定手順であり、利用者のフォルダに入れる文書ではないため。
 
 echo "📥 ダウンロード中 → $DEST"
 mkdir -p "$DEST"
