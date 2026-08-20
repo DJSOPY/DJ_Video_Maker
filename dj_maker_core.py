@@ -77,8 +77,12 @@ def ytdlp_run(args, **kw):
     #   やり直す。403以外（404や無効URL等）は待っても直らないので再試行しない。
     _err = ((getattr(r, "stderr", "") or "") +
             (getattr(r, "stdout", "") or "")) if kw.get("capture_output") else ""
-    if "403" in _err or "Forbidden" in _err:
-        print("  ⏳ YouTubeに一時的に拒否されました(403) → 15秒待って自動でやり直します...")
+    # ★capture_output を使わない呼び出し（映像DL本体など。yt-dlpの進捗を
+    #   そのまま画面に流すため）では、Python側からエラー文を読めない。
+    #   その場合は「終了コードが0以外」を再試行の合図にする。
+    _retry = ("403" in _err or "Forbidden" in _err) if _err else (r.returncode != 0)
+    if _retry:
+        print("  ⏳ ダウンロードに失敗しました → 15秒待って自動でやり直します...")
         _sleep_time.sleep(15)
         r = _ytdlp_once(args, **kw)
     return r

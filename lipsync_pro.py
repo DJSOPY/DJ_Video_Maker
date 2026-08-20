@@ -2538,8 +2538,22 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
             or (report["feature_similarity"] >= min_sim + 0.08
                 and report["median_dtw_cost"] <= 0.70)
         )
+        # ★弱一致が連続しても、その区間は口元非表示（安全背景/Bロール）で
+        #   隠されるので、曲全体を捨てる理由にはならない。
+        #   以前は一律 6.0秒 で足切りしていたため、他の条件を全部クリアして
+        #   いても長い間奏1つで不採用になっていた
+        #   （実例: I Just Might [Intro Clean] は12.0秒の1点だけで落選。
+        #     カバー100%・末尾100%・範囲外0.0秒と他は良好だった）。
+        #   本当に見るべきは「歌っている最中にどれだけ確認できないか」なので、
+        #   歌唱中unsafe率が十分低ければ、連続長は 14.0秒 まで許容する。
+        #   率が高い曲は従来どおり 6.0秒 で止める（悪い曲を通さない）。
+        _sing_tot = report.get("singing_seconds") or 0.0
+        _sing_unsafe = (report.get("unsafe_split_seconds") or {}).get("sing", 0.0)
+        _sing_rate = (_sing_unsafe / _sing_tot) if _sing_tot > 0.05 else 1.0
+        _bad_limit = 14.0 if _sing_rate <= 0.30 else 6.0
+        report["bad_run_limit"] = _bad_limit
         local_ok = (report["block_similarity_p20"] >= min_block
-                    and report["longest_bad_seconds"] <= 6.0)
+                    and report["longest_bad_seconds"] <= _bad_limit)
         strong_reordered = (report["block_similarity_p20"] >= min_block + 0.08
                             and report["feature_lift"] >= 0.05
                             and report["median_dtw_cost"] <= 0.80)
@@ -3885,8 +3899,10 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
                 reasons.append(f"DTW p75={q['p75_dtw_cost']:.2f}>{_mc_ + 0.20:.2f}")
             if q["block_similarity_p20"] < _mb_:
                 reasons.append(f"局所p20={q['block_similarity_p20']:.2f}<{_mb_}")
-            if q["longest_bad_seconds"] > 6.0:
-                reasons.append(f"弱一致が連続{q['longest_bad_seconds']:.1f}s>6.0s")
+            _lim = q.get("bad_run_limit", 6.0)
+            if q["longest_bad_seconds"] > _lim:
+                reasons.append(
+                    f"弱一致が連続{q['longest_bad_seconds']:.1f}s>{_lim:.1f}s")
             print("     ⚠️ Pro同期の絶対信頼度が不足 → この映像を採用せず旧方式へ")
             if reasons:
                 print(f"        ↳ 不足の内訳: {' / '.join(reasons)}")

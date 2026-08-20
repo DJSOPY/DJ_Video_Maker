@@ -675,6 +675,35 @@ class LowFaceRateVisualProofTests(unittest.TestCase):
         i_prep = src.index('report["unsafe_ranges"] = _prepare_unsafe_ranges(')
         self.assertLess(i_cause, i_prep)
 
+    def test_bad_run_limit_depends_on_singing_unsafe_rate(self):
+        """弱一致の連続長は、歌唱中unsafe率が低い曲では緩める。
+
+        弱一致の区間は口元非表示で隠されるので、そこが長いだけで
+        曲全体を捨てる必要はない。以前は一律6.0秒で足切りしていたため、
+        他の条件を全部クリアしていても長い間奏1つで不採用になっていた
+        （実例: I Just Might [Intro Clean] は12.0秒の1点だけで落選。
+          カバー100%・末尾100%・範囲外0.0秒と他は良好だった）。
+        歌唱中に確認できない割合が高い曲は、従来どおり6.0秒で止める。
+        """
+        src = (Path(lipsync_pro.__file__).resolve()).read_text(encoding="utf-8")
+        # 固定値6.0での足切りが残っていないこと
+        self.assertNotIn('report["longest_bad_seconds"] <= 6.0', src)
+        self.assertIn("_bad_limit = 14.0 if _sing_rate <= 0.30 else 6.0", src)
+        self.assertIn('report["bad_run_limit"] = _bad_limit', src)
+
+        def limit(sing_unsafe, sing_tot):
+            rate = (sing_unsafe / sing_tot) if sing_tot > 0.05 else 1.0
+            return 14.0 if rate <= 0.30 else 6.0
+
+        # 実ログの数値で、通すべき曲と落とすべき曲が分かれること
+        self.assertEqual(limit(33.4, 133.2), 14.0)   # I Just Might(25%)
+        self.assertEqual(limit(11.2, 170.9), 14.0)   # Dessert Remix(6.6%)
+        self.assertEqual(limit(62.4, 186.7), 6.0)    # Cake(33%) は据え置き
+        self.assertLessEqual(12.0, limit(33.4, 133.2))   # 12秒でも通る
+        self.assertGreater(12.0, limit(62.4, 186.7))     # Cakeは落ちる
+        # 歌唱時間が取れない場合は安全側（6.0秒）に倒す
+        self.assertEqual(limit(0.0, 0.0), 6.0)
+
     def test_merged_seconds_removes_overlap(self):
         f = lipsync_pro._merged_seconds
         self.assertAlmostEqual(f([(0, 10), (5, 15)]), 15.0)
