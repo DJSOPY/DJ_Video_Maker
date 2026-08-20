@@ -196,3 +196,40 @@ class TempoSearchRangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class StretchLimitTest(unittest.TestCase):
+    """区間末尾ズレの内部伸縮に、原曲系だけ厳しい上限を設けたことの回帰テスト。
+
+    Remixはテンポ自体が違うので、ある程度の伸縮は正当な補正になる。
+    一方 原曲・Edit系（同一音源のはず）で大きく伸ばす必要が出るのは、
+    そもそも対応が取れていないサイン。無理に帳尻を合わせると映像がスローになる。
+    実例: Beat It で41秒長い別バージョンMVを掴んだ際、194秒の区間を
+          ×1.144 引き伸ばして28秒のズレを吸収し、全編で口が合わなくなった。
+    """
+
+    @staticmethod
+    def _decide(r, is_rmx):
+        lo, hi = (0.85, 1.18) if is_rmx else (0.94, 1.06)
+        return lo <= r <= hi and abs(r - 1.0) > 0.015
+
+    def test_source_has_tight_limit(self):
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("_lo, _hi = (0.85, 1.18) if is_rmx_measured else (0.94, 1.06)", src)
+        # 旧: 一律 0.85〜1.18 が残っていないこと
+        self.assertNotIn("if 0.85 <= r <= 1.18 and abs(r - 1.0) > 0.015:", src)
+
+    def test_normal_corrections_still_apply(self):
+        # 実ログで正常に働いていた伸縮は、原曲系でも維持される
+        for r in (1.022, 1.024, 1.030, 0.983, 0.970):
+            self.assertTrue(self._decide(r, False), f"×{r} は補正されるべき")
+
+    def test_extreme_stretch_rejected_for_source(self):
+        # 実際に破綻した値は、原曲系では補正しない
+        for r in (1.098, 1.131, 1.144):
+            self.assertFalse(self._decide(r, False), f"×{r} は補正すべきでない")
+
+    def test_remix_keeps_wide_range(self):
+        # Remixのテンポ補正は従来どおり効く（同期を壊さない）
+        for r in (1.098, 1.144, 0.880):
+            self.assertTrue(self._decide(r, True), f"Remixの×{r} は補正されるべき")
+
