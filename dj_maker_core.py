@@ -1749,8 +1749,17 @@ def pick_loop(loop_path):
     vids = get_loop_videos(loop_path)
     return random.choice(vids)
 
-def make_filler_segment(loop_path, duration, out_path, tmp_dir=None):
-    """フィラー映像をduration秒分作る。フォルダ指定なら複数動画をランダムにつなぐ"""
+def make_filler_segment(loop_path, duration, out_path, tmp_dir=None,
+                        frame_count=None):
+    """フィラー映像をduration秒分作る。フォルダ指定なら複数動画をランダムにつなぐ。
+
+    ★frame_count を受け取れることが重要。
+      呼び出し側(vocal_sync)は生成物のフレーム数が要求と1枚でも違うと
+      「失敗」とみなして純黒に差し替える(_make_black_no_mouth)。
+      以前この関数は枚数を受け取れず、秒数指定でしか作れなかったため、
+      端数で必ず枚数がズレて全フィラーが黒画面になっていた
+      （実例: DANCE & SHOUT で168秒／全体の55%が真っ黒）。
+    """
     vids = get_loop_videos(loop_path)
     # 壊れた素材(長さ0や読めないもの)を除外
     if vids:
@@ -1767,6 +1776,7 @@ def make_filler_segment(loop_path, duration, out_path, tmp_dir=None):
         run(["ffmpeg","-y","-stream_loop",str(loops),"-i",str(vids[0]),
              "-t",f"{duration:.3f}",
              "-vf",VF_NORM,*ENC_ARGS,"-an",str(out_path)])
+        _fit_filler_frames(out_path, frame_count, tmp_dir)
         return
 
     # 複数ファイル: ランダムに切り替えながら埋める
@@ -1799,6 +1809,7 @@ def make_filler_segment(loop_path, duration, out_path, tmp_dir=None):
     if not pieces:
         run(["ffmpeg","-y","-f","lavfi","-i",f"color=c=black:s=1280x720:d={duration:.3f}:r=30",
              *ENC_ARGS,"-an",str(out_path)])
+        _fit_filler_frames(out_path, frame_count, tmp_dir)
         return
 
     if len(pieces) == 1:
@@ -1815,6 +1826,39 @@ def make_filler_segment(loop_path, duration, out_path, tmp_dir=None):
             shutil.copy(pieces[0], out_path)
     for p_ in pieces:
         p_.unlink(missing_ok=True)
+    _fit_filler_frames(out_path, frame_count, tmp_dir)
+
+
+def _fit_filler_frames(out_path, frame_count, tmp_dir=None):
+    """フィラー映像を、要求されたフレーム数ちょうどに揃える。
+
+    呼び出し側は厳密一致(==)で採否を決めるため、1枚でも違うと黒画面に
+    差し替えられてしまう。足りなければ最終フレームで埋め、多ければ切る。
+    frame_count が未指定なら何もしない（従来どおりの挙動）。
+    """
+    try:
+        want = int(frame_count)
+    except (TypeError, ValueError):
+        return
+    if want <= 0:
+        return
+    out_path = Path(out_path)
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return
+    tmp_dir = Path(tmp_dir) if tmp_dir else out_path.parent
+    fixed = tmp_dir / f"fit_{out_path.stem}.mp4"
+    fixed.unlink(missing_ok=True)
+    # 要求枚数を満たすのに必要な尺（30fps基準）＋余裕を、最終フレームの複製で確保する。
+    # 固定5秒では大きく不足するケースがあった（元102枚に対し300枚要求で252枚止まり）。
+    pad_sec = max(5.0, want / 30.0 + 2.0)
+    # -frames:v で枚数を確定させる。足りない分は tpad で最終フレームを複製。
+    run(["ffmpeg", "-y", "-i", str(out_path),
+         "-vf", f"tpad=stop_mode=clone:stop_duration={pad_sec:.1f}",
+         "-frames:v", str(want), *ENC_ARGS, "-an", str(fixed)])
+    if fixed.exists() and fixed.stat().st_size > 0:
+        shutil.move(str(fixed), str(out_path))
+    else:
+        fixed.unlink(missing_ok=True)
 
 
 # 低信頼の口パク区間に、未検証の人物映像を出さないための専用経路。
@@ -2531,7 +2575,7 @@ def _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
         return bool(vocal_sync.make_vocal_lipsync_remix(
             music_path, video_path, output_path, tmp_dir, music_dur,
             filler_cb=lambda d, o, frames=None: make_filler_segment(
-                video_path, d, o, tmp_dir),
+                video_path, d, o, tmp_dir, frame_count=frames),
             strict_fail_closed=False))
     except Exception as e:
         print(f"  ⚠️ ボーカル分離リップシンクで例外: {e}")

@@ -73,7 +73,9 @@ class UnsafePlanTests(unittest.TestCase):
         src = CORE_PATH.read_text(encoding="utf-8")
         # 既定パスは strict_fail_closed=False かつフィラーにMV映像(make_filler_segment)
         self.assertIn("strict_fail_closed=False))", src)
-        self.assertIn("make_filler_segment(\n                video_path, d, o, tmp_dir)", src)
+        self.assertIn("make_filler_segment(\n"
+                      "                video_path, d, o, tmp_dir, frame_count=frames)",
+                      src)
         # strict機能自体は定数Trueで呼べる形で保持
         self.assertIn("if _STRICT_FAIL_CLOSED_LIPSYNC:", src)
 
@@ -440,3 +442,31 @@ class SafeBackgroundIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FillerFrameCountTest(unittest.TestCase):
+    """フィラーが要求フレーム数ちょうどを作れることの回帰テスト。
+
+    vocal_sync 側は生成物のフレーム数が要求と1枚でも違うと「失敗」とみなし、
+    純黒(_make_black_no_mouth)に差し替える。ところが make_filler_segment は
+    frame_count を受け取れず秒数指定でしか作れなかったため、端数で必ず
+    枚数がズレて全フィラーが黒画面になっていた。
+    実例: DANCE & SHOUT で ⚡ドロップ/VJ の168秒（全体の55%）が真っ黒。
+    """
+
+    def test_accepts_frame_count(self):
+        src = Path(__file__).resolve().parent.joinpath("dj_maker_core.py").read_text(encoding="utf-8")
+        self.assertIn("def make_filler_segment(loop_path, duration, out_path, tmp_dir=None,\n"
+                      "                        frame_count=None):", src)
+        self.assertIn("def _fit_filler_frames(", src)
+
+    def test_caller_passes_frame_count(self):
+        src = Path(__file__).resolve().parent.joinpath("dj_maker_core.py").read_text(encoding="utf-8")
+        # 既定経路(make_filler_segment)にも枚数が渡っていること
+        self.assertIn("video_path, d, o, tmp_dir, frame_count=frames)", src)
+
+    def test_pad_covers_large_requests(self):
+        # 不足分に応じてパディング尺を決める（固定5秒では足りなかった）
+        src = Path(__file__).resolve().parent.joinpath("dj_maker_core.py").read_text(encoding="utf-8")
+        self.assertIn("pad_sec = max(5.0, want / 30.0 + 2.0)", src)
+        self.assertNotIn("stop_duration=5\"", src)
+
