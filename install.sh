@@ -32,13 +32,28 @@ if ! curl -m 12 -s -o /dev/null -I "https://raw.githubusercontent.com"; then
     exit 1
 fi
 
+# 「URLエンコード名<TAB>保存するファイル名」の対。
+# ★エンコードを python3 で作ってはいけない。まっさらなMacの python3 は
+#   実体が無く、実行すると開発者ツールのインストールを促すだけで結果が空になる。
+#   その結果、日本語名のファイルだけURLが空になり404で落ちていた
+#   （実例: 2026-08-21 配布先のMacで .command と .txt/.pdf が全滅）。
+#   GitHubはNFD正規化で保存しているので、その値を直接埋め込む。
 FILES=(
-  "dj_maker_core.py" "lipsync_pro.py" "vocal_sync.py" "mouth_sync.py"
-  "web_server.py" "web_ui.html" "setup_common.sh"
-  "これをダブルクリック！.command" "DJ_Video_Maker.command"
-  "DJ_Video_Maker_URL.command" "修復_初回からやり直し.command"
-  "最初にこれを実行.command" "コマンド集.txt" "かんたん説明書.pdf"
-  "最新版にアップデート.command"
+  "dj_maker_core.py	dj_maker_core.py"
+  "lipsync_pro.py	lipsync_pro.py"
+  "vocal_sync.py	vocal_sync.py"
+  "mouth_sync.py	mouth_sync.py"
+  "web_server.py	web_server.py"
+  "web_ui.html	web_ui.html"
+  "setup_common.sh	setup_common.sh"
+  "%E3%81%93%E3%82%8C%E3%82%92%E3%82%BF%E3%82%99%E3%83%95%E3%82%99%E3%83%AB%E3%82%AF%E3%83%AA%E3%83%83%E3%82%AF%EF%BC%81.command	これをダブルクリック！.command"
+  "DJ_Video_Maker.command	DJ_Video_Maker.command"
+  "DJ_Video_Maker_URL.command	DJ_Video_Maker_URL.command"
+  "%E4%BF%AE%E5%BE%A9_%E5%88%9D%E5%9B%9E%E3%81%8B%E3%82%89%E3%82%84%E3%82%8A%E7%9B%B4%E3%81%97.command	修復_初回からやり直し.command"
+  "%E6%9C%80%E5%88%9D%E3%81%AB%E3%81%93%E3%82%8C%E3%82%92%E5%AE%9F%E8%A1%8C.command	最初にこれを実行.command"
+  "%E3%82%B3%E3%83%9E%E3%83%B3%E3%83%88%E3%82%99%E9%9B%86.txt	コマンド集.txt"
+  "%E3%81%8B%E3%82%93%E3%81%9F%E3%82%93%E8%AA%AC%E6%98%8E%E6%9B%B8.pdf	かんたん説明書.pdf"
+  "%E6%9C%80%E6%96%B0%E7%89%88%E3%81%AB%E3%82%A2%E3%83%83%E3%83%95%E3%82%9A%E3%83%86%E3%82%99%E3%83%BC%E3%83%88.command	最新版にアップデート.command"
 )
 # 「利用ログ設定手順.txt」は配布しない。あれは開発者（集計する側）向けの
 # Apps Script設定手順であり、利用者のフォルダに入れる文書ではないため。
@@ -46,18 +61,14 @@ FILES=(
 echo "📥 ダウンロード中 → $DEST"
 mkdir -p "$DEST"
 FAIL=""
-for f in "${FILES[@]}"; do
-    ok=""
-    # macOSの日本語ファイル名は濁点の扱い(NFC/NFD)が混在しうるため、両方＋非エンコードを順に試す
-    for variant in \
-        "$(python3 -c "import urllib.parse,unicodedata,sys;print(urllib.parse.quote(unicodedata.normalize('NFD',sys.argv[1])))" "$f" 2>/dev/null)" \
-        "$(python3 -c "import urllib.parse,unicodedata,sys;print(urllib.parse.quote(unicodedata.normalize('NFC',sys.argv[1])))" "$f" 2>/dev/null)" \
-        "$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$f" 2>/dev/null)"
-    do
-        [ -z "$variant" ] && continue
-        if curl -fsSL --retry 2 -o "$DEST/$f" "${BASE}/${variant}"; then ok="1"; break; fi
-    done
-    [ -z "$ok" ] && FAIL="$FAIL $f"
+for entry in "${FILES[@]}"; do
+    enc="${entry%%	*}"      # タブより前＝URL用のエンコード済み名
+    name="${entry##*	}"     # タブより後＝保存するファイル名
+    # 502等の一時エラーに備えてリトライ。--retry-all-errors で5xxも拾う。
+    if ! curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+              -o "$DEST/$name" "${BASE}/${enc}"; then
+        FAIL="$FAIL $name"
+    fi
 done
 
 # 実行権限（curl取得なので隔離属性は付かない＝警告が出ない）
