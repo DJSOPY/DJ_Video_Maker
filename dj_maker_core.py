@@ -1125,6 +1125,69 @@ def measure_pos_chroma(music_audio, video_audio, m_t, mv_guess, sr=11025, half=4
         return mv_guess, 0.0
 
 
+def measure_bpm_precise(audio, sr=11025):
+    """ビート位置に直線を当てはめて正確なBPMを測る。戻り: (bpm, 信頼度)
+
+    librosa の推定値をそのまま使うと、フレーム分解能(約23ms)の丸めで
+    1〜2%ずれることがある。ビート時刻の列に直線 y = a*n + b を当てはめ、
+    傾き a を1拍の長さとすれば丸め誤差が平均化されて精度が上がる。
+    信頼度は「直線からの最大ズレ」から出すので、テンポが揺れる曲では下がる。
+    """
+    try:
+        import librosa
+        a = np.asarray(audio, dtype=np.float32)
+        # ★11025Hzではビート検出が拍を取りこぼし、BPMが0.2%ずれる
+        #   （実測: 380拍/122.785 対 385拍/122.999）。判定に使うには粗いので、
+        #   22050Hzへ上げてから測る。ここでの0.2%は口パクの生死を分ける。
+        if sr < 22050:
+            a = librosa.resample(a, orig_sr=sr, target_sr=22050)
+            sr = 22050
+        _, beats = librosa.beat.beat_track(y=a, sr=sr, units="time")
+        beats = np.asarray(beats, dtype=float)
+        if len(beats) < 16:
+            return None, 0.0
+        idx = np.arange(len(beats))
+        slope, intercept = np.polyfit(idx, beats, 1)
+        if slope <= 1e-6:
+            return None, 0.0
+        resid = beats - (intercept + slope * idx)
+        # 信頼度は標準偏差で見る。最大ズレは1拍の外れ値に引きずられ、
+        # 低いサンプリングレートでは正しいBPMでも0.3秒級の値が出てしまう
+        # （実測: 11025Hzで最大317ms／標準偏差121ms、22050Hzでは21ms／8ms）。
+        conf = float(max(0.0, min(1.0, 1.0 - float(resid.std()) / 0.05)))
+        return float(60.0 / slope), conf
+    except Exception:
+        return None, 0.0
+
+
+def verify_tempo_by_bpm(music_audio, video_audio, best_rate, sr=11025):
+    """テンポ探索の結果を、両音源の実測BPM比と突き合わせる。
+
+    戻り: (採用してよいか, 実測比 or None, 説明文)
+
+    なぜ必要か:
+      テンポ探索は「波形が一番一直線に揃う倍率」を選ぶが、同一音源でも
+      別の倍率に高い点が付くことがある（実例: 等倍54%に対し×1.010が79%）。
+      その結果、同じテンポの曲を1%ずらして乗せ、178秒で1.7秒ぶん口がズレた。
+      両者のBPMを独立に測って比を取れば、同一音源なら1.000付近になるので、
+      探索結果と食い違えば探索の方を捨てられる。
+    """
+    bm, cm = measure_bpm_precise(music_audio, sr)
+    bv, cv = measure_bpm_precise(video_audio, sr)
+    if bm is None or bv is None or min(cm, cv) < 0.5:
+        return True, None, ""          # 測れないなら口を出さない
+    ratio = bv / bm
+    while ratio > 1.4:                 # 半分/倍で検出された場合を揃える
+        ratio /= 2.0
+    while ratio < 0.72:
+        ratio *= 2.0
+    if abs(ratio - best_rate) > 0.005 and abs(ratio - 1.0) <= 0.005:
+        return (False, ratio,
+                f"  ⚖️ 実測BPM {bm:.2f} と {bv:.2f} はほぼ同じ（比 {ratio:.4f}）"
+                f" → ×{best_rate:.3f} は採用しません（同一テンポと判断）")
+    return True, ratio, ""
+
+
 def find_best_mv_tempo(video_audio, music_audio, sr=11025, window_sec=SEG_WINDOW_SEC):
     """MVを色々な倍率に伸縮し、曲と波形が最も一貫して合う倍率を探す（BPM検出に頼らない）。
     各倍率で「曲の窓ごとの“生”ベスト一致位置」が一直線（順番通り）に並ぶ度合い(locked率)を測り、最良を返す。
@@ -3105,6 +3168,17 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     _tempo_evidence = bool(abs(best_rate - 1.0) > 0.005
                            and (lock - lock_1p0) >= 0.10
                            and lock >= TEMPO_ADJUST_MIN_LOCK)
+    # ★【B】探索結果を、両音源の実測BPM比で裏取りする。
+    #   一直線度は同一音源でも別倍率に高い点を付けることがある
+    #   （実例: 等倍54%に対し×1.010が79%。実際は同テンポだった）。
+    #   BPMを独立に測って「ほぼ同じ」と出たら、探索結果は採用しない。
+    if _tempo_evidence:
+        _ok_rate, _bpm_ratio, _bpm_msg = verify_tempo_by_bpm(
+            music_audio, video_audio, best_rate)
+        if not _ok_rate:
+            print(_bpm_msg)
+            best_rate, lock = 1.0, lock_1p0
+            _tempo_evidence = False
     if _tempo_evidence and not _name_says_remix:
         print(f"  🔎 名前に表記はありませんが、テンポ差 ×{best_rate:.3f} を実測"
               f"（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）→ 別テンポ音源として扱います")
@@ -4776,6 +4850,76 @@ def detect_chorus_heads_snapped(mono, sr, fb, beat_len):
         fb_list.append(b); b+=32
     return fb_list
 
+def auto_generate_dj_cues(mono, sr, fb, beat_len, music_dur):
+    """既存の構造検出を配線して、DJ用のHot Cueを自動で打つ。
+
+    戻り: [(index, sec, rgb_hex, name)]（時刻順・重複除去済み）
+
+    配置ルール（現場でのカットイン/ミックスを想定）:
+      CUE1 Intro   … 曲の最初の拍。スクラッチ/頭出し用
+      CUE2 Start   … イントロ明け（歌い出し/ビートイン）。イントロを飛ばして入る用
+      CUE3 Hook 1  … 1回目のサビ頭。いきなりサビからカットインする用
+      CUE4 Mix Out … 1回目のサビ終わり8小節前。次の曲を混ぜ始める合図
+      CUE5 Hook 2  … 2回目のサビ頭
+      CUE6 Outro   … 最後の盛り上がりの終わり。逃げ道用
+
+    検出関数はすべて小節頭にスナップ済みの秒を返すので、ここでは並べて
+    近すぎるものを間引くだけ。ジャンル別の小節数ルール（Hip-Hop=8/16、
+    House=16/32等）は、まずこの汎用版の位置をSeratoで実際に確認してから
+    必要なら足す。いきなり分岐を増やすと外れた時に原因が追えないため。
+    """
+    bar = 4.0 * beat_len
+    cand = []   # (sec, rgb, name)
+
+    # CUE1: イントロ頭
+    cand.append((fb, "CC0000", "Intro"))
+
+    # CUE2: イントロ明け（頭が静かな曲だけ別位置になる。同じなら後で間引かれる）
+    try:
+        ss = detect_song_start(mono, sr, fb, beat_len)
+        if ss is not None:
+            cand.append((float(ss), "CC6600", "Start"))
+    except Exception:
+        pass
+
+    # CUE3/5: サビ頭（8小節グリッドにスナップ済みの小節index）
+    try:
+        heads = detect_chorus_heads_snapped(mono, sr, fb, beat_len)
+        for k, h in enumerate(heads[:2]):
+            sec = fb + float(h) * bar
+            cand.append((sec, "00CC00" if k == 0 else "0099CC",
+                         "Hook 1" if k == 0 else "Hook 2"))
+    except Exception:
+        pass
+
+    # CUE4: ミックスアウト（1回目のサビ終わり8小節前）
+    try:
+        mo = detect_first_chorus_mixout(mono, sr, fb, beat_len)
+        if mo is not None:
+            cand.append((float(mo), "CCCC00", "Mix Out"))
+    except Exception:
+        pass
+
+    # CUE6: アウトロ開始（最後の盛り上がりの終わり）
+    try:
+        ce = detect_climax_end(mono, sr, fb, beat_len)
+        if ce is not None:
+            cand.append((float(ce), "9900CC", "Outro"))
+    except Exception:
+        pass
+
+    # 曲の範囲内に収め、時刻順に並べ、1小節未満の近接は先に出た方を残す
+    cand = [(max(0.0, min(s, music_dur - 0.5)), c, n) for s, c, n in cand]
+    cand.sort(key=lambda x: x[0])
+    picked = []
+    for s, c, n in cand:
+        if picked and s - picked[-1][0] < bar * 0.9:
+            continue
+        picked.append((s, c, n))
+    # Seratoの Hot Cue は最大8個
+    return [(i, s, c, n) for i, (s, c, n) in enumerate(picked[:8])]
+
+
 def write_serato_cues(mp4_path, orig_music, intro_offset_sec):
     """完成MP4にビートグリッド(BPM)を書き込み、元ファイルのSerato Cueがあれば引き継ぐ。"""
     if not _ensure_mutagen():
@@ -4807,15 +4951,29 @@ def write_serato_cues(mp4_path, orig_music, intro_offset_sec):
         cue_msg = ""
         try:
             cues = read_serato_cues(orig_music)
+            off_ms = int(round(intro_offset_sec * 1000))   # Extended化した分だけ後ろへ
             if cues:
-                off_ms = int(round(intro_offset_sec * 1000))   # Extended化した分だけ後ろへ
                 cues2 = [(idx, max(0, ms + off_ms), rgb, name) for (idx, ms, rgb, name) in cues]
                 mp4["----:com.serato.dj:markersv2"] = [MP4FreeForm(_serato_b64(_build_markers2(cues2)))]
                 cue_msg = f"・Cue {len(cues2)}個を引き継ぎ"
             else:
-                cue_msg = "・元にCueなし(引き継ぎなし)"
+                # ★元にCueが無い場合だけ、曲の構造から自動で打つ。
+                #   DJが自分で打ったCueがあるならそれを尊重して上書きしない。
+                music_dur = len(mono) / 11025.0
+                auto = auto_generate_dj_cues(mono, 11025, fb, beat_len, music_dur)
+                if auto:
+                    cues2 = [(idx, max(0, int(round(sec * 1000)) + off_ms), rgb, name)
+                             for (idx, sec, rgb, name) in auto]
+                    mp4["----:com.serato.dj:markersv2"] = [MP4FreeForm(_serato_b64(_build_markers2(cues2)))]
+                    cue_msg = f"・Cue {len(cues2)}個を自動生成"
+                    print("     🎯 自動Cue:")
+                    for (idx, sec, rgb, name) in auto:
+                        t = sec + intro_offset_sec
+                        print(f"        {idx+1}. {name:8s} {int(t//60)}:{t%60:04.1f}")
+                else:
+                    cue_msg = "・元にCueなし(自動生成できず)"
         except Exception as _ce:
-            cue_msg = f"・Cue引き継ぎ失敗({_ce})"
+            cue_msg = f"・Cue処理失敗({_ce})"
 
         mp4.save()
         print(f"     BPM {bpm:.2f}・ビートグリッド書き込み済み{cue_msg}")

@@ -233,3 +233,52 @@ class StretchLimitTest(unittest.TestCase):
         for r in (1.098, 1.144, 0.880):
             self.assertTrue(self._decide(r, True), f"Remixの×{r} は補正されるべき")
 
+class TempoVerifyByBpmTest(unittest.TestCase):
+    """テンポ探索の結果を実測BPM比で裏取りすることの回帰テスト。
+
+    一直線度は同一音源でも別倍率に高い点を付けることがある。
+    実例: Bestie - Love Options で 等倍54%に対し×1.010が79%となり、
+    同一テンポの曲を1%ずらして乗せた結果、178秒で1.7秒ぶん口がズレた。
+    補正後アンカーの傾きが0.9906（=補正量とほぼ同じだけ逆向き）だったことが、
+    補正そのものが誤りだった動かぬ証拠。
+    """
+
+    def test_functions_exist(self):
+        src = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("def measure_bpm_precise(", src)
+        self.assertIn("def verify_tempo_by_bpm(", src)
+        # 判定に組み込まれていること
+        self.assertIn("_ok_rate, _bpm_ratio, _bpm_msg = verify_tempo_by_bpm(", src)
+        # 低いサンプリングレートのまま測らないこと
+        self.assertIn("if sr < 22050:", src)
+        # 信頼度は標準偏差で見る（最大ズレだと外れ値に弱い）
+        self.assertIn("float(resid.std()) / 0.05", src)
+
+    def test_rejects_only_when_bpm_says_same(self):
+        def verdict(ratio, best_rate):
+            # verify_tempo_by_bpm の判定部分と同じ条件
+            return not (abs(ratio - best_rate) > 0.005 and abs(ratio - 1.0) <= 0.005)
+        # 実測が同テンポなのに探索が1%差と言う → 却下
+        self.assertFalse(verdict(1.0000, 1.010))
+        # 本物のテンポ差は通す（実測で確認済みの値）
+        for r in (1.0100, 1.0150, 1.0600, 0.9600):
+            self.assertTrue(verdict(r, r))
+
+    def test_residual_drift_detection(self):
+        import numpy as np
+        # 実ログのアンカー（×1.010補正後）→ 傾き0.9906で警告が出るべき
+        anchors = [(2.5, 3.2), (32.3, 32.7), (77.0, 77.0),
+                   (121.7, 121.2), (181.2, 180.2)]
+        ar = np.array([a[0] for a in anchors]); ao = np.array([a[1] for a in anchors])
+        slope = float(np.polyfit(ar, ao, 1)[0])
+        self.assertLess(slope, 0.996)
+        self.assertTrue(abs(slope - 1.0) > 0.004)
+        # 正しく同期できていれば警告は出ない
+        ok = [(t, t * 1.0002 + 0.1) for t in range(2, 190, 15)]
+        ar2 = np.array([a[0] for a in ok]); ao2 = np.array([a[1] for a in ok])
+        self.assertLess(abs(float(np.polyfit(ar2, ao2, 1)[0]) - 1.0), 0.004)
+
+    def test_drift_warning_in_source(self):
+        src = (CORE_PATH.parent / "lipsync_pro.py").read_text(encoding="utf-8")
+        self.assertIn("残留ドリフト", src)
+

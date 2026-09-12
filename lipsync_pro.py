@@ -122,6 +122,12 @@ SAFE_BG_USE_MV_INSTEAD = True
 #   音側(HuBERT/DTW/発音類似)の品質ゲートの判断に委ねて人物を表示する。
 #   明確な矛盾（歌ってないのに口が動く等）は conflicts 判定で引き続き弾く。
 VISUAL_PROOF_MIN_FACE = 0.30
+# 視覚証明が「意味のある量」取れたとみなす最低カバー率。
+#   顔が十分映っていても、証明できる区間が曲のごく一部しか取れないことがある。
+#   その値で残りを全部隠すと、音側が高品質でも映像がほぼ出なくなるため、
+#   ここを下回ったら“検証不能”として音側の判定に委ねる。
+#   実測: 良好な同期(カバー100%/発音類似0.74)でも証明は4%しか取れなかった。
+VISUAL_PROOF_MIN_COVER = 0.20
 
 # 「歌っていない区間」とみなす無音の最短の長さ（秒）。
 #   これ以上ボーカルが無い区間だけを『非歌唱』として口元を隠す。
@@ -3210,15 +3216,29 @@ def equal_and_mux(anchors, mv_path, music_path, music_dur, mv_dur, out_path, tmp
         #   既に通っているので、ここは判定不能として音の判断に委ねる。
         #   ※明確な矛盾（歌ってないのに口が動く等）は後段の conflicts 判定で
         #     引き続き検出し、その区間だけ差し替える。安全性の要はそちら。
-        if not visual_phase_proof_ranges and safe_mouth_profile:
+        if safe_mouth_profile:
             try:
                 _fr = float(safe_mouth_profile.get("face_rate", 0.0) or 0.0)
             except (TypeError, ValueError):
                 _fr = 0.0
+            _proved = sum(max(0.0, b - a) for a, b in (visual_phase_proof_ranges or []))
+            _cover = _proved / max(1e-6, float(music_dur))
+            # ★救済の条件は「顔が見えないこと」だけでは足りない。
+            #   顔検出率が閾値を超えていても、実際に証明できた区間がごく一部しか
+            #   取れないことがある（実例: 顔42%あるのに証明は192秒中7.6秒＝4%）。
+            #   その状態で残り96%を隠すと、音側が高品質でも映像がほぼ出なくなる。
+            #   「証明できた量が曲のごく一部」も“検証不能”として扱い、音の判断に委ねる。
+            #   ※明確な矛盾（歌ってないのに口が動く等）は後段の conflicts 判定が
+            #     引き続き拾うので、危険な区間はそちらで差し替えられる。
             if _fr < VISUAL_PROOF_MIN_FACE:
                 visual_phase_proof_ranges = [(0.0, float(music_dur))]
                 print(f"     ℹ️ 顔検出率{_fr*100:.0f}%（低すぎて口元を検証できない）"
                       f" → 判定不能として音側の判定に任せます")
+            elif _cover < VISUAL_PROOF_MIN_COVER:
+                visual_phase_proof_ranges = [(0.0, float(music_dur))]
+                print(f"     ℹ️ 口元を証明できたのは{_proved:.1f}秒"
+                      f"（全体の{_cover*100:.0f}%・顔は{_fr*100:.0f}%検出）"
+                      f" → 検証不能として音側の判定に任せます")
     else:
         visual_phase_proof_ranges = _merge_time_ranges(
             visual_phase_proof_ranges, lo=0.0, hi=music_dur)
@@ -3691,6 +3711,26 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
         # ログ: 何秒→MV何秒
         for (r0, o0, c) in anchors[:: max(1, len(anchors) // 12)]:
             print(f"        remix {r0:6.1f}s → MV {o0:6.1f}s")
+
+        # ★【残留ドリフトの検証】アンカー全体に直線を当て、傾きが1.000から
+        #   離れていないかを見る。テンポ補正が正しければ傾きは1.000に近づき、
+        #   補正が誤っていれば「補正した量と同じだけ逆向き」のドリフトが残る。
+        #   実例: ×1.010を適用した曲で傾き0.990（=補正が丸ごと誤り）。
+        #   178秒で1.7秒ぶん口がズレていた。ここで気づけるようにする。
+        try:
+            if len(anchors) >= 8:
+                _ar = np.array([a[0] for a in anchors], dtype=float)
+                _ao = np.array([a[1] for a in anchors], dtype=float)
+                _sl = float(np.polyfit(_ar, _ao, 1)[0])
+                _span = float(_ar[-1] - _ar[0])
+                _drift = (_sl - 1.0) * _span
+                if abs(_sl - 1.0) > 0.004 and _span > 30.0:
+                    print(f"     ⚠️ 残留ドリフト: 全体の傾き {_sl:.4f}"
+                          f"（{_span:.0f}秒で {_drift:+.1f}秒ぶん口がズレていきます）")
+                    print(f"        → テンポ補正が合っていない可能性があります"
+                          f"（同一音源なら 1.000 付近になるはずです）")
+        except Exception:
+            pass
 
         # --- 映像warp + mux ---
         print("🎞 映像をwarpして remix音にmux...")
