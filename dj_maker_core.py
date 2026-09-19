@@ -4850,76 +4850,6 @@ def detect_chorus_heads_snapped(mono, sr, fb, beat_len):
         fb_list.append(b); b+=32
     return fb_list
 
-def auto_generate_dj_cues(mono, sr, fb, beat_len, music_dur):
-    """既存の構造検出を配線して、DJ用のHot Cueを自動で打つ。
-
-    戻り: [(index, sec, rgb_hex, name)]（時刻順・重複除去済み）
-
-    配置ルール（現場でのカットイン/ミックスを想定）:
-      CUE1 Intro   … 曲の最初の拍。スクラッチ/頭出し用
-      CUE2 Start   … イントロ明け（歌い出し/ビートイン）。イントロを飛ばして入る用
-      CUE3 Hook 1  … 1回目のサビ頭。いきなりサビからカットインする用
-      CUE4 Mix Out … 1回目のサビ終わり8小節前。次の曲を混ぜ始める合図
-      CUE5 Hook 2  … 2回目のサビ頭
-      CUE6 Outro   … 最後の盛り上がりの終わり。逃げ道用
-
-    検出関数はすべて小節頭にスナップ済みの秒を返すので、ここでは並べて
-    近すぎるものを間引くだけ。ジャンル別の小節数ルール（Hip-Hop=8/16、
-    House=16/32等）は、まずこの汎用版の位置をSeratoで実際に確認してから
-    必要なら足す。いきなり分岐を増やすと外れた時に原因が追えないため。
-    """
-    bar = 4.0 * beat_len
-    cand = []   # (sec, rgb, name)
-
-    # CUE1: イントロ頭
-    cand.append((fb, "CC0000", "Intro"))
-
-    # CUE2: イントロ明け（頭が静かな曲だけ別位置になる。同じなら後で間引かれる）
-    try:
-        ss = detect_song_start(mono, sr, fb, beat_len)
-        if ss is not None:
-            cand.append((float(ss), "CC6600", "Start"))
-    except Exception:
-        pass
-
-    # CUE3/5: サビ頭（8小節グリッドにスナップ済みの小節index）
-    try:
-        heads = detect_chorus_heads_snapped(mono, sr, fb, beat_len)
-        for k, h in enumerate(heads[:2]):
-            sec = fb + float(h) * bar
-            cand.append((sec, "00CC00" if k == 0 else "0099CC",
-                         "Hook 1" if k == 0 else "Hook 2"))
-    except Exception:
-        pass
-
-    # CUE4: ミックスアウト（1回目のサビ終わり8小節前）
-    try:
-        mo = detect_first_chorus_mixout(mono, sr, fb, beat_len)
-        if mo is not None:
-            cand.append((float(mo), "CCCC00", "Mix Out"))
-    except Exception:
-        pass
-
-    # CUE6: アウトロ開始（最後の盛り上がりの終わり）
-    try:
-        ce = detect_climax_end(mono, sr, fb, beat_len)
-        if ce is not None:
-            cand.append((float(ce), "9900CC", "Outro"))
-    except Exception:
-        pass
-
-    # 曲の範囲内に収め、時刻順に並べ、1小節未満の近接は先に出た方を残す
-    cand = [(max(0.0, min(s, music_dur - 0.5)), c, n) for s, c, n in cand]
-    cand.sort(key=lambda x: x[0])
-    picked = []
-    for s, c, n in cand:
-        if picked and s - picked[-1][0] < bar * 0.9:
-            continue
-        picked.append((s, c, n))
-    # Seratoの Hot Cue は最大8個
-    return [(i, s, c, n) for i, (s, c, n) in enumerate(picked[:8])]
-
-
 def write_serato_cues(mp4_path, orig_music, intro_offset_sec):
     """完成MP4にビートグリッド(BPM)を書き込み、元ファイルのSerato Cueがあれば引き継ぐ。"""
     if not _ensure_mutagen():
@@ -4951,29 +4881,17 @@ def write_serato_cues(mp4_path, orig_music, intro_offset_sec):
         cue_msg = ""
         try:
             cues = read_serato_cues(orig_music)
-            off_ms = int(round(intro_offset_sec * 1000))   # Extended化した分だけ後ろへ
             if cues:
+                off_ms = int(round(intro_offset_sec * 1000))   # Extended化した分だけ後ろへ
                 cues2 = [(idx, max(0, ms + off_ms), rgb, name) for (idx, ms, rgb, name) in cues]
                 mp4["----:com.serato.dj:markersv2"] = [MP4FreeForm(_serato_b64(_build_markers2(cues2)))]
                 cue_msg = f"・Cue {len(cues2)}個を引き継ぎ"
             else:
-                # ★元にCueが無い場合だけ、曲の構造から自動で打つ。
-                #   DJが自分で打ったCueがあるならそれを尊重して上書きしない。
-                music_dur = len(mono) / 11025.0
-                auto = auto_generate_dj_cues(mono, 11025, fb, beat_len, music_dur)
-                if auto:
-                    cues2 = [(idx, max(0, int(round(sec * 1000)) + off_ms), rgb, name)
-                             for (idx, sec, rgb, name) in auto]
-                    mp4["----:com.serato.dj:markersv2"] = [MP4FreeForm(_serato_b64(_build_markers2(cues2)))]
-                    cue_msg = f"・Cue {len(cues2)}個を自動生成"
-                    print("     🎯 自動Cue:")
-                    for (idx, sec, rgb, name) in auto:
-                        t = sec + intro_offset_sec
-                        print(f"        {idx+1}. {name:8s} {int(t//60)}:{t%60:04.1f}")
-                else:
-                    cue_msg = "・元にCueなし(自動生成できず)"
+                # Cueの自動生成は行わない。位置の精度が実用に足りず、
+                # DJが自分で打つ前提のため、元ファイルのCueの引き継ぎだけにする。
+                cue_msg = "・元にCueなし(引き継ぎなし)"
         except Exception as _ce:
-            cue_msg = f"・Cue処理失敗({_ce})"
+            cue_msg = f"・Cue引き継ぎ失敗({_ce})"
 
         mp4.save()
         print(f"     BPM {bpm:.2f}・ビートグリッド書き込み済み{cue_msg}")
