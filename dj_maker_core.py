@@ -2967,6 +2967,103 @@ def waveform_track_plan(music_audio, video_audio, sr, music_dur, vid_dur,
     return seg_plan, confs, score
 
 
+def bridge_constant_offset(seg_plan, music_dur, vid_dur, tol=0.25,
+                           min_agree_sec=20.0, min_agree_frac=0.60,
+                           min_agree_segs=3, verbose=True):
+    """採用区間のズレが全部同じなら、間のフィラーを同じズレで埋め直す。
+
+    なぜ必要か（実例: 「君セン! (OGATA Edit)」）:
+      波形プランはMV採用区間を13個出し、そのズレは**13個すべて -9.1秒**
+      （標準偏差 0.0000秒）だった。つまり「MVの頭に9.1秒足しただけのEdit」で、
+      本来は1区間で通せる。ところが窓ごとのNCCが match_th(0.60) を下回った
+      所（静かな部分・間奏・SE）が「MVに無い区間」と判定され、
+      フィラーが13個・計119.5秒＝曲の46%も発生した。
+      さらに悪いことに、そのフィラーは「認証できる口元なしカットが無い」ため
+      **MVの0.00秒から**で埋められ、曲中に13回もMVの冒頭が差し込まれる。
+
+      しかしその12個の穴は、同じ -9.1秒で引くとMVの未使用部分に
+      ぴったり収まる（穴の長さ＝MV側の空き長さが毎回完全一致）。
+      つまり「MVに無い」のではなく「NCCが弱かっただけ」。
+
+    安全性について:
+      これは波形で確認できなかった窓にMV映像（＝人物の口）を出す処理なので、
+      fail-closed方針に反するように見える。だが現状その穴は結局
+      「MVの0.00秒から」で埋められており、同じ量の口を**間違った時刻で**
+      出している。同じズレで埋める方が、出す口の量は変わらず時刻が正しい。
+      そのうえで同一音源確定（same_source）の曲にだけ適用し、
+      ・ズレが一致する採用区間が3本以上
+      ・一致分が「20秒以上」かつ「採用区間全体の60%以上」
+      を満たす時だけ動かす。1本でもズレが違う構成なら何もしない。
+    """
+    try:
+        segs = [(float(s), float(e), None if mv is None else float(mv))
+                for s, e, mv in (seg_plan or []) if float(e) > float(s)]
+    except (TypeError, ValueError, OverflowError):
+        return list(seg_plan or []), None
+    if not segs:
+        return list(seg_plan or []), None
+    try:
+        music_dur = float(music_dur); vid_dur = float(vid_dur)
+    except (TypeError, ValueError):
+        return segs, None
+    if not (music_dur > 0.0 and vid_dur > 0.0):
+        return segs, None
+
+    mapped = [(s, e, mv) for s, e, mv in segs if mv is not None]
+    if len(mapped) < min_agree_segs:
+        return segs, None
+    # 支配的なズレ = 採用秒数で重み付けした中央値
+    offs = sorted(((mv - s), (e - s)) for s, e, mv in mapped)
+    total_w = sum(w for _, w in offs)
+    acc, dom = 0.0, offs[len(offs) // 2][0]
+    for o, w in offs:
+        acc += w
+        if acc >= total_w / 2.0:
+            dom = o
+            break
+    agree = [(s, e, mv) for s, e, mv in mapped if abs((mv - s) - dom) <= tol]
+    agree_sec = sum(e - s for s, e, _ in agree)
+    if (len(agree) < min_agree_segs or agree_sec < min_agree_sec
+            or total_w <= 0.0 or (agree_sec / total_w) < min_agree_frac):
+        return segs, None
+
+    filled = 0.0
+    out = []
+    for s, e, mv in segs:
+        if mv is not None:
+            out.append((s, e, mv)); continue
+        # この穴を dom のズレで埋められるか（MVに素材がある範囲だけ）
+        a = max(s, -dom)                      # mv >= 0 になる music 開始
+        b = min(e, max(0.0, vid_dur - dom))   # mv+長さ <= vid_dur になる music 終了
+        if b - a < 0.5:
+            out.append((s, e, None)); continue
+        if a - s > 0.05:
+            out.append((s, a, None))
+        out.append((a, b, a + dom))
+        filled += b - a
+        if e - b > 0.05:
+            out.append((b, e, None))
+    if filled <= 0.05:
+        return segs, None
+
+    # つながった採用区間を1本にまとめる（ログが27区間→数区間になる）
+    merged = []
+    for s, e, mv in out:
+        if merged:
+            ps, pe, pmv = merged[-1]
+            if (mv is not None and pmv is not None and abs(s - pe) <= 0.05
+                    and abs((pmv + (pe - ps)) - mv) <= 0.05):
+                merged[-1] = (ps, e, pmv); continue
+            if mv is None and pmv is None and abs(s - pe) <= 0.05:
+                merged[-1] = (ps, e, None); continue
+        merged.append((s, e, mv))
+    if verbose:
+        print(f"  🧩 採用区間のズレが全部 {dom:+.1f}秒 で一致"
+              f"（{len(agree)}区間 / {agree_sec:.0f}秒）→ 同じズレで穴を埋めました"
+              f"（フィラー {filled:.1f}秒ぶんをMV映像に復帰 / {len(segs)}区間→{len(merged)}区間）")
+    return merged, dom
+
+
 def _expand_unsafe_plan_ranges(seg_plan, total_dur, pad=0.25, min_show=0.75,
                                extra_unsafe_ranges=None):
     """None区間を前後へ広げ、短すぎるSHOW島を除去する。
@@ -3394,6 +3491,11 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
     # ただし、これは弱区間まで「同一音源」とみなす許可ではない。
     # Remixの後半にある連続弱区間は、下の局所Pro経路で別々に再解析する。
     same_source = (p80 >= 0.78) or (strong_frac >= 0.30)
+    # ★同一音源と確定した曲に限り、「採用区間のズレが全部同じ」なら
+    #   間の弱窓フィラーを同じズレで埋め直す（詳細は bridge_constant_offset）。
+    if same_source:
+        seg_plan, _dom_off = bridge_constant_offset(
+            seg_plan, music_dur, vid_dur)
     # 波形が「同一音源」と断じた場合は、その一致区間のMVはまさにこの音を
     # 鳴らしている本人の映像＝音の同一性そのものが口元の証明になる。
     # よって同一音源は波形だけで完結させ、clean vocal無声マスクも安全境界拡張も
