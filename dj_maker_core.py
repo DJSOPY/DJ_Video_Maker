@@ -1622,6 +1622,66 @@ def _ensure_dtw_libs():
         except Exception:
             return False
 
+def _ytdlp_update_cmd():
+    """そのMacの yt-dlp を実際に更新できるコマンドを返す。
+
+    なぜ必要か: brew で入れた人と pip で入れた人がいる。
+      `brew upgrade yt-dlp` は pip 版には効かない（Error: No available formula）。
+      実例: 2026-10-29 仲間のMacで
+        「You installed yt-dlp with pip or using the wheel from PyPi」
+      と警告が出ているのに、ツールは brew を案内していた。
+    """
+    try:
+        import shutil as _sh
+        p = _sh.which("yt-dlp") or ""
+        if p:
+            # Homebrew配下なら brew、それ以外（pipx/pip/venv）は pip
+            if "/Cellar/" in p or "/homebrew/" in p or p.startswith("/usr/local/bin"):
+                r = subprocess.run(["brew", "list", "yt-dlp"],
+                                   capture_output=True, text=True)
+                if r.returncode == 0:
+                    return "brew upgrade yt-dlp"
+    except Exception:
+        pass
+    return "pip3 install -U yt-dlp      （brewで入れた人は  brew upgrade yt-dlp ）"
+
+
+def _download_fail_hints():
+    """ダウンロード失敗時の原因を、実際に多い順に案内する。
+
+    なぜ必要か:
+      これまでは「ネット接続」「yt-dlpが古い」の2つしか出していなかったが、
+      実際に仲間のMacで起きた失敗は どちらでもなく、ほぼ全部が
+      「ブラウザのCookieを読めていない → YouTubeに未ログイン扱い → 403」だった。
+      （例: Safariを選んだが、ターミナルに フルディスクアクセス が無く
+        Cookies.binarycookies が Operation not permitted で読めない）
+      原因が書いていないと本人も直しようがないので、ここで名指しする。
+    """
+    b = ""
+    try:
+        b = (load_config() or {}).get("cookies_browser", "") or ""
+    except Exception:
+        b = ""
+    _label = {"chrome": "Google Chrome", "brave": "Brave", "edge": "Microsoft Edge",
+              "firefox": "Firefox", "safari": "Safari", "none": "Cookieを使わない設定"}
+    _now = _label.get(b, b) if b else "未設定"
+
+    print("   ── 多い順に、原因と直し方 ──")
+    print(f"   ① ブラウザのCookieが読めていない（403 Forbidden の一番の原因）　いまの設定: {_now}")
+    if b == "safari":
+        print("      Safariは『ターミナルにフルディスクアクセス』が無いとCookieを読めません。")
+        print("      → Chrome に切り替えるのが確実です（ChromeでYouTubeにログインしておく）")
+    elif b in ("none", ""):
+        print("      Cookieを使わない設定だと、YouTubeにボット判定されて弾かれることがあります。")
+    else:
+        print(f"      {_now} でYouTubeにログインしているか確認してください。")
+    print("      切り替え方: ターミナルで  rm ~/.dj_video_maker/config.json")
+    print("      → もう一度ツールを起動すると、ブラウザを選び直せます（Chrome推奨）")
+    print("   ② その動画が 年齢制限 / 地域制限 / 限定公開 の可能性 → 別のURLで試してください")
+    print("   ③ ネット接続を確認してください")
+    print(f"   ④ yt-dlp が古い可能性があります → ターミナルで  {_ytdlp_update_cmd()}")
+
+
 def download_video(url, out_dir):
     print(f"\n🎬 映像をダウンロード中...")
     out = out_dir / "video.mp4"
@@ -1633,8 +1693,7 @@ def download_video(url, out_dir):
         candidates = list(out_dir.glob("video.*"))
         if not candidates:
             print("❌ 映像をダウンロードできませんでした。")
-            print("   ・ネット接続を確認してください")
-            print("   ・yt-dlp が古い可能性があります → ターミナルで  brew upgrade yt-dlp")
+            _download_fail_hints()
             sys.exit(1)
         out = candidates[0]
     print(f"  ✅ 完了")
@@ -3204,7 +3263,20 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
           f"長さ比={music_dur / max(0.1, vid_dur):.3f}")
     if is_rmx_measured:
         if lock < 0.45:
-            print(f"  ⚠️ どのテンポでも波形が一直線に揃わない（別アレンジ）→ リップシンクに切替")
+            # ★以前はここで「Proリップシンク1発勝負 → ダメなら素のMV」で return していた。
+            #   そのため名前に Remix/Bootleg 等があるだけで
+            #   🌊生波形追従 → クロマ → 音内容アライン の3段を一度も通らず、
+            #   Proの品質ゲートに落ちた瞬間に「オフセット0の素MV」で終わっていた。
+            #   （実例: 「言った!!(Remix)」。Proは MV=曲+16.4秒 を掴んでいたのに
+            #     HuBERT類似度だけで落選し、同期なしのMVが出力された。
+            #     同じ曲でも名前に Remix が無い GASOLINA 等は通常カスケードに入れて
+            #     音内容アラインで配置できていた＝名前だけで結果が変わっていた。）
+            #   名前は「ヒント」であって根拠ではないので、まず波形カスケードを通す。
+            #   Proを試す機会は失わない: 下のカスケードが「生波形で同一音源と確定」
+            #   できなかった時点で、クロマより先にProを呼ぶ（remix_lipsync_attempted
+            #   で二重実行も防ぐ）。
+            print(f"  ⚠️ どのテンポでも波形が一直線に揃わない（別アレンジの可能性）"
+                  f" → それでも先に生波形で対応箇所を探します")
             # ★波形が一直線に揃わなくても、テンポ比そのものは信用できることが多い。
             #   Remixは構成を並べ替える（サビ始まり等）ので窓が一直線に並ばず一直線度は
             #   下がるが、「等倍より明確に良い倍率」が出ているなら倍率は本物。
@@ -3226,21 +3298,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                     video_path = adj
                     vid_dur = get_duration(video_path) or (vid_dur / best_rate)
                     video_audio = wav_to_array_path(video_path, duration=min(vid_dur, 360))
-            if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
-                return
-            _safe_end = not REMIX_SHOW_MV_WHEN_UNMATCHED
-            if _safe_end:
-                print(f"  → リップシンクも弱い → 口元なし映像だけで安全側に仕上げます")
-            else:
-                print(f"  → リップシンクも弱い → MVをそのまま流します（別アレンジのため同期なし・口は合いません）")
-            make_plain_mv_sync(video_path, music_path, output_path, tmp_dir,
-                               safe_no_mouth=_safe_end)
-            try:
-                mb = output_path.stat().st_size / 1024 / 1024
-                print(f"  ✅ 完成: {output_path.name} ({mb:.1f} MB)")
-            except Exception:
-                pass
-            return
+            # ★ここで return しない。下の🌊生波形追従カスケードへ合流する。
         # 「MV全体を1オフセットで当てて流せる」のは拍が十分に一直線な時だけ。
         # lock 0.45〜0.80 は揃いが中途半端＝当て込み不可（後段でリップシンクへ回す）。
         remix_aligned = (lock >= 0.80)
@@ -3284,15 +3342,18 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             print(f"  ℹ️ 等倍と大差なし → テンポ補正せず等倍で配置")
 
         # lock 0.45〜0.80は「一部は合うが、MV全編を1本の時間軸では
-        # 流せない」remix。従来は remix_aligned=False を記録するだけで
-        # そのまま伴奏波形/クロマ経路へ進み、ボーカル位置が違うのに
-        # 通常同期を採用することがあった。この帯はProを先に試す。
+        # 流せない」remix。remix_aligned=False を記録するだけで伴奏波形/クロマへ
+        # 進むと、ボーカル位置が違うのに通常同期を採用することがあるため、
+        # この帯は「クロマより先にPro」を守る必要がある。
+        # ★ただしPro自体は、生波形で同一音源と確定できなかった後に呼ぶ。
+        #   生波形は「同一音源なら一意に指す」最も強い証拠で、しかもProの
+        #   1/10以下のコスト（実測 13秒 対 2〜4分）。先にProを走らせると、
+        #   波形で一発で解ける曲にまでDemucs+HuBERTを掛けることになる。
+        #   Pro優先の意図（クロマに先を越させない）は維持したまま、
+        #   順番だけ「生波形 → Pro → クロマ/音内容」に入れ替える。
         if not remix_aligned:
-            print(f"  🎤 部分的なテンポ一致（{lock*100:.0f}%） → ボーカル・リップシンクを優先")
-            remix_lipsync_attempted = True
-            if _try_vocal_lipsync(music_path, video_path, output_path, tmp_dir, music_dur):
-                return
-            print("  ↪︎ リップシンクの信頼度が足りないため、波形/メロディ同期も試します")
+            print(f"  🎤 部分的なテンポ一致（{lock*100:.0f}%） → "
+                  f"まず生波形、合わなければボーカル・リップシンクを優先")
 
     # ── 全編・生波形・等間隔追従（単調制約なし）──
     #   各窓の絶対ベストMV位置を生波形NCCで実測し、波形が指す所へそのまま置く。
@@ -3345,6 +3406,21 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         # 元祖版のカスケード: クロマ一致 → 音内容アライン → リップシンク → 原曲MVそのまま。
         # クロマ/音内容で配置した場合も、この後の clean-vocal 無声マスク等の安全機構は
         # seg_plan に対して従来どおり効く（配置の根拠が増えるだけで検証は減らない）。
+        #
+        # ★Remix判定の曲は、クロマより先にProリップシンクを試す。
+        #   理由は上の「lock 0.45〜0.80」の注記と同じで、別アレンジでは
+        #   クロマ/音内容が先に弱い根拠で配置を決めてしまうことがある。
+        #   以前は lock<0.45 と lock<0.80 の2か所で波形より前にProを呼んでいたが、
+        #   それを「生波形で同一音源と確定できなかった後」のここ1か所に集約した。
+        #   生波形で確定した曲（same_source）はこのブロックに来ないので、
+        #   波形で解ける曲にDemucs+HuBERTを掛けることがなくなる。
+        if is_rmx_measured and not remix_lipsync_attempted:
+            print(f"  🎤 別アレンジの可能性 → クロマより先にボーカル・リップシンクを試します")
+            remix_lipsync_attempted = True
+            if _try_vocal_lipsync(music_path, video_path, output_path,
+                                  tmp_dir, music_dur):
+                return
+            print("  ↪︎ リップシンクの信頼度が足りないため、メロディ/音内容でも探します")
         print(f"  ↪︎ 生波形では合わない（強一致率{strong_frac*100:.0f}%）→ クロマ（メロディ）で合わせ直します...")
         cseg_plan, cconf, cuniq = align_segments(video_audio, music_audio)
         cmatch = (sum(e - s for s, e, mv in cseg_plan if mv is not None) / music_dur) if music_dur > 0 else 0.0
