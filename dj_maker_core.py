@@ -48,9 +48,87 @@ def detect_browsers():
         found.append("safari")  # Safariは標準搭載なので常に候補に
     return found
 
+_CHROMIUM_DIRS_MAC = {
+    "chrome": "Google/Chrome",
+    "brave":  "BraveSoftware/Brave-Browser",
+    "edge":   "Microsoft Edge",
+}
+# YouTube（Google）にログインしている時だけ存在するCookie名
+_YT_LOGIN_NAMES = ("LOGIN_INFO", "SAPISID", "__Secure-3PSID", "__Secure-1PSID", "SID")
+
+
+def pick_logged_in_profile(browser):
+    """Chrome系ブラウザで「YouTubeにログインしているプロフィール」を探して返す。
+
+    なぜ必要か（実例: 2026-11 anc の8曲・11曲バッチ）:
+      yt-dlp は --cookies-from-browser chrome とだけ渡すと、Chromeフォルダの中の
+      全プロフィール（Default / Profile 1 / Guest Profile / System Profile …）から
+      「いちばん最近更新された Cookies ファイル」を選ぶ（yt_dlp/cookies.py の _newest）。
+      Chromeは裏でゲスト用などのプロフィールも触るので、ある瞬間だけ
+      ログインしていないプロフィール（Cookie 30個）を掴み、YouTubeに 403 で弾かれる。
+      詳細ログでは「Extracted 3107 cookies」と「Extracted 30 cookies」が
+      同じ実行の中で入れ替わっていて、30の時だけ必ず失敗していた
+      （anc 103回中11回 / fujitasou 48回中5回）。
+      → ログイン済みのプロフィールを1つに決めて、毎回そこだけを読ませる。
+
+    戻り値: プロフィールのフォルダパス（見つからなければ None ＝従来どおり自動選択）
+    """
+    import sqlite3, shutil as _sh, tempfile as _tf
+    sub = _CHROMIUM_DIRS_MAC.get(browser)
+    if not sub or sys.platform != "darwin":
+        return None
+    root = Path.home() / "Library" / "Application Support" / sub
+    if not root.is_dir():
+        return None
+    best = None   # (ログインCookie数, YouTubeのCookie数, 全Cookie数, パス)
+    for prof in sorted(root.iterdir()):
+        if not prof.is_dir() or prof.name in ("Guest Profile", "System Profile"):
+            continue
+        dbs = [p for p in (prof / "Network" / "Cookies", prof / "Cookies") if p.is_file()]
+        if not dbs:
+            continue
+        db = max(dbs, key=lambda p: p.stat().st_mtime)   # yt-dlpと同じく新しい方
+        try:
+            with _tf.TemporaryDirectory(prefix="djvm_ck_") as td:
+                cp = Path(td) / "Cookies"
+                _sh.copy2(db, cp)                 # 使用中のDBは直接開かずコピーを読む
+                con = sqlite3.connect(f"file:{cp}?mode=ro", uri=True)
+                try:
+                    cur = con.cursor()
+                    total = cur.execute("SELECT count(*) FROM cookies").fetchone()[0]
+                    yt = cur.execute("SELECT count(*) FROM cookies WHERE host_key LIKE '%youtube.com'").fetchone()[0]
+                    q = ",".join("?" * len(_YT_LOGIN_NAMES))
+                    login = cur.execute(
+                        f"SELECT count(*) FROM cookies WHERE host_key LIKE '%youtube.com' AND name IN ({q})",
+                        _YT_LOGIN_NAMES).fetchone()[0]
+                finally:
+                    con.close()
+        except Exception:
+            continue
+        cand = (login, yt, total, str(prof))
+        if best is None or cand[:3] > best[:3]:
+            best = cand
+    if best is None or best[0] == 0:
+        return None          # ログイン済みプロフィールが見当たらない → 従来の自動選択に任せる
+    return best[3]
+
+
+_PINNED_PROFILE = {}
+
 def cookie_args_from_config(config):
     b = config.get("cookies_browser")
     if b and b != "none":
+        if b in _CHROMIUM_DIRS_MAC:
+            if b not in _PINNED_PROFILE:
+                try:
+                    _PINNED_PROFILE[b] = pick_logged_in_profile(b)
+                except Exception:
+                    _PINNED_PROFILE[b] = None
+                if _PINNED_PROFILE[b]:
+                    print(f"  🔐 {b} のプロフィール「{Path(_PINNED_PROFILE[b]).name}」の"
+                          f"Cookieを使います（YouTubeログイン済みのものに固定）")
+            if _PINNED_PROFILE[b]:
+                return ["--cookies-from-browser", f"{b}:{_PINNED_PROFILE[b]}"]
         return ["--cookies-from-browser", b]
     return []
 
@@ -1295,6 +1373,101 @@ def find_best_mv_tempo(video_audio, music_audio, sr=11025, window_sec=SEG_WINDOW
         return 1.0, 0.0, 0.0
 
 
+def measure_tempo_drift(video_audio, music_audio, sr=11025, win_sec=6.0):
+    """曲の各所が「MVの何秒に当たるか」を測り、その並びの傾きからテンポ比を出す。
+
+    なぜ必要か:
+      find_best_mv_tempo の「一直線度」は、窓ごとの対応位置が中央値から
+      ±1秒以内に収まる割合で採点する。テンポ差が小さい／曲が短いと、
+      等倍のままでもズレが1秒以内に収まってしまい、等倍も正解も100%になって
+      差が出ない（実測: 70秒の曲でMVが2%遅い → ×1.025も等倍も一直線度100%、
+      補正されず最後で1.4秒ズレた）。
+      BPMを数える方法は「140を70や93と数える」取り違えがあり根拠に使えない
+      （実測: 同じ曲で 93.15 / 70.00 / 91.47 と出た）。
+      ここでは拍を数えず、ズレそのものを測る。前半でMVと0.0秒ずれ、
+      後半で0.7秒ずれていれば、その間にテンポ差の分だけ離れていったということ。
+
+    やり方: 6秒窓を3秒おきに取り、各窓をMV全体と照合して一番合う位置を求める
+      （クロマで位置を決め、オンセットで細かく詰める）。窓の時刻とMV位置の組に
+      外れ値に強い直線（Theil-Sen）を当て、直線に乗る点だけで引き直す。
+      構成を並べ替えたEditは直線に乗らない点が多くなるので、点の数・範囲・
+      残差の条件を満たさない時は「わからない」を返す。
+
+    戻り: (MV倍率 or None, 情報dict)
+      倍率は find_best_mv_tempo と同じ向き（MVを何倍速にすれば曲に合うか）。
+    """
+    info = {"n": 0, "inliers": 0, "span": 0.0, "sigma": None, "se": None, "drift": 0.0}
+    try:
+        ov, cv, fps = compute_features(video_audio, sr)
+        om, cm, _ = compute_features(music_audio, sr)
+        try:
+            _k, _kconf = estimate_semitone_shift(video_audio, music_audio, sr)
+            if _k and _kconf >= 0.05:
+                cv = np.roll(cv, int(_k), axis=0)
+        except Exception:
+            pass
+        win = max(16, int(round(win_sec * fps)))
+        step = max(4, win // 2)
+        Tv = cv.shape[1]
+        if Tv <= win or cm.shape[1] <= win:
+            return None, info
+        UNIFORM = 1.0 / np.sqrt(12)
+        pts = []
+        for s in range(0, cm.shape[1] - win + 1, step):
+            seg = cm[:, s:s + win]
+            if float(seg.max(axis=0).mean()) < UNIFORM * 1.35:
+                continue                                   # 音程の無い窓（無音・SE）は使わない
+            total = None
+            for b in range(12):
+                c = correlate(cv[b], seg[b], mode='valid', method='fft')
+                total = c if total is None else total + c
+            ch = total / float(win)                        # 平均コサイン類似度（0〜1）
+            so = om[s:s + win]; so = so - so.mean()
+            oc = correlate(ov, so, mode='valid', method='fft') / (float(win) * (so.std() + 1e-9))
+            score = ch + 0.5 * oc
+            k = int(np.argmax(score))
+            if float(ch[k]) < SEG_SCORE_TH:
+                continue
+            off = 0.0                                      # 放物線補間で1フレーム未満まで詰める
+            if 0 < k < len(score) - 1:
+                y0, y1, y2 = score[k - 1], score[k], score[k + 1]
+                d = (y0 - 2 * y1 + y2)
+                if d < 0:
+                    off = float(np.clip(0.5 * (y0 - y2) / d, -0.5, 0.5))
+            pts.append(((s + win / 2.0) / fps, (k + off + win / 2.0) / fps))
+        info["n"] = len(pts)
+        if len(pts) < 6:
+            return None, info
+        t = np.array([p[0] for p in pts]); m = np.array([p[1] for p in pts])
+        # Theil-Sen（10秒以上離れた2点の傾きの中央値）
+        sl = [(m[j] - m[i]) / (t[j] - t[i]) for i in range(len(t)) for j in range(i + 1, len(t))
+              if t[j] - t[i] >= 10.0]
+        if len(sl) < 5:
+            return None, info
+        k0 = float(np.median(sl)); c0 = float(np.median(m - k0 * t))
+        inl = np.abs(m - (k0 * t + c0)) <= 0.25
+        if inl.sum() < max(6, int(0.6 * len(pts))):
+            return None, info
+        ti, mi = t[inl], m[inl]
+        span = float(ti.max() - ti.min())
+        dur = float(len(music_audio)) / sr
+        if span < max(25.0, 0.35 * dur):
+            return None, info
+        A = np.vstack([ti, np.ones_like(ti)]).T
+        (k1, c1), *_ = np.linalg.lstsq(A, mi, rcond=None)
+        res = mi - (k1 * ti + c1)
+        sigma = float(np.sqrt(np.sum(res ** 2) / max(1, len(ti) - 2)))
+        se = sigma / (np.sqrt(np.sum((ti - ti.mean()) ** 2)) + 1e-9)
+        info.update(inliers=int(inl.sum()), span=span, sigma=sigma, se=float(se),
+                    drift=float((k1 - 1.0) * span))
+        if sigma > 0.12:
+            return None, info                              # 直線に乗りきらない＝信用しない
+        return float(k1), info
+    except Exception as e:
+        info["error"] = str(e)
+        return None, info
+
+
 def estimate_semitone_shift(video_audio, music_audio, sr=11025):
     """MVに対して曲が何半音ずれているかを推定する。戻り: (半音0..11, 確信度0..1)
 
@@ -1367,9 +1540,32 @@ def make_tempo_adjusted_mv(video_path, rate, tmp_dir, varispeed=False):
                   f"aresample=44100")
         else:
             af = f"atempo={rate:.6f}"
-        # 映像: setpts=PTS/rate（rate倍速）
+        # 映像: rate倍速。
+        # ★setpts だけだと、速めた時（rate>1）に間引くフレームの選び方が
+        #   「切り捨て」になり、映像が音より一定で遅れる
+        #   （実測: ×1.02で1.6フレーム≒53ms、×1.19で2.0フレーム≒66ms 遅れ。
+        #     遅くする方向は0）。元のfpsに「四捨五入」で揃え直すと、
+        #   どの倍率でも理屈上の最小（±0.5フレーム）に収まる（実測 最大0.6）。
+        _src_fps = 30.0
+        try:
+            _pr = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+                capture_output=True, text=True, errors="replace").stdout.split()
+            for _v in _pr:
+                _n, _, _d = _v.partition("/")
+                _f = float(_n) / float(_d or 1)
+                if 5.0 <= _f <= 120.0:
+                    _src_fps = _f
+                    break
+        except Exception:
+            _src_fps = 30.0
         cmd = ["ffmpeg", "-y", "-i", str(video_path),
-               "-filter:v", f"setpts=PTS/{rate:.6f}",
+               # PTS-STARTPTS（開始を0に数え直す）は使わない。映像と音声で開始時刻が
+               # 違うファイルだと、映像だけ数え直すと音とのタイミングが崩れるため。
+               "-filter:v", (f"setpts=PTS/{rate:.6f},"
+                             f"fps=fps={_src_fps:.6f}:round=near"),
                "-filter:a", af,
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                "-c:a", "aac", "-b:a", "192k", str(out)]
@@ -1694,7 +1890,12 @@ def download_video(url, out_dir):
         if not candidates:
             print("❌ 映像をダウンロードできませんでした。")
             _download_fail_hints()
-            sys.exit(1)
+            # ★以前は sys.exit(1) で「プログラムごと終了」していた。
+            #   SystemExit は曲ごとの except Exception をすり抜けるので、
+            #   1曲のダウンロード失敗で残りの曲が全部作られずに終わっていた
+            #   （詳細ログ: anc 11曲中8曲目 / 8曲中7曲目で全体が停止）。
+            #   呼び出し側は None を「この候補はダメ → 次の候補へ」と扱う。
+            return None
         out = candidates[0]
     print(f"  ✅ 完了")
     return out
@@ -2925,6 +3126,12 @@ def waveform_track_plan(music_audio, video_audio, sr, music_dur, vid_dur,
         t += hop
     if not pts:
         return [], [], {"p80": 0.0, "strong_frac": 0.0, "match_ratio": 0.0}
+    # ★最後の窓は必ず曲の終わりまで担当させる。
+    #   上のループは「残り0.05秒未満」の端を窓にしないため、曲長が hop の倍数を
+    #   わずかに超える曲（例: 70.034秒）では最後の0.034秒がプランから抜け、
+    #   後段の総フレーム数チェックで1枚足りず「全編を安全背景へ置換」になっていた
+    #   （実例: 2026-08-09 Deja Vu 5520/5521 frames、言った!!(Remix) 2100/2101）。
+    pts[-1][1] = float(music_dur)
     confs = np.array([p[3] for p in pts], dtype=float)
     N = len(pts)
     p80 = float(np.percentile(confs, 80))
@@ -3214,7 +3421,8 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         chosen_url = _best_verify["url"]
     if video_path is None:
         print("  ❌ 有効な映像が取得できませんでした")
-        return
+        # 黙って return すると完成数に数えられ、画面の「作れなかった曲」にも出ない。
+        raise RuntimeError("MVの映像をダウンロードできませんでした（URL欄に別のURLを貼ると作れることがあります）")
 
     # 自動で選ばれたMVが曲より極端に短い＝短縮版/別物の可能性。
     # 候補が1個しか無いと「短すぎスキップ」が飛び先を持てないので、ここで手動URL上書きの機会を与える。
@@ -3335,7 +3543,28 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             print(_bpm_msg)
             best_rate, lock = 1.0, lock_1p0
             _tempo_evidence = False
-    if _tempo_evidence and not _name_says_remix:
+    # ★【C】一直線度で差が出なかった時は、ズレの増え方からテンポ差を直接測る。
+    #   曲が短い／テンポ差が小さいと、等倍のままでもズレが1秒以内に収まり
+    #   「等倍も正解も一直線度100%」になって見分けられない。
+    #   （実測: 70秒・MVが2%遅い → 補正されず最後で1.4秒ズレた）
+    #   ここでは前半〜後半の各所で「MVと何秒ずれているか」を測り、その傾きを使う。
+    #   直線にきれいに乗った時だけ採用し、それ以外は従来どおり（何もしない）。
+    _drift_evidence = False
+    if not _tempo_evidence:
+        _dr, _dinfo = measure_tempo_drift(video_audio, music_audio)
+        if _dr is not None and 0.004 <= abs(_dr - 1.0) <= 0.08:
+            print(f"  ⏱ 前半と後半のズレの増え方からテンポ差 ×{_dr:.4f} を実測"
+                  f"（{_dinfo['span']:.0f}秒で {_dinfo['drift']:+.2f}秒ずれていく / "
+                  f"{_dinfo['inliers']}か所で一致・誤差{_dinfo['sigma']*1000:.0f}ms）"
+                  f" → MVを補正します")
+            best_rate = float(_dr)
+            lock = max(lock, lock_1p0)
+            _tempo_evidence = True
+            _drift_evidence = True
+    # テンポ差が「明確」と言える条件（一直線度の差、またはズレの実測）
+    _tempo_clear = bool(((lock - lock_1p0) >= 0.10 and lock >= TEMPO_ADJUST_MIN_LOCK)
+                        or _drift_evidence)
+    if _tempo_evidence and not _name_says_remix and not _drift_evidence:
         print(f"  🔎 名前に表記はありませんが、テンポ差 ×{best_rate:.3f} を実測"
               f"（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）→ 別テンポ音源として扱います")
     is_rmx_measured = bool(_name_says_remix or _tempo_evidence)
@@ -3380,7 +3609,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             #   ここでMVを合わせずに渡すと、19%もテンポが違う映像のままDTWに投げることに
             #   なり、伸縮を吸収しきれず失敗する（実例: Dj Dark Remix ×1.20 を等倍のまま
             #   渡して一致0.46で不採用）。補正してからリップシンクへ渡す。
-            if (abs(best_rate - 1.0) > 0.005 and (lock - lock_1p0) >= 0.10 and lock >= TEMPO_ADJUST_MIN_LOCK):
+            if ((abs(best_rate - 1.0) > 0.005 or _drift_evidence) and _tempo_clear):
                 print(f"  🎚 テンポ差 ×{best_rate:.3f} は明確（等倍{lock_1p0*100:.0f}%→{lock*100:.0f}%）"
                       f" → MVを補正してからリップシンクします")
                 # 「レコードを速く回した」編集か自動判定（音程も一緒に動いたか）
@@ -3400,7 +3629,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
         # lock 0.45〜0.80 は揃いが中途半端＝当て込み不可（後段でリップシンクへ回す）。
         remix_aligned = (lock >= 0.80)
         if (remix_aligned and abs(best_rate - 1.0) > 0.003
-                and (lock - lock_1p0) >= 0.10 and lock >= TEMPO_ADJUST_MIN_LOCK):
+                and _tempo_clear):
             print(f"  🎚 MVを ×{best_rate:.3f} にテンポ補正して波形を合わせます...")
             # 「レコードを速く回した」編集か自動判定（音程も一緒に動いたか）
             _vs, _sh, _cf = looks_like_varispeed(
@@ -3415,7 +3644,7 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                 vid_dur = get_duration(video_path) or (vid_dur / best_rate)
                 video_audio = wav_to_array_path(video_path, duration=min(vid_dur, 360))
         elif (not remix_aligned and abs(best_rate - 1.0) > 0.005
-                and (lock - lock_1p0) >= 0.10 and lock >= TEMPO_ADJUST_MIN_LOCK):
+                and _tempo_clear):
             # 一致率は中間的でも「等倍よりこの倍率の方が明確に揃う」なら、テンポ差は本物。
             # ここでMVを合わせておかないと、19%もテンポが違う映像のまま
             # リップシンクに渡すことになり、DTWが巨大な伸縮を吸収しきれず失敗する
@@ -3689,7 +3918,14 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
                       f"大きすぎるため補正しません（MVが別バージョンの可能性）")
 
 
-    # セグメント生成
+    # ★プランの最後が曲の終わりに少しだけ届いていない時は、最後の区間を伸ばして埋める。
+    #   どのプラン（波形/クロマ/音内容）でも、端数が抜けると最後の総フレーム数チェックで
+    #   全編が安全背景に差し替わってしまう。2秒以内の端数なら最後の区間の続きで十分
+    #   （MVが尽きる場合は下の処理が尽きた分だけ口元なし映像で埋める）。
+    if seg_plan:
+        _ls, _le, _lmv = seg_plan[-1]
+        if 0.0 < (music_dur - _le) <= 2.0:
+            seg_plan = list(seg_plan[:-1]) + [(_ls, music_dur, _lmv)]
     seg_files = []
     for si, (s, e, mv) in enumerate(seg_plan):
         dur = e - s
@@ -5374,6 +5610,8 @@ import time as _run_time          # 全曲の所要時間の計測用（利用�
 _run_t0 = _run_time.time()
 try:
     for i, music in enumerate(music_list, 1):
+        sub_tmp = None
+        orig_music = None
         try:
             print(f"\n{'─'*54}")
             print(f"  [{i}/{len(music_list)}] {music.name}")
@@ -5440,25 +5678,44 @@ try:
                     _wm_times.append((0.0, min(7.0, _tdur)))
                 if WATERMARK_ENABLED and _wm_times:
                     _wm_text = "DJ SOPY video/club edit" if extend_bars > 0 else WATERMARK_TEXT
-                    _wm = add_watermark(out_path, _wm_times, tmp, text=_wm_text)
+                    _wm = add_watermark(out_path, _wm_times, sub_tmp, text=_wm_text)
                     if _wm != out_path and Path(_wm).exists():
                         Path(_wm).replace(out_path)
                         print(f"  🏷  ウォーターマーク追加")
 
                 # 100MB以内に収める（音声の扱いは audio_cap で決定）
-                _fit = fit_to_size(out_path, orig_music, 100, tmp, audio_cap_kbps=audio_cap)
+                _fit = fit_to_size(out_path, orig_music, 100, sub_tmp, audio_cap_kbps=audio_cap)
                 if _fit != out_path and Path(_fit).exists():
                     Path(_fit).replace(out_path)
 
                 write_serato_cues(out_path, orig_music, intro_offset)
+            else:
+                # 例外は出なかったが完成ファイルが無い＝作れていない。
+                # 数えないと「成功」扱いになり、画面の再作成リストにも出ない。
+                print(f"\n  ❌ この曲は作れませんでした（完成ファイルがありません）")
+                print("     → 次の曲に進みます（他の曲は影響を受けません）")
+                failed_tracks.append(orig_music.name)
         except KeyboardInterrupt:
             raise
-        except Exception as _e:
+        except (Exception, SystemExit) as _e:
             # 1曲が失敗しても全体は止めない。原因を出して次の曲へ進む。
-            print(f"\n  ❌ この曲は作れませんでした: {_e}")
+            # ★SystemExit も受ける: run() / get_duration() 等は失敗時に sys.exit(1) するので、
+            #   ffmpeg が1曲で失敗しただけでも残り全曲が止まっていた。
+            _why = _e if not isinstance(_e, SystemExit) else "処理の途中で失敗しました（上のログを参照）"
+            print(f"\n  ❌ この曲は作れませんでした: {_why}")
             print("     → 次の曲に進みます（他の曲は影響を受けません）")
-            failed_tracks.append(music.name)
+            failed_tracks.append(orig_music.name if orig_music is not None else music.name)
             continue
+        finally:
+            # ★1曲終わるごとに、その曲の作業フォルダを消す。
+            #   以前は全曲が終わるまで track_1〜track_N を全部残していたため、
+            #   MV・Demucsのstem・区間ごとの再エンコード・結合前の動画などが
+            #   曲数ぶん積み上がり、15曲だと数GB〜十数GBに達してディスクを圧迫した
+            #   （途中で「No space left on device」になると残りの曲が全滅する）。
+            #   完成した動画は out_dir に移動済みで、ここには中間ファイルしか無い。
+            #   成功・失敗どちらでも消す（失敗した曲の残骸が一番大きいことが多い）。
+            if sub_tmp is not None:
+                shutil.rmtree(sub_tmp, ignore_errors=True)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

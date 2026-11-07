@@ -106,22 +106,43 @@ def set_browser(browser):
 
 # ---- multipart/form-data を最小パース（ファイル＋テキスト項目）----
 def parse_multipart(body, boundary):
-    parts = body.split(b"--" + boundary)
+    """multipart本文を分解する。
+
+    ★ファイルの中身は bytes にコピーせず、(開始, 終了) の位置だけ返す。
+      以前は body.split() でパートごとにコピーし、さらに末尾の \r\n を
+      落とす時にもう1回コピーしていたので、15曲（WAVで計1GB前後）だと
+      アップロードの瞬間に本文の2〜3倍のメモリを使っていた。
+      位置だけ持って memoryview で直接ファイルに書けば、本文1つ分で済む。
+    戻り値: files=[(name, filename, start, end)], fields={name: value}
+    """
     files, fields = [], {}
-    for p in parts:
-        if not p or p in (b"--\r\n", b"--"): continue
-        if b"\r\n\r\n" not in p: continue
-        head, data = p.split(b"\r\n\r\n", 1)
-        if data.endswith(b"\r\n"): data = data[:-2]
-        head_s = head.decode("utf-8", "replace")
+    sep = b"--" + boundary
+    pos = body.find(sep)
+    if pos < 0:
+        return files, fields
+    while True:
+        head_start = pos + len(sep)
+        if body[head_start:head_start + 2] == b"--":
+            break                                   # 終端
+        nxt = body.find(sep, head_start)
+        if nxt < 0:
+            break
+        hdr_end = body.find(b"\r\n\r\n", head_start, nxt)
+        if hdr_end < 0:
+            pos = nxt; continue
+        head_s = body[head_start:hdr_end].decode("utf-8", "replace")
+        d0, d1 = hdr_end + 4, nxt
+        if body[d1 - 2:d1] == b"\r\n":
+            d1 -= 2
         m = re.search(r'name="([^"]*)"', head_s)
-        if not m: continue
-        name = m.group(1)
-        fn = re.search(r'filename="([^"]*)"', head_s)
-        if fn and fn.group(1):
-            files.append((name, fn.group(1), data))
-        else:
-            fields[name] = data.decode("utf-8", "replace").strip()
+        if m:
+            name = m.group(1)
+            fn = re.search(r'filename="([^"]*)"', head_s)
+            if fn and fn.group(1):
+                files.append((name, fn.group(1), d0, d1))
+            else:
+                fields[name] = body[d0:d1].decode("utf-8", "replace").strip()
+        pos = nxt
     return files, fields
 
 
@@ -207,6 +228,17 @@ def run_engine(job, music_paths, out_dir, extend, py, urls=None, audio_cap="320"
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, errors="replace")
         job["proc"] = proc
+        # ★作成中だけMacを眠らせない。15曲だと1時間前後かかることがあり、
+        #   途中でスリープすると処理が止まる。caffeinate -w は対象プロセスが
+        #   終わると自動で解除されるので、止め忘れは起きない。
+        #   （-i = アイドルスリープ防止。画面は消えてもよい。macOS以外は何もしない）
+        _caf = shutil.which("caffeinate")
+        if _caf:
+            try:
+                subprocess.Popen([_caf, "-i", "-w", str(proc.pid)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
         proc.stdin.write(answers); proc.stdin.flush(); proc.stdin.close()
         for line in proc.stdout:
             line = line.rstrip("\n"); job["log"].append(line)
@@ -386,9 +418,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             jdir = WORK / jid; (jdir/"in").mkdir(parents=True, exist_ok=True)
             (jdir/"out").mkdir(parents=True, exist_ok=True)
             music_paths = []
-            for idx,(_name, fn, data) in enumerate(files):
+            _mv = memoryview(body)
+            _used = set()
+            for idx,(_name, fn, d0, d1) in enumerate(files):
                 safe = re.sub(r'[/\\]', "_", fn)
-                fp = jdir/"in"/safe; fp.write_bytes(data); music_paths.append(fp)
+                # 同名ファイルを2つ入れても上書きで1曲消えないように番号を付ける
+                if safe in _used:
+                    _st, _sx = os.path.splitext(safe)
+                    k = 2
+                    while f"{_st} ({k}){_sx}" in _used: k += 1
+                    safe = f"{_st} ({k}){_sx}"
+                _used.add(safe)
+                fp = jdir/"in"/safe
+                with open(fp, "wb") as _fh:
+                    _fh.write(_mv[d0:d1])          # コピーせずに書く
+                music_paths.append(fp)
+            del _mv, body
             # 各曲のURL（url_0, url_1 ... 空なら自動選択）
             items = []
             for idx, p in enumerate(music_paths):
