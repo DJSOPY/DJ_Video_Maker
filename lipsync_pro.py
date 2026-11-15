@@ -2260,6 +2260,9 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
         "accepted": False, "coverage": 0.0, "feature_similarity": -1.0,
         "tail_coverage": 0.0, "longest_invalid_seconds": float("inf"),
         "ending_invalid_seconds": float("inf"),
+        "head_invalid_seconds": 0.0, "interior_coverage": 0.0,
+        "interior_longest_invalid_seconds": float("inf"),
+        "accepted_partial_range": False,
         "block_similarity_p20": -1.0, "longest_bad_seconds": float("inf"),
         "feature_lift": 0.0, "onset_correlation": 0.0,
         "median_dtw_cost": float("inf"), "p75_dtw_cost": float("inf"),
@@ -2330,6 +2333,22 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
                 ending += sample_sec
             report["longest_invalid_seconds"] = float(longest)
             report["ending_invalid_seconds"] = float(ending)
+            # ★曲の「頭」と「最後」にあるMV範囲外を除いた、内側だけのカバー率。
+            #   Remix/Introは原曲MVより長いのが普通で、足された頭や最後に
+            #   対応するMVは存在しない。そこは下で unsafe（MVに対応が無い）に
+            #   入るのでレンダラーが別カットに差し替える＝映像は破綻しない。
+            #   採否で見るべきは「MVと対応し得る内側」が切れ目なく繋がっているか。
+            _vi = np.flatnonzero(all_valid)
+            if len(_vi):
+                _f, _l = int(_vi[0]), int(_vi[-1])
+                _inner = all_valid[_f:_l + 1]
+                report["head_invalid_seconds"] = float(_f * sample_sec)
+                report["interior_coverage"] = float(np.mean(_inner))
+                _lg = _cu = 0.0
+                for ok in _inner:
+                    _cu = 0.0 if ok else _cu + sample_sec
+                    _lg = max(_lg, _cu)
+                report["interior_longest_invalid_seconds"] = float(_lg)
             _mark_unsafe(report, "MVに対応が無い",
                          _unsafe_mask_ranges(all_times, ~all_valid, sample_sec))
 
@@ -2570,6 +2589,29 @@ def alignment_quality_report(anchors, windows, rfeat, rt, ofeat, ot,
                     and report["tail_coverage"] >= 0.98
                     and report["longest_invalid_seconds"] <= 0.75
                     and report["ending_invalid_seconds"] <= 0.25)
+        # ★部分採用：頭/最後だけがMVの外で、内側は切れ目なく強く合っている場合。
+        #   以前は range_ok を満たさないと、他が全部良くても曲全体を捨てて
+        #   粗い旧方式に落としていた。実例（詳細ログ）:
+        #     Macarena (Bayside Boys Remix): 発音類似0.77・局所p20=0.56 と
+        #       採用された曲より良いのに「末尾の範囲外0.28s>0.25s」＝0.03秒で落選。
+        #     Want U Back (Clean Intro): 0.58 / 0.39 だが、曲がMVより24秒長く
+        #       最後の11.4秒にMVが無いので落選。
+        #   条件は緩めすぎないよう、
+        #     ・内側のカバー98%以上・内側の連続範囲外0.75秒以下（内側は従来と同じ厳しさ）
+        #     ・曲全体の70%以上がMVに対応している
+        #     ・局所p20が基準+0.08以上（strong_reordered と同じ「強い一致」の幅）
+        #     ・歌っている最中に隠す割合が30%以下
+        #   をすべて要求する。弱い一致の曲（例: Get Wild Remix p20=0.05）は
+        #   ここを通らず、従来どおり旧方式へ回る。
+        partial_range_ok = (
+            not range_ok
+            and report["interior_coverage"] >= 0.98
+            and report["interior_longest_invalid_seconds"] <= 0.75
+            and report["coverage"] >= 0.70
+            and report["block_similarity_p20"] >= min_block + 0.08
+            and _sing_rate <= 0.30)
+        report["accepted_partial_range"] = bool(partial_range_ok)
+        range_ok = range_ok or partial_range_ok
         report["accepted"] = bool(
             range_ok
             and report["median_dtw_cost"] <= max_cost
@@ -3916,6 +3958,14 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
             if _split:
                 print("       ※非歌唱中は音響同期の評価対象外"
                       "（口運動は未確認のためDJ用Bロールとして表示）")
+        if q["accepted"] and q.get("accepted_partial_range"):
+            _hd = q.get("head_invalid_seconds", 0.0)
+            _tl = q.get("ending_invalid_seconds", 0.0)
+            _parts = []
+            if _hd > 0.05: _parts.append(f"頭{_hd:.1f}秒")
+            if _tl > 0.05: _parts.append(f"最後{_tl:.1f}秒")
+            print(f"     ✂️ 部分採用: 曲の{'・'.join(_parts) or '端'}はMVに対応が無いので"
+                  f"別カットで埋め、対応する部分は高精度同期を使います")
         if not q["accepted"]:
             # ★どの条件で落ちたかを明示する。「信頼度が不足」だけでは、
             #   6つある判定のどれが原因か分からず改善のしようがなかった。
@@ -3933,6 +3983,24 @@ def process(music_path, mv_source, out_path, use_hubert=True, placement="equal",
             if q.get("ending_invalid_seconds", 0.0) > 0.25:
                 reasons.append(
                     f"末尾の範囲外{q['ending_invalid_seconds']:.2f}s>0.25s")
+            if any(r.startswith(("カバー", "末尾", "連続範囲外")) for r in reasons):
+                # 範囲で落ちた時は、部分採用の条件のどれに届かなかったかも出す
+                _pr = []
+                if q.get("interior_coverage", 0.0) < 0.98:
+                    _pr.append(f"内側カバー{q.get('interior_coverage', 0.0)*100:.0f}%<98%")
+                if q.get("interior_longest_invalid_seconds", 9e9) > 0.75:
+                    _pr.append(f"内側の連続範囲外"
+                               f"{q.get('interior_longest_invalid_seconds', 0.0):.1f}s>0.75s")
+                if q["coverage"] < 0.70:
+                    _pr.append("MV対応が曲の70%未満")
+                if q["block_similarity_p20"] < _mb_ + 0.08:
+                    _pr.append(f"局所p20={q['block_similarity_p20']:.2f}<{_mb_ + 0.08:.2f}")
+                _st = q.get("singing_seconds") or 0.0
+                _su = (q.get("unsafe_split_seconds") or {}).get("sing", 0.0)
+                if _st > 0.05 and _su / _st > 0.30:
+                    _pr.append(f"歌唱中に隠す割合{_su / _st * 100:.0f}%>30%")
+                if _pr:
+                    reasons.append("（部分採用も不可: " + " / ".join(_pr) + "）")
             if q["median_dtw_cost"] > _mc_:
                 reasons.append(f"DTW{q['median_dtw_cost']:.2f}>{_mc_}")
             if q["p75_dtw_cost"] > _mc_ + 0.20:
