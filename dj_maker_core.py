@@ -58,20 +58,24 @@ _YT_LOGIN_NAMES = ("LOGIN_INFO", "SAPISID", "__Secure-3PSID", "__Secure-1PSID", 
 
 
 def pick_logged_in_profile(browser):
-    """Chrome系ブラウザで「YouTubeにログインしているプロフィール」を探して返す。
+    """Chrome系ブラウザで「YouTubeにログインしている Cookies ファイル」を探し、
+    そのファイルが入っている**フォルダ**を返す（プロフィールのフォルダではない）。
 
-    なぜ必要か（実例: 2026-11 anc の8曲・11曲バッチ）:
-      yt-dlp は --cookies-from-browser chrome とだけ渡すと、Chromeフォルダの中の
-      全プロフィール（Default / Profile 1 / Guest Profile / System Profile …）から
-      「いちばん最近更新された Cookies ファイル」を選ぶ（yt_dlp/cookies.py の _newest）。
-      Chromeは裏でゲスト用などのプロフィールも触るので、ある瞬間だけ
-      ログインしていないプロフィール（Cookie 30個）を掴み、YouTubeに 403 で弾かれる。
-      詳細ログでは「Extracted 3107 cookies」と「Extracted 30 cookies」が
-      同じ実行の中で入れ替わっていて、30の時だけ必ず失敗していた
-      （anc 103回中11回 / fujitasou 48回中5回）。
-      → ログイン済みのプロフィールを1つに決めて、毎回そこだけを読ませる。
+    なぜフォルダまで絞るのか（2026-11-09 anc のログで判明）:
+      最初の版はプロフィール（…/Chrome/Default）を返していた。ところが yt-dlp は
+      渡されたフォルダの**中を全部たどって**「Cookies」という名前のファイルを集め、
+      いちばん最近更新された1つを読む（yt_dlp/cookies.py: _find_files は os.walk、
+      _newest は更新時刻が最大のもの）。1つのプロフィールの中にも Cookies は
+      複数あり（本体の Default/Network/Cookies のほか、拡張機能やアプリごとの
+      保存領域にも同名ファイルができる）、そちらが後から更新された瞬間は
+      小さい方（Cookie 30個・未ログイン）を掴んで 403 になる。
+      実際「🔐 Default に固定」と出たあとも、同じ実行の中で
+      Extracted 3153 → 30 → 30 → 3153 と入れ替わり、30の曲だけ失敗していた。
+      → 「Cookies が1つしか無いフォルダ」を渡せば、yt-dlp に選ぶ余地が無くなる。
+      （macOSでは復号の鍵はキーチェーンから取るので、渡すフォルダが
+        プロフィール直下でなくても復号には影響しない）
 
-    戻り値: プロフィールのフォルダパス（見つからなければ None ＝従来どおり自動選択）
+    戻り値: フォルダのパス（見つからなければ None ＝従来どおり自動選択）
     """
     import sqlite3, shutil as _sh, tempfile as _tf
     sub = _CHROMIUM_DIRS_MAC.get(browser)
@@ -80,14 +84,13 @@ def pick_logged_in_profile(browser):
     root = Path.home() / "Library" / "Application Support" / sub
     if not root.is_dir():
         return None
-    best = None   # (ログインCookie数, YouTubeのCookie数, 全Cookie数, パス)
-    for prof in sorted(root.iterdir()):
-        if not prof.is_dir() or prof.name in ("Guest Profile", "System Profile"):
+    best = None   # (ログインCookie数, YouTubeのCookie数, 全Cookie数, フォルダ)
+    for cur_root, dirs, files in os.walk(root):
+        if Path(cur_root) == root:
+            dirs[:] = [d for d in dirs if d not in ("Guest Profile", "System Profile")]
+        if "Cookies" not in files:
             continue
-        dbs = [p for p in (prof / "Network" / "Cookies", prof / "Cookies") if p.is_file()]
-        if not dbs:
-            continue
-        db = max(dbs, key=lambda p: p.stat().st_mtime)   # yt-dlpと同じく新しい方
+        db = Path(cur_root) / "Cookies"
         try:
             with _tf.TemporaryDirectory(prefix="djvm_ck_") as td:
                 cp = Path(td) / "Cookies"
@@ -105,11 +108,11 @@ def pick_logged_in_profile(browser):
                     con.close()
         except Exception:
             continue
-        cand = (login, yt, total, str(prof))
+        cand = (login, yt, total, str(cur_root))
         if best is None or cand[:3] > best[:3]:
             best = cand
     if best is None or best[0] == 0:
-        return None          # ログイン済みプロフィールが見当たらない → 従来の自動選択に任せる
+        return None          # ログイン済みのCookieが見当たらない → 従来の自動選択に任せる
     return best[3]
 
 
@@ -125,8 +128,13 @@ def cookie_args_from_config(config):
                 except Exception:
                     _PINNED_PROFILE[b] = None
                 if _PINNED_PROFILE[b]:
-                    print(f"  🔐 {b} のプロフィール「{Path(_PINNED_PROFILE[b]).name}」の"
-                          f"Cookieを使います（YouTubeログイン済みのものに固定）")
+                    try:
+                        _rel = str(Path(_PINNED_PROFILE[b]).relative_to(
+                            Path.home() / "Library" / "Application Support" / _CHROMIUM_DIRS_MAC[b]))
+                    except Exception:
+                        _rel = Path(_PINNED_PROFILE[b]).name
+                    print(f"  🔐 {b} の「{_rel}」のCookieだけを使います"
+                          f"（YouTubeログイン済みのファイルに固定）")
             if _PINNED_PROFILE[b]:
                 return ["--cookies-from-browser", f"{b}:{_PINNED_PROFILE[b]}"]
         return ["--cookies-from-browser", b]
@@ -2210,6 +2218,16 @@ REMIX_SHOW_MV_WHEN_UNMATCHED = True
 #                 そもそも同期を主張しておらず、口が映っても“ズレ”ではない。
 #   False       : 従来どおり紫の抽象背景へ退避（未証明の口を一切出さない最厳格）。
 FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT = True
+# ★フィラー用に「口元が映らないカット」をMV全編から探す処理を行うか。
+#   この探索はMV全体を12fpsで顔解析するので1曲あたり中央値で約50秒かかる
+#   （詳細ログ実測: 探索なし 42秒 / あり 91秒）。採用条件は「顔は検出できていて、
+#   口だけが画面の外にある」状態が必要な長さの全フレームで続くことで、
+#   2026-07〜11 の231曲・146回の探索で**採用は0回**、全部
+#   「認証できる口元なしカットが無いため、MV映像で埋めます」に落ちていた。
+#   結果が変わらない探索に毎回50秒払っていたので既定で止める。
+#   （FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT=False＝未認証なら抽象背景にする運用では、
+#     探索の結果で見た目が変わるので、この設定に関係なく探索する）
+SAFE_BROLL_SCAN_ENABLED = False
 
 
 def _safe_video_frame_count(duration, fps=30.0):
@@ -2412,6 +2430,10 @@ def _render_mv_loop_fill(source, out_path, frame_count, start=0.0):
     return bool(r.returncode == 0 and _video_has_exact_frames(out_path, frames))
 
 
+class _SkipSafeBrollScan(Exception):
+    """口元なしカットの探索を行わない設定の時に、探索部分を飛ばすための合図。"""
+
+
 def make_safe_no_mouth_filler_segment(loop_path, duration, out_path, tmp_dir=None,
                                       frame_count=None):
     """口元が一切見えないと全フレームで証明できた映像だけを採用する。
@@ -2449,6 +2471,8 @@ def make_safe_no_mouth_filler_segment(loop_path, duration, out_path, tmp_dir=Non
         except (Exception, SystemExit):
             continue
     try:
+        if FILLER_SHOW_MV_INSTEAD_OF_ABSTRACT and not SAFE_BROLL_SCAN_ENABLED:
+            raise _SkipSafeBrollScan()
         import mouth_sync
         picker = getattr(mouth_sync, "pick_no_mouth_mv_time", None)
         if not vids or not callable(picker):
@@ -2490,6 +2514,8 @@ def make_safe_no_mouth_filler_segment(loop_path, duration, out_path, tmp_dir=Non
                           f"（全{frames}フレーム検査）")
                     return True
                 candidate.unlink(missing_ok=True)
+    except _SkipSafeBrollScan:
+        pass
     except (Exception, SystemExit) as e:
         print(f"     ⚠️ 口元なしBロールを認証できません: {str(e)[:100]}")
 
@@ -2509,8 +2535,8 @@ def make_safe_no_mouth_filler_segment(loop_path, duration, out_path, tmp_dir=Non
                 start = float((used * max(3.0, exact_dur * 1.7)) % span)
                 if _render_safe_broll_candidate(source, start, frames, out_path):
                     if _video_has_exact_frames(out_path, frames):
-                        print(f"     🎬 認証できる口元なしカットが無いため、"
-                              f"MV映像で埋めます（{source.name} {start:.2f}秒〜）")
+                        print(f"     🎬 MVに対応が無い区間はMV映像で埋めます"
+                              f"（{source.name} {start:.2f}秒〜）")
                         return True
                     out_path.unlink(missing_ok=True)
             except (Exception, SystemExit):
@@ -3176,7 +3202,7 @@ def waveform_track_plan(music_audio, video_audio, sr, music_dur, vid_dur,
 
 def bridge_constant_offset(seg_plan, music_dur, vid_dur, tol=0.25,
                            min_agree_sec=20.0, min_agree_frac=0.60,
-                           min_agree_segs=3, verbose=True):
+                           min_agree_segs=1, verbose=True):
     """採用区間のズレが全部同じなら、間のフィラーを同じズレで埋め直す。
 
     なぜ必要か（実例: 「君セン! (OGATA Edit)」）:
@@ -3234,11 +3260,25 @@ def bridge_constant_offset(seg_plan, music_dur, vid_dur, tol=0.25,
             or total_w <= 0.0 or (agree_sec / total_w) < min_agree_frac):
         return segs, None
 
+    # ★埋めるのは「隣の採用区間が支配的なズレと同じ」穴だけ。
+    #   採用区間が1本だけの曲（全編1区間＋曲の最後の1〜2秒だけ穴）でも動かすために
+    #   必要本数を1に下げた代わりに、この条件で範囲を絞る。
+    #   実例: 2026-11-09「浮世CROSSING」は強一致率99%・全編 MVの2.2秒〜 の1区間なのに、
+    #   最後の2.1秒（フェードアウトで波形が弱い）だけ穴になり、そこにMVの
+    #   0.00秒（冒頭）が差し込まれていた。同じズレで続ければMVの続きがそのまま流れる。
+    #   隣がズレの違う区間（＝そこで構成が変わっている）なら、従来どおり触らない。
+    def _agrees(seg):
+        return seg[2] is not None and abs((seg[2] - seg[0]) - dom) <= tol
     filled = 0.0
     out = []
-    for s, e, mv in segs:
+    for _i, (s, e, mv) in enumerate(segs):
         if mv is not None:
             out.append((s, e, mv)); continue
+        _prev = segs[_i - 1] if _i > 0 else None
+        _next = segs[_i + 1] if _i + 1 < len(segs) else None
+        _nb = [x for x in (_prev, _next) if x is not None and x[2] is not None]
+        if not _nb or not all(_agrees(x) for x in _nb):
+            out.append((s, e, None)); continue
         # この穴を dom のズレで埋められるか（MVに素材がある範囲だけ）
         a = max(s, -dom)                      # mv >= 0 になる music 開始
         b = min(e, max(0.0, vid_dur - dom))   # mv+長さ <= vid_dur になる music 終了
@@ -3269,6 +3309,102 @@ def bridge_constant_offset(seg_plan, music_dur, vid_dur, tol=0.25,
               f"（{len(agree)}区間 / {agree_sec:.0f}秒）→ 同じズレで穴を埋めました"
               f"（フィラー {filled:.1f}秒ぶんをMV映像に復帰 / {len(segs)}区間→{len(merged)}区間）")
     return merged, dom
+
+
+def smooth_sandwiched_jumps(seg_plan, video_audio, music_audio, vid_dur,
+                            sr=11025, tol=1.0, max_run_sec=45.0, verbose=True):
+    """前後を「同じズレ」の区間に挟まれた飛びを、聴き比べたうえで本筋に戻す。
+
+    なぜ必要か（実例: 2026-11-11「Night Of Fire」）:
+      17区間のうち大半は「MV = 曲 − 2.0秒」で一直線なのに、途中の5区間だけ
+      MVの全然違う場所（135秒・151秒・65秒・43秒・168秒）に飛んでいた。
+      サビのように同じ音が何度も出る所では、音内容アラインが「別の回のサビ」を
+      選ぶことがあるため。映像は数秒おきに関係ない場面へ跳び、
+      「末尾ズレ +61.9秒（×11.579）」のような補正不能の警告も出る。
+
+    前後の区間のズレが同じ ＝ その間に曲の時間は足されても削られてもいない。
+    なら、間の区間も同じズレ（MVの続き）で流せる可能性が高い。ただし本当に
+    別の場所の音を差し込んだEditもあり得るので、決めつけずに聴き比べる:
+      ・本筋の位置（前後と同じズレ）のMVの音と、曲の音のクロマ類似度を測る
+      ・それが採用基準を満たし、かつ今の飛び先の9割以上の類似度なら本筋に戻す
+      ・本筋の方が明らかに合わないなら、本当に別素材なので触らない
+    さらに、飛びの長さが前後の一致区間の合計より長い時（どちらが本筋か
+    言えない）や45秒を超える時は対象外。
+
+    戻り: (新しいプラン, 戻した区間数)
+    """
+    try:
+        segs = [(float(s), float(e), None if mv is None else float(mv))
+                for s, e, mv in (seg_plan or [])]
+        vid_dur = float(vid_dur)
+    except (TypeError, ValueError, OverflowError):
+        return list(seg_plan or []), 0
+    if len(segs) < 3:
+        return segs, 0
+    off = lambda g: g[2] - g[0]
+    feats = {}
+
+    def _sim(s0, e0, mv0):
+        if not feats:
+            _ov, cv, fps = compute_features(video_audio, sr)
+            _om, cm, _ = compute_features(music_audio, sr)
+            try:
+                k, kc = estimate_semitone_shift(video_audio, music_audio, sr)
+                if k and kc >= 0.05:
+                    cv = np.roll(cv, int(k), axis=0)
+            except Exception:
+                pass
+            feats.update(cv=cv, cm=cm, fps=fps)
+        cv, cm, fps = feats["cv"], feats["cm"], feats["fps"]
+        a = int(round(s0 * fps)); k = int(round(mv0 * fps))
+        n = min(int(round((e0 - s0) * fps)), cm.shape[1] - a, cv.shape[1] - k)
+        if a < 0 or k < 0 or n < int(fps):
+            return None
+        return float(np.mean(np.sum(cm[:, a:a + n] * cv[:, k:k + n], axis=0)))
+
+    fixed = 0; fixed_sec = 0.0
+    i = 1
+    while i < len(segs) - 1:
+        A = segs[i - 1]
+        if A[2] is None or segs[i][2] is None or abs(off(segs[i]) - off(A)) <= tol:
+            i += 1; continue
+        base = off(A)
+        j = i
+        while (j < len(segs) and segs[j][2] is not None
+               and abs(off(segs[j]) - base) > tol):
+            j += 1
+        if j >= len(segs) or segs[j][2] is None:      # 右側に同じズレの区間が無い
+            i += 1; continue                          # 次の区間を起点にして探し直す
+        rs, re_ = segs[i][0], segs[j - 1][1]
+        run = re_ - rs
+        # 前後の「同じズレで連続している」長さ（根拠の強さ）
+        left = 0.0; q = i - 1
+        while q >= 0 and segs[q][2] is not None and abs(off(segs[q]) - base) <= tol:
+            left += segs[q][1] - segs[q][0]; q -= 1
+        right = 0.0; q = j
+        while q < len(segs) and segs[q][2] is not None and abs(off(segs[q]) - base) <= tol:
+            right += segs[q][1] - segs[q][0]; q += 1
+        new_mv = rs + base
+        ok = (run <= max_run_sec and run <= left + right
+              and new_mv >= 0.0 and re_ + base <= vid_dur + 0.05)
+        if ok:
+            try:
+                sim_main = _sim(rs, re_, new_mv)
+                cur = [(_sim(g[0], g[1], g[2]), g[1] - g[0]) for g in segs[i:j]]
+                cur = [(v, w) for v, w in cur if v is not None]
+                sim_cur = (sum(v * w for v, w in cur) / sum(w for _, w in cur)) if cur else 0.0
+            except Exception:
+                sim_main = None; sim_cur = 0.0
+            ok = (sim_main is not None and sim_main >= SEG_SCORE_TH
+                  and sim_main >= 0.90 * sim_cur)
+        if ok:
+            segs[i:j] = [(rs, re_, new_mv)]
+            fixed += (j - i); fixed_sec += run
+        i += 1
+    if fixed and verbose:
+        print(f"  🧹 前後と同じズレに挟まれた飛び {fixed}区間（計{fixed_sec:.0f}秒）は、"
+              f"本筋の位置でも音が合うことを確認 → MVの続きに戻しました")
+    return segs, fixed
 
 
 def _expand_unsafe_plan_ranges(seg_plan, total_dur, pad=0.25, min_show=0.75,
@@ -3856,6 +3992,11 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             if hidden_after > hidden_before + 0.01:
                 print(f"  🛡️ Remix安全境界: NG側を前後0.25秒拡張 / "
                       f"0.75秒未満の口元SHOWを除外（非表示 {hidden_after:.1f}秒）")
+
+    # ★同じズレの区間に挟まれた飛びは、聴き比べて合うなら本筋へ戻す
+    #   （詳細は smooth_sandwiched_jumps。合わない飛び＝本物の並べ替えは残る）
+    seg_plan, _n_smoothed = smooth_sandwiched_jumps(
+        seg_plan, video_audio, music_audio, vid_dur)
 
     # 波形が指すプランをそのまま採用（並べ替え・hook-firstは自然に出る）
     print(f"\n🎬 映像構成プラン（波形追従・{len(seg_plan)}区間）:")

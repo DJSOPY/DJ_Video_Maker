@@ -180,6 +180,71 @@ djvm_dl(){  # djvm_dl <URL> <保存先>  （リトライ1回つき）
     curl -L --fail -m 600 -o "$2" "$1"
 }
 
+# yt-dlp を「入れた方法に合わせて」更新する。成功したら 0 を返す。
+#  なぜ必要か: 以前は「直接DL版なら入れ直し、それ以外は brew upgrade」の2通りだけで、
+#  結果を見ずに更新済みの印を付けていた。pip で入った yt-dlp（実行すると
+#  "You installed yt-dlp with pip" と出る）は brew upgrade では更新されないので、
+#  毎週「更新したつもり」で古いまま残り、2026-11 時点で2人とも 2026.07.04（4か月前）
+#  だった。YouTube側の仕様が変わると、古い yt-dlp は全曲ダウンロードに失敗する。
+#  失敗した時は印を付けないので、次に起動した時にまた試す（1日1回まで）。
+djvm_update_ytdlp(){
+    local yp before after py first tried vy vm ny nm age
+    yp="$(command -v yt-dlp 2>/dev/null)"
+    [ -n "$yp" ] || return 1
+    tried="$DJVM_HOME/ytdlp_update_tried"
+    if [ -f "$tried" ] && [ $(( $(date +%s) - $(stat -f %m "$tried" 2>/dev/null || echo 0) )) -lt 86400 ]; then
+        return 1
+    fi
+    before="$(yt-dlp --version 2>/dev/null)"
+    if [ -x "$DJVM_BIN/yt-dlp" ] && [ "$yp" = "$DJVM_BIN/yt-dlp" ]; then
+        djvm_install_static_ytdlp >/dev/null 2>&1
+    elif command -v brew >/dev/null 2>&1 && brew list yt-dlp >/dev/null 2>&1; then
+        brew upgrade yt-dlp >/dev/null 2>&1
+    else
+        # pip版: yt-dlp 本体の1行目（#!/…/python）が、それを入れた python
+        first="$(head -n 1 "$yp" 2>/dev/null)"
+        py=""
+        case "$first" in
+            "#!"*python*) py="${first#??}"; py="${py%% *}" ;;
+        esac
+        if [ -n "$py" ] && [ -x "$py" ]; then
+            "$py" -m pip install -q -U --retries 1 --timeout 20 yt-dlp >/dev/null 2>&1 \
+              || "$py" -m pip install -q -U --user --retries 1 --timeout 20 yt-dlp >/dev/null 2>&1
+        fi
+    fi
+    hash -r 2>/dev/null
+    after="$(yt-dlp --version 2>/dev/null)"
+    if [ -z "$after" ]; then
+        echo "   ⚠️ yt-dlp の更新後に起動を確認できませんでした"
+        touch "$tried" 2>/dev/null
+        return 1
+    fi
+    if [ "$after" != "$before" ]; then
+        echo "   ✓ yt-dlp を更新しました（$before → $after）"
+        rm -f "$tried" 2>/dev/null
+        return 0
+    fi
+    # バージョンが変わらない = もともと最新、または更新できなかった。
+    # yt-dlp の版は日付（例 2026.07.04）。4か月以上前のままなら
+    # 「更新できなかった」と見なして印を付けず、明日また試す。
+    age=0
+    case "$after" in
+        [0-9][0-9][0-9][0-9].[0-9][0-9].*)
+            vy="${after%%.*}"; vm="${after#*.}"; vm="${vm%%.*}"
+            ny="$(date +%Y)"; nm="$(date +%m)"
+            age=$(( (10#$ny * 12 + 10#$nm) - (10#$vy * 12 + 10#$vm) ))
+            ;;
+    esac
+    if [ "$age" -ge 4 ]; then
+        echo "   ⚠️ yt-dlp を更新できませんでした（$after のまま）。ダウンロードに失敗する時はお知らせください"
+        touch "$tried" 2>/dev/null
+        return 1
+    fi
+    echo "   ✓ yt-dlp は最新です（$after）"
+    rm -f "$tried" 2>/dev/null
+    return 0
+}
+
 djvm_install_static_ytdlp(){
     echo "📥 yt-dlp を直接ダウンロード中（約40MB）..."
     mkdir -p "$DJVM_BIN"
@@ -272,12 +337,7 @@ djvm_ensure_tools(){
             local STAMP="$DJVM_HOME/ytdlp_updated"
             if [ ! -f "$STAMP" ] || [ $(( $(date +%s) - $(stat -f %m "$STAMP" 2>/dev/null || echo 0) )) -gt 604800 ]; then
                 echo "🔄 yt-dlp を最新版に更新中（週1回の自動チェック）..."
-                if [ -x "$DJVM_BIN/yt-dlp" ] && [ "$(command -v yt-dlp)" = "$DJVM_BIN/yt-dlp" ]; then
-                    djvm_install_static_ytdlp
-                else
-                    brew upgrade yt-dlp 2>/dev/null
-                fi
-                touch "$STAMP"
+                djvm_update_ytdlp && touch "$STAMP"
             fi
         fi
     fi
