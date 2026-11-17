@@ -332,25 +332,24 @@ djvm_ensure_tools(){
                 brew cleanup 2>/dev/null
                 brew install yt-dlp
             }
-        else
-            # YouTubeの仕様変更対策：週1回だけ自動アップデート
-            local STAMP="$DJVM_HOME/ytdlp_updated"
-            if [ ! -f "$STAMP" ] || [ $(( $(date +%s) - $(stat -f %m "$STAMP" 2>/dev/null || echo 0) )) -gt 604800 ]; then
-                echo "🔄 yt-dlp を最新版に更新中（週1回の自動チェック）..."
-                djvm_update_ytdlp && touch "$STAMP"
-            fi
         fi
     fi
     # --- まだ足りないものがあれば静的フォールバック ---
     if ! command -v ffmpeg &>/dev/null || ! command -v ffprobe &>/dev/null || ! command -v yt-dlp &>/dev/null; then
         djvm_install_static_all
     fi
-    # --- 静的yt-dlpの週1更新（brew無し運用のケース）---
-    if ! command -v brew &>/dev/null && [ -x "$DJVM_BIN/yt-dlp" ]; then
-        local STAMP="$DJVM_HOME/ytdlp_updated"
+    # --- YouTubeの仕様変更対策：yt-dlp を週1回だけ自動アップデート ---
+    #  ★以前は「brewがある時」と「brew無し＋直接DL版」の2か所に分かれていて、
+    #    「brew無し＋pip版」のMacはどちらにも当てはまらず一度も更新されなかった。
+    #    入れた方法の見分けは djvm_update_ytdlp が行うので、ここは1か所にまとめる。
+    #  ★印のファイル名を変えてある（ytdlp_updated → ytdlp_updated2）。
+    #    古い印は「更新できていないのに付いた」ものなので、それを無視して
+    #    この版が入った最初の起動で必ず1回試すため。
+    if command -v yt-dlp &>/dev/null; then
+        local STAMP="$DJVM_HOME/ytdlp_updated2"
         if [ ! -f "$STAMP" ] || [ $(( $(date +%s) - $(stat -f %m "$STAMP" 2>/dev/null || echo 0) )) -gt 604800 ]; then
             echo "🔄 yt-dlp を最新版に更新中（週1回の自動チェック）..."
-            djvm_install_static_ytdlp && touch "$STAMP"
+            djvm_update_ytdlp && touch "$STAMP"
         fi
     fi
     # --- 最終確認 ---

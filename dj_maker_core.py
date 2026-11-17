@@ -116,7 +116,68 @@ def pick_logged_in_profile(browser):
     return best[3]
 
 
-_PINNED_PROFILE = {}
+_PINNED_PROFILE = {}      # ブラウザ名 → ログイン済み Cookies ファイルの入っているフォルダ
+_COOKIE_PIN_ROOT = CONFIG_DIR / "cookie_pin"
+
+
+def _refresh_cookie_pin(b):
+    """ログイン済みの Cookies ファイルを、自分専用のフォルダへ写して、そのフォルダを返す。
+
+    なぜ写しを使うのか（2026-11-16 anc のログで判明）:
+      前の版は「ログイン済みの Cookies が入っているフォルダ」を yt-dlp に渡していた。
+      Cookies が Default/Network/ にあるMacではそれで1つに絞れるが、
+      anc のMacでは Default/ の直下にあり、渡すフォルダが「Default」になった。
+      yt-dlp は渡されたフォルダの**中を全部たどって**一番新しい Cookies を読むので、
+      Default の下にある別の小さい Cookies（30個・未ログイン）をまた掴み、
+      🔐固定と表示されたまま 6曲中5曲が Extracted 30 → 403 になった。
+      Chromeのフォルダ構成はMacごとに違い、どこを渡しても他のファイルが
+      混ざり得る。そこで「Cookies が1個しか無い自分のフォルダ」に写して渡す。
+      これなら yt-dlp が選ぶ余地は構成に関係なく無い。
+      （yt-dlp 自身も読む前に一時フォルダへコピーしているので、写しを読むこと自体は
+        元と同じ。値は暗号化されたままで、復号の鍵はmacOSのキーチェーンにある）
+    写しは毎回のダウンロード直前に取り直す（Cookieは更新されるため）。
+    戻り値: 写しのフォルダ（失敗時は None ＝従来どおりブラウザ名だけを渡す）
+    """
+    import shutil as _sh
+    src_dir = _PINNED_PROFILE.get(b)
+    if not src_dir:
+        return None
+    src = Path(src_dir) / "Cookies"
+    try:
+        if not src.is_file():
+            return None
+        dst_dir = _COOKIE_PIN_ROOT / b
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(_COOKIE_PIN_ROOT, 0o700); os.chmod(dst_dir, 0o700)
+        except OSError:
+            pass
+        for old in dst_dir.iterdir():                 # 余計なファイルが残らないように
+            if old.name != "Cookies":
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        tmp = _COOKIE_PIN_ROOT / f".{b}.tmp"
+        _sh.copy2(src, tmp)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, dst_dir / "Cookies")          # 読んでいる最中に半端な状態を見せない
+        return str(dst_dir)
+    except Exception:
+        return None
+
+
+def _cleanup_cookie_pin():
+    import shutil as _sh
+    _sh.rmtree(_COOKIE_PIN_ROOT, ignore_errors=True)
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_cookie_pin)
+
 
 def cookie_args_from_config(config):
     b = config.get("cookies_browser")
@@ -127,18 +188,29 @@ def cookie_args_from_config(config):
                     _PINNED_PROFILE[b] = pick_logged_in_profile(b)
                 except Exception:
                     _PINNED_PROFILE[b] = None
-                if _PINNED_PROFILE[b]:
+                if _PINNED_PROFILE[b] and _refresh_cookie_pin(b):
                     try:
-                        _rel = str(Path(_PINNED_PROFILE[b]).relative_to(
+                        _rel = str((Path(_PINNED_PROFILE[b]) / "Cookies").relative_to(
                             Path.home() / "Library" / "Application Support" / _CHROMIUM_DIRS_MAC[b]))
                     except Exception:
-                        _rel = Path(_PINNED_PROFILE[b]).name
-                    print(f"  🔐 {b} の「{_rel}」のCookieだけを使います"
-                          f"（YouTubeログイン済みのファイルに固定）")
+                        _rel = "Cookies"
+                    print(f"  🔐 {b} の「{_rel}」だけを使います"
+                          f"（YouTubeログイン済みのファイルを写して固定）")
             if _PINNED_PROFILE[b]:
-                return ["--cookies-from-browser", f"{b}:{_PINNED_PROFILE[b]}"]
+                _pin = _refresh_cookie_pin(b)
+                if _pin:
+                    return ["--cookies-from-browser", f"{b}:{_pin}"]
         return ["--cookies-from-browser", b]
     return []
+
+
+def _refresh_cookie_args():
+    """yt-dlp を呼ぶ直前に、Cookieの写しを最新に取り直す。"""
+    for i in range(len(YTDLP_COOKIE_ARGS) - 1):
+        if YTDLP_COOKIE_ARGS[i] == "--cookies-from-browser":
+            b = YTDLP_COOKIE_ARGS[i + 1].split(":", 1)[0]
+            if _PINNED_PROFILE.get(b):
+                _refresh_cookie_pin(b)
 
 
 def ytdlp_run(args, **kw):
@@ -180,6 +252,10 @@ import time as _sleep_time
 def _ytdlp_once(args, **kw):
     """Cookie付き→失敗ならCookie無し、の1往復（従来のytdlp_runの中身）。"""
     global YTDLP_COOKIE_ARGS, _COOKIE_DISABLED
+    try:
+        _refresh_cookie_args()
+    except Exception:
+        pass
     r = subprocess.run(["yt-dlp", *YTDLP_COOKIE_ARGS, *args], **kw)
     if r.returncode == 0 or not YTDLP_COOKIE_ARGS:
         return r
