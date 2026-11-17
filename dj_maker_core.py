@@ -1103,6 +1103,32 @@ def align_segments(video_audio, music_audio, sr=11025, window_sec=SEG_WINDOW_SEC
     uniqueness = float(np.median(uniq_list)) if uniq_list else 0.0
     return [(s, e, mv) for s, e, mv in merged], avg_score, uniqueness
 
+_CONTENT_ALIGN_SLOPES = {}     # 区間の曲側開始秒 → その区間で実測した MV/曲 の速さ
+
+
+def _run_slope(run, min_span=20.0):
+    """音内容アラインの1ラン（[(曲秒, MV秒, 類似度), ...]）の傾きを外れ値に強く測る。
+    戻り: (傾き, 切片) / 測れない時は None。
+    20秒以上の広がりと十分な点数が無いランは、1フレーム(約0.09秒)の量子化で
+    傾きがぶれるので測らない（None＝従来の扱いに任せる）。"""
+    try:
+        t = np.array([a[0] for a in run], dtype=float)
+        m = np.array([a[1] for a in run], dtype=float)
+        if len(t) < 12 or (t.max() - t.min()) < min_span:
+            return None
+        sl = [(m[j] - m[i]) / (t[j] - t[i])
+              for i in range(len(t)) for j in range(i + 1, len(t)) if t[j] - t[i] >= 8.0]
+        if len(sl) < 10:
+            return None
+        k = float(np.median(sl)); c = float(np.median(m - k * t))
+        res = np.abs(m - (k * t + c))
+        if float(np.mean(res <= 0.35)) < 0.70:       # 直線に乗らないランは信用しない
+            return None
+        return k, c
+    except Exception:
+        return None
+
+
 def content_align_plan(music_audio, video_audio, music_dur, vid_dur, sr=11025,
                        win_sec=4.0, hop_sec=1.0, slope_tol=0.25, min_run=4):
     """音内容アライン（6/24 fix_mv_align 方式）。
@@ -1162,11 +1188,24 @@ def content_align_plan(music_audio, video_audio, music_dur, vid_dur, sr=11025,
     if not runs:
         return None
     segs = []
+    _CONTENT_ALIGN_SLOPES.clear()
     for r in runs:
         offs = np.array([mv - ed for ed, mv, _ in r])
         offset = float(np.median(offs))                       # 区間内は中央値オフセットで頑健
         e0 = r[0][0]; e1 = r[-1][0] + hop_sec
-        segs.append([e0, e1, max(0.0, e0 + offset)])
+        m0 = max(0.0, e0 + offset)
+        # ★このランの中で、MVが曲に対して何倍の速さで進んでいるかを実測する。
+        #   ランの条件は「隣の窓との傾きが1±25%」と緩いので、数%のテンポ差が
+        #   あってもランは切れない。逆にテンポが同じなら傾きはぴったり1になる。
+        #   これを控えておき、後段の伸縮補正が「測った速さ」を使えるようにする
+        #   （詳細は伸縮補正の所の注記。実例: One Night Carnival）。
+        _sl = _run_slope(r)
+        if _sl is not None:
+            _k, _c = _sl
+            if abs(_k - 1.0) > 0.004:
+                m0 = max(0.0, _k * e0 + _c)                   # 傾きがある時は直線上の位置から始める
+            _CONTENT_ALIGN_SLOPES[round(float(e0), 2)] = float(_k)
+        segs.append([e0, e1, m0])
     segs.sort(key=lambda s: s[0])
     intro_end = segs[0][0]
     for i in range(len(segs) - 1):
@@ -4127,6 +4166,29 @@ def process_with_youtube(urls, music_path, loop_path, output_path, tmp_dir):
             #   実測では ×1.015〜×1.030 は正常に働いていたので、原曲系は6%を上限とし、
             #   超える区間は補正を諦める（等速のまま＝ズレは継ぎ目に残すが映像は壊れない）。
             _lo, _hi = (0.85, 1.18) if is_rmx_measured else (0.94, 1.06)
+            # ★この区間の中でMVの速さを実測できているなら、それを使う。
+            #   「次の区間の頭に着地するように伸縮する」は、区間の長さと
+            #   次の区間までのMVの長さが合わない理由を全部テンポ差だと見なす処理。
+            #   だが合わない理由が「MVの途中に曲に無い場面が挟まっている」（構成の違い）
+            #   の時は、区間の中はテンポが同じで、区間の変わり目で一気にズレるだけ。
+            #   そこを伸縮すると、合っていた区間をわざわざ遅く／速くしてしまう。
+            #   実例: 2026-11-16「One Night Carnival - 2013」
+            #     曲2.0〜210.7秒 → MV10.2秒〜（ズレ+8.2秒で一定）、次の区間はズレ+15.4秒。
+            #     MV側に7.2秒ぶん余分な場面があるだけなのに「末尾ズレ +7.2秒 →
+            #     内部で×1.034 伸縮」と208秒ぶんを3.4%速回しし、口が曲の進行とともに
+            #     ずれていって3分半で7秒ズレた（テンポ探索は ×1.000・一直線度71%＝
+            #     曲の71%が同じズレ、と正しく出ていた）。
+            #   区間が長いほど同じ秒数のズレが小さい割合に見えるので、
+            #   「6%以内なら伸縮」という判定は、長くてよく合っている区間ほど誤って通る。
+            _meas = _CONTENT_ALIGN_SLOPES.get(round(float(s), 2))
+            if _meas is not None:
+                if abs(_meas - 1.0) > 0.004 and _lo <= _meas <= _hi:
+                    seg_rates[i] = _meas
+                    print(f"  📐 区間{i} はMVの速さを実測 ×{_meas:.3f} → その速さで再生します")
+                elif abs(r - 1.0) > 0.015:
+                    print(f"  ⏸ 区間{i} 末尾ズレ {span - dur:+.1f}秒 は、区間内の速さが"
+                          f"曲と同じ（実測×{_meas:.3f}）なので構成の違いと判断 → 伸縮しません")
+                continue
             if _lo <= r <= _hi and abs(r - 1.0) > 0.015:   # 中間区間の継ぎ目だけ小補正
                 seg_rates[i] = r
                 print(f"  🩹 区間{i} 末尾ズレ {span - dur:+.1f}秒 → 内部で×{r:.3f} 伸縮して補正")
